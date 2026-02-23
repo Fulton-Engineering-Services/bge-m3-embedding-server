@@ -1,0 +1,306 @@
+openapi: "3.1.0"
+info:
+  title: bge-m3-axum-fastembed-rs
+  description: |
+    HTTP server serving BGE-M3 dense and sparse embeddings via fastembed-rs.
+
+    - **Dense embeddings** (`/v1/embeddings`): OpenAI-compatible endpoint returning 1024-dimensional float vectors.
+    - **Sparse embeddings** (`/v1/sparse-embeddings`): BGE-M3 SPLADE-style sparse token weights.
+    - **Health** (`/health`): Readiness probe with worker pool status.
+  version: "0.5.0"
+  license:
+    name: MIT OR Apache-2.0
+  contact:
+    url: https://github.com/fultonengineeringservices/bge-m3-axum-fastembed-rs
+
+servers:
+  - url: http://localhost:8081
+    description: Local development
+
+paths:
+  /v1/embeddings:
+    post:
+      summary: Generate dense embeddings (OpenAI-compatible)
+      description: |
+        Accepts one or more text strings and returns dense 1024-dimensional
+        float vectors using the BGE-M3 model. The `model` field is accepted
+        for OpenAI API compatibility but is ignored — BGE-M3 is always used.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/DenseRequest"
+            examples:
+              single_string:
+                summary: Single string input
+                value:
+                  input: "The quick brown fox jumps over the lazy dog"
+              array_input:
+                summary: Array of strings
+                value:
+                  input:
+                    - "First document to embed"
+                    - "Second document to embed"
+      responses:
+        "200":
+          description: Dense embeddings generated successfully
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DenseResponse"
+        "400":
+          description: Malformed JSON body
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "413":
+          description: Request body exceeds 2 MiB limit
+        "415":
+          description: Content-Type is not application/json
+        "422":
+          description: Valid JSON but invalid schema (e.g. input is a number)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "503":
+          description: Service not ready or all workers have exited
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /v1/sparse-embeddings:
+    post:
+      summary: Generate sparse embeddings (BGE-M3 SPLADE-style)
+      description: |
+        Accepts one or more text strings and returns sparse token weight vectors.
+        Each token is represented as an index (vocabulary position) and a weight value.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SparseRequest"
+            examples:
+              single_string:
+                summary: Single string input
+                value:
+                  input: "Sparse embeddings for retrieval"
+      responses:
+        "200":
+          description: Sparse embeddings generated successfully
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SparseResponse"
+        "400":
+          description: Malformed JSON body
+        "413":
+          description: Request body exceeds 2 MiB limit
+        "415":
+          description: Content-Type is not application/json
+        "422":
+          description: Valid JSON but invalid schema
+        "503":
+          description: Service not ready or all workers have exited
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /health:
+    get:
+      summary: Readiness probe
+      description: |
+        Returns service health and worker pool status.
+
+        - `200 ok` — all workers healthy
+        - `200 warn` — some workers have exited (degraded but operational)
+        - `503 loading` — models still loading (not yet ready)
+        - `503 fail` — ready flag set but no live workers (fatal degradation)
+      responses:
+        "200":
+          description: Service is operational (healthy or degraded)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthResponse"
+              examples:
+                healthy:
+                  summary: All workers live
+                  value:
+                    status: "ok"
+                    workers:
+                      live: 2
+                      total: 2
+                degraded:
+                  summary: Some workers have exited
+                  value:
+                    status: "warn"
+                    workers:
+                      live: 1
+                      total: 2
+        "503":
+          description: Service unavailable (loading or all workers dead)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthResponse"
+              examples:
+                loading:
+                  summary: Models still loading
+                  value:
+                    status: "loading"
+                fail:
+                  summary: No live workers
+                  value:
+                    status: "fail"
+                    workers:
+                      live: 0
+                      total: 2
+
+components:
+  schemas:
+    TextInput:
+      description: |
+        One or more input strings. Accepts either a single string or an array of strings.
+      oneOf:
+        - type: string
+          example: "Text to embed"
+        - type: array
+          items:
+            type: string
+          minItems: 1
+          example: ["First text", "Second text"]
+
+    DenseRequest:
+      type: object
+      required:
+        - input
+      properties:
+        input:
+          $ref: "#/components/schemas/TextInput"
+        model:
+          type: string
+          description: Accepted for OpenAI API compatibility; always uses BGE-M3.
+          example: "bge-m3"
+
+    DenseEmbeddingData:
+      type: object
+      required: [object, index, embedding]
+      properties:
+        object:
+          type: string
+          enum: ["embedding"]
+        index:
+          type: integer
+          minimum: 0
+          description: Zero-based position of this embedding in the input batch.
+        embedding:
+          type: array
+          items:
+            type: number
+            format: float
+          description: 1024-dimensional dense vector.
+
+    Usage:
+      type: object
+      required: [prompt_tokens, total_tokens]
+      properties:
+        prompt_tokens:
+          type: integer
+          description: Approximate token count (character-based estimate).
+        total_tokens:
+          type: integer
+          description: Same as prompt_tokens (no completion tokens for embeddings).
+
+    DenseResponse:
+      type: object
+      required: [object, model, data, usage]
+      properties:
+        object:
+          type: string
+          enum: ["list"]
+        model:
+          type: string
+          enum: ["bge-m3"]
+        data:
+          type: array
+          items:
+            $ref: "#/components/schemas/DenseEmbeddingData"
+        usage:
+          $ref: "#/components/schemas/Usage"
+
+    SparseRequest:
+      type: object
+      required:
+        - input
+      properties:
+        input:
+          $ref: "#/components/schemas/TextInput"
+
+    SparseValues:
+      type: object
+      required: [indices, values]
+      properties:
+        indices:
+          type: array
+          items:
+            type: integer
+            format: int32
+            minimum: 0
+          description: Vocabulary token indices (BGE-M3 tokenizer, vocab size ~30K).
+        values:
+          type: array
+          items:
+            type: number
+            format: float
+          description: SPLADE weights for each token index (parallel to indices).
+
+    SparseEmbeddingData:
+      type: object
+      required: [index, sparse_values]
+      properties:
+        index:
+          type: integer
+          minimum: 0
+          description: Zero-based position in the input batch.
+        sparse_values:
+          $ref: "#/components/schemas/SparseValues"
+
+    SparseResponse:
+      type: object
+      required: [data]
+      properties:
+        data:
+          type: array
+          items:
+            $ref: "#/components/schemas/SparseEmbeddingData"
+
+    HealthResponse:
+      type: object
+      required: [status]
+      properties:
+        status:
+          type: string
+          enum: ["ok", "warn", "loading", "fail"]
+        workers:
+          type: object
+          required: [live, total]
+          properties:
+            live:
+              type: integer
+              minimum: 0
+            total:
+              type: integer
+              minimum: 1
+
+    ErrorResponse:
+      type: object
+      properties:
+        error:
+          type: string
+          description: Human-readable error message.
