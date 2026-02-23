@@ -21,6 +21,9 @@ cargo clippy --all-targets -- -D warnings
 
 # Format check
 cargo fmt --check
+
+# Supply chain audit (requires cargo-deny)
+cargo deny check
 ```
 
 ## Run Locally
@@ -53,9 +56,9 @@ The server starts accepting requests once model warm-up completes (watch logs fo
 
 The server uses a **worker pool** pattern to handle concurrent embedding requests:
 
-- At startup, `BGE_M3_WORKERS` workers are spawned via `tokio::task::spawn_blocking`, each loading its own `TextEmbedding` (dense) and `SparseTextEmbedding` (sparse) model instance.
-- Work is dispatched through a bounded `tokio::sync::mpsc` channel; workers share the receiver via `Arc<tokio::sync::Mutex<Receiver>>`.
-- A shared `AtomicBool` readiness flag is set after each worker completes its model load and warm-up probe. The `/health` endpoint returns `503` until this flag is set.
+- Workers are spawned via `spawn_blocking`, each loading dense + sparse model instances.
+- Work dispatched through bounded `mpsc` channel; workers share receiver via `Arc<Mutex<Receiver>>`.
+- Readiness: each worker signals via a separate `mpsc` readiness channel after model load. The init task collects all signals, then a warm-up probe runs both dense and sparse inference before setting the `AtomicBool` ready flag.
 - HTTP observability is provided by `tower-http::TraceLayer`.
 
 ## Docker
@@ -73,3 +76,14 @@ docker run --rm \
 
 The container exposes port `8081`. The built-in `HEALTHCHECK` polls `/health` every 10 seconds
 with a 120-second start period to allow time for model download and ONNX initialization.
+
+## Releasing
+
+The Release workflow creates git tags automatically. **Do not create tags locally.**
+To release: bump version in `Cargo.toml`, commit, push to `main`. The workflow handles tag creation, multi-arch Docker builds, and GitHub Release.
+
+## Gotchas
+
+- `fastembed::SparseEmbedding` does not implement `Debug` — use `.err().expect()` instead of `.unwrap_err()` on `Result<Vec<SparseEmbedding>>`
+- Stale model cache causes silent worker load failures ("Worker exited before signaling readiness") — fix by clearing `BGE_M3_CACHE_DIR`
+- Config tests use `from_lookup()` closure pattern instead of `env::set_var` to avoid process-global state mutation under parallel test execution
