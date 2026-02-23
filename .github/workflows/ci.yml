@@ -64,6 +64,8 @@ jobs:
         with:
           toolchain: "1.75"
       - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5  # v2
+      - name: Remove Cargo.lock (lock file v4 is unreadable by cargo < 1.78)
+        run: rm Cargo.lock
       - name: Check (MSRV)
         run: cargo check --all-features
 
