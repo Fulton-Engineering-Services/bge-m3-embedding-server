@@ -156,6 +156,7 @@ jobs:
     permissions:
       contents: write
       packages: write
+      id-token: write   # required for cosign OIDC keyless signing
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
         with:
@@ -188,6 +189,26 @@ jobs:
             -t "$IMAGE:latest" \
             $(printf "$IMAGE@sha256:%s " *)
 
+      # ── Image signing + SBOM ──────────────────────────────────────────
+      - name: Install cosign
+        uses: sigstore/cosign-installer@dc72c7d5c4d10cd6bcb8cf6e3fd625a9e5e537da  # v3.7.0
+
+      - name: Sign container image
+        env:
+          IMAGE: ${{ env.REGISTRY }}/${{ needs.version.outputs.repo }}
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          cosign sign --yes \
+            "$IMAGE:$VERSION" \
+            "$IMAGE:latest"
+
+      - name: Generate SBOM
+        uses: anchore/sbom-action@f325610c9f50a54015d37c8d16cb3b0e2c8f4de5  # v0.18.0
+        with:
+          image: ${{ env.REGISTRY }}/${{ needs.version.outputs.repo }}:${{ needs.version.outputs.version }}
+          artifact-name: sbom-${{ needs.version.outputs.version }}.spdx.json
+          output-file: /tmp/sbom-${{ needs.version.outputs.version }}.spdx.json
+
       # ── Git tag + GitHub Release ──────────────────────────────────────
       - name: Create git tag
         run: |
@@ -201,5 +222,6 @@ jobs:
           name: Release ${{ needs.version.outputs.tag }}
           generate_release_notes: true
           make_latest: true
+          files: /tmp/sbom-${{ needs.version.outputs.version }}.spdx.json
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

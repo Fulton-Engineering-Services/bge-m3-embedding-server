@@ -74,20 +74,30 @@ impl EmbedPool {
                         let _span_guard = span.enter();
 
                         info!("Loading dense model (worker {id})...");
+                        let dense_start = std::time::Instant::now();
                         let mut dense_model = TextEmbedding::try_new(
                             TextInitOptions::new(EmbeddingModel::BGEM3)
                                 .with_cache_dir(cache_dir_clone.clone())
                                 .with_show_download_progress(id == 0),
                         )
                         .map_err(|e| anyhow::anyhow!("Failed to load dense model: {e}"))?;
+                        tracing::info!(
+                            elapsed_ms = dense_start.elapsed().as_millis(),
+                            "Dense model loaded (worker {id})"
+                        );
 
                         info!("Loading sparse model (worker {id})...");
+                        let sparse_start = std::time::Instant::now();
                         let mut sparse_model = SparseTextEmbedding::try_new(
                             SparseInitOptions::new(SparseModel::BGEM3)
                                 .with_cache_dir(cache_dir_clone)
                                 .with_show_download_progress(false),
                         )
                         .map_err(|e| anyhow::anyhow!("Failed to load sparse model: {e}"))?;
+                        tracing::info!(
+                            elapsed_ms = sparse_start.elapsed().as_millis(),
+                            "Sparse model loaded (worker {id})"
+                        );
 
                         info!("Worker {id} models loaded — signaling ready");
 

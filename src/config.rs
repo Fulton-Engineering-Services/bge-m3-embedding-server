@@ -1,15 +1,34 @@
 use std::env;
 
+/// Runtime configuration loaded from environment variables.
+///
+/// All fields are read once at startup via [`Config::from_env`]. Changes to
+/// environment variables after startup have no effect.
 pub struct Config {
+    /// Path to the directory where ONNX model files are cached.
+    ///
+    /// Set with `BGE_M3_CACHE_DIR`. Defaults to `/cache`.
     pub cache_dir: String,
-    /// Bind address. Defaults to `0.0.0.0:8081` — intentional for Docker
-    /// container deployments where all interfaces must be reachable (SEC-5).
+    /// TCP bind address for the HTTP server.
+    ///
+    /// Set with `BGE_M3_BIND`. Defaults to `0.0.0.0:8081`.
+    /// The `0.0.0.0` default is intentional for Docker container deployments.
     pub bind_addr: String,
+    /// Number of embedding worker threads to spawn.
+    ///
+    /// Set with `BGE_M3_WORKERS`. Defaults to `2`. Minimum effective value is `1`.
+    /// Each worker loads its own model instance.
     pub workers: usize,
+    /// Maximum number of input texts accepted in a single request.
+    ///
+    /// Set with `BGE_M3_MAX_BATCH`. Defaults to `256`. Minimum effective value is `1`.
     pub max_batch: usize,
 }
 
 impl Config {
+    /// Creates a [`Config`] by reading environment variables.
+    ///
+    /// Unrecognized or missing variables fall back to their defaults.
     pub fn from_env() -> Self {
         Self::from_lookup(|key| env::var(key).ok())
     }
