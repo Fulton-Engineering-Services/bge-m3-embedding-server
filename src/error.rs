@@ -6,11 +6,17 @@ use axum::{
 use serde_json::json;
 use tracing::error;
 
-/// Application-level error type that maps to HTTP responses.
+/// Application-level errors that map to HTTP status codes.
 #[derive(Debug)]
 pub enum AppError {
+    /// The request was malformed or violates input constraints.
+    /// Maps to HTTP 400 Bad Request.
     InvalidRequest(String),
+    /// The service is not yet ready (model loading) or has no live workers.
+    /// Maps to HTTP 503 Service Unavailable.
     ServiceUnavailable(String),
+    /// An unexpected internal error occurred during embedding.
+    /// Maps to HTTP 500 Internal Server Error.
     Internal(String),
 }
 

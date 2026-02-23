@@ -15,6 +15,12 @@ use crate::state::AppState;
 /// Maximum characters allowed per individual input string (SEC-3).
 const MAX_STRING_CHARS: usize = 32_768;
 
+/// Validates a batch of input texts against size and length constraints.
+///
+/// Returns [`AppError::InvalidRequest`] if:
+/// - `texts` is empty
+/// - `texts.len() > max_batch`
+/// - any individual text exceeds [`MAX_STRING_CHARS`] characters
 fn validate_input(texts: &[String], max_batch: usize) -> Result<(), AppError> {
     if texts.is_empty() {
         return Err(AppError::InvalidRequest(
@@ -39,6 +45,10 @@ fn validate_input(texts: &[String], max_batch: usize) -> Result<(), AppError> {
     Ok(())
 }
 
+/// Checks whether the service is ready to handle embedding requests.
+///
+/// Returns [`AppError::ServiceUnavailable`] if the model has not finished
+/// loading or if all workers have exited.
 fn check_ready(state: &AppState) -> Result<(), AppError> {
     if !state.ready.load(Ordering::Acquire) {
         return Err(AppError::ServiceUnavailable("model not ready".to_string()));
@@ -424,7 +434,7 @@ mod tests {
         };
         let result = dense_embeddings(State(state), Json(req)).await;
         assert!(result.is_ok(), "expected Ok but got: {:?}", result.err());
-        let Json(resp) = result.unwrap();
+        let Json(resp) = result.expect("dense_embeddings should succeed");
         assert_eq!(resp.data.len(), 2);
         assert_eq!(resp.data[0].embedding, vec![0.1f32, 0.2, 0.3]);
         assert_eq!(resp.data[1].embedding, vec![0.4, 0.5, 0.6]);
@@ -458,7 +468,7 @@ mod tests {
             result.is_ok(),
             "expected Ok but got error from sparse handler"
         );
-        let Json(resp) = result.unwrap();
+        let Json(resp) = result.expect("sparse_embeddings should succeed");
         assert_eq!(resp.data.len(), 1);
         assert_eq!(resp.data[0].sparse_values.indices, vec![42u32]);
         assert_eq!(resp.data[0].sparse_values.values, vec![0.5f32]);
