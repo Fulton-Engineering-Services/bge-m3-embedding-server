@@ -14,6 +14,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Hand-crafted OpenAPI 3.1 specification (`openapi.yaml`) covering all three endpoints with full request/response schemas, `TextInput` `oneOf`, and component definitions
 - README API Reference section linking to `openapi.yaml`
 
+### Changed
+- MSRV raised from 1.75 → 1.85 (transitive dependency `aligned v0.4.3` requires `edition2024`, stabilised in Rust 1.85)
+
 ## [0.5.0] - 2026-02-23
 
 ### Added

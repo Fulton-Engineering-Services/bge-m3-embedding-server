@@ -56,20 +56,16 @@ jobs:
         run: cargo nextest run --all-features --no-tests=warn
 
   msrv:
-    name: MSRV (1.75)
+    name: MSRV (1.85)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
       - uses: dtolnay/rust-toolchain@efa25f7f19611383d5b0ccf2d1c8914531636bf9  # stable
         with:
-          toolchain: "1.75"
+          toolchain: "1.85"
       - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5  # v2
-      - name: Remove Cargo.lock (lock file v4 is unreadable by cargo < 1.78)
-        run: rm Cargo.lock
       - name: Check (MSRV)
-        # --bins skips dev-deps; criterion pulls in aligned v0.4.3 which requires
-        # edition2024 (only stabilised in cargo 1.85) — not needed for the production binary
-        run: cargo check --bins
+        run: cargo check --all-features
 
   coverage:
     name: Code Coverage
