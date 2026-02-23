@@ -6,6 +6,13 @@ on:
   pull_request:
     branches: [main]
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
@@ -39,7 +46,7 @@ jobs:
       - uses: taiki-e/install-action@cargo-nextest
 
       - name: Run tests
-        run: cargo nextest run --all-features --no-tests=pass
+        run: cargo nextest run --all-features --no-tests=warn
 
   deny:
     name: Supply Chain Security

@@ -4,6 +4,7 @@ use fastembed::{
     TextEmbedding, TextInitOptions,
 };
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio::task::JoinHandle;
@@ -23,9 +24,25 @@ pub enum EmbedRequest {
     },
 }
 
+/// RAII guard that decrements the live-worker counter when dropped.
+/// Guarantees decrement fires on clean exit AND on panic unwind.
+struct WorkerGuard(Arc<AtomicUsize>);
+
+impl Drop for WorkerGuard {
+    fn drop(&mut self) {
+        let remaining = self.0.fetch_sub(1, Ordering::AcqRel).saturating_sub(1);
+        if remaining == 0 {
+            tracing::error!("All embedding workers have exited — pool is degraded");
+        } else {
+            tracing::warn!(remaining, "Embedding worker exited");
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct EmbedPool {
     tx: mpsc::Sender<EmbedRequest>,
+    live_workers: Arc<AtomicUsize>,
 }
 
 impl EmbedPool {
@@ -38,6 +55,9 @@ impl EmbedPool {
         // Capacity = n so senders never block.
         let (ready_tx, mut ready_rx) = mpsc::channel::<Result<()>>(n);
 
+        let live_workers = Arc::new(AtomicUsize::new(n));
+        let live_workers_for_init = Arc::clone(&live_workers);
+
         let init_handle = tokio::task::spawn(
             async move {
                 let mut worker_handles = Vec::with_capacity(n);
@@ -46,10 +66,12 @@ impl EmbedPool {
                     let rx_clone = Arc::clone(&rx);
                     let cache_dir_clone = cache_dir.clone();
                     let ready_tx_clone = ready_tx.clone();
+                    let live_for_worker = Arc::clone(&live_workers_for_init);
 
                     let handle = tokio::task::spawn_blocking(move || {
+                        let _guard = WorkerGuard(Arc::clone(&live_for_worker));
                         let span = info_span!("worker", id = id);
-                        let _guard = span.enter();
+                        let _span_guard = span.enter();
 
                         info!("Loading dense model (worker {id})...");
                         let mut dense_model = TextEmbedding::try_new(
@@ -141,7 +163,7 @@ impl EmbedPool {
             .instrument(info_span!("embed_pool")),
         );
 
-        (Self { tx }, init_handle)
+        (Self { tx, live_workers }, init_handle)
     }
 
     pub async fn dense(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>> {
@@ -171,15 +193,24 @@ impl EmbedPool {
             .await
             .map_err(|_| anyhow::anyhow!("Worker dropped reply sender"))?
     }
+
+    /// Returns the number of currently live embedding workers.
+    /// Returns 0 if all workers have exited (pool is fully degraded).
+    pub fn live_worker_count(&self) -> usize {
+        self.live_workers.load(Ordering::Acquire)
+    }
 }
 
 #[cfg(test)]
 impl EmbedPool {
-    /// Creates an EmbedPool with an already-closed channel for testing error paths.
+    /// Creates an [`EmbedPool`] with an already-closed channel for testing error paths.
     pub(crate) fn closed_for_test() -> Self {
         let (tx, rx) = mpsc::channel::<EmbedRequest>(1);
         drop(rx);
-        Self { tx }
+        Self {
+            tx,
+            live_workers: Arc::new(AtomicUsize::new(0)),
+        }
     }
 }
 
