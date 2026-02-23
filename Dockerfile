@@ -1,10 +1,15 @@
-FROM rust:1.88-bookworm AS builder
-WORKDIR /app
+FROM ubuntu:24.04 AS builder
 
-# ort-sys links pre-built ONNX Runtime C++ objects that need libstdc++
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends g++ \
+    && apt-get install -y --no-install-recommends \
+       curl ca-certificates build-essential pkg-config libssl-dev \
     && rm -rf /var/lib/apt/lists/*
+
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+    | sh -s -- -y --default-toolchain stable
+ENV PATH="/root/.cargo/bin:${PATH}"
+
+WORKDIR /app
 
 # Cache dependency compilation by building a dummy binary first
 COPY Cargo.toml Cargo.lock ./
@@ -15,9 +20,9 @@ RUN mkdir src && echo "fn main(){}" > src/main.rs \
 COPY src ./src
 RUN touch src/main.rs && cargo build --release
 
-FROM debian:bookworm-slim
+FROM ubuntu:24.04
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates libssl3 \
+    && apt-get install -y --no-install-recommends ca-certificates libssl3t64 \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /app/target/release/bge-m3-axum-fastembed-rs /usr/local/bin/
