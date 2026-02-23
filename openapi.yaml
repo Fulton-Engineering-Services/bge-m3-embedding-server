@@ -7,7 +7,7 @@ info:
     - **Dense embeddings** (`/v1/embeddings`): OpenAI-compatible endpoint returning 1024-dimensional float vectors.
     - **Sparse embeddings** (`/v1/sparse-embeddings`): BGE-M3 SPLADE-style sparse token weights.
     - **Health** (`/health`): Readiness probe with worker pool status.
-  version: "0.5.0"
+  version: "0.6.0"
   license:
     name: MIT OR Apache-2.0
   contact:
