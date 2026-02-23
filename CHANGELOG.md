@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-02-23
+
+### Added
+- `BGE_M3_LOG_FORMAT=json` environment variable for structured JSON log output
+- `EmbedPool::with_fixed_responses()` test fixture for happy-path handler tests
+- Happy-path dense and sparse embedding handler tests (53 tests total, up from 51)
+- `SECURITY.md`, `CONTRIBUTING.md`, `CHANGELOG.md` community health files
+- README status badges (CI, Release, License, Docker)
+- `dependabot.yml` for weekly automated dependency updates (github-actions + cargo)
+
+### Changed
+- Dockerfile: non-root `USER bge`, `curl` removed from runtime, HEALTHCHECK uses bash TCP check
+- Dockerfile: base image `ubuntu:24.04` pinned to SHA256 digest
+- GitHub Actions: all action refs SHA-pinned for supply chain security
+
 ## [0.3.0] - 2026-02-23
 
 ### Added
@@ -39,7 +54,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Multi-arch Docker images (linux/amd64, linux/arm64) via GHCR
 - Automated release workflow via GitHub Actions
 
-[Unreleased]: https://github.com/fultonengineeringservices/bge-m3-axum-fastembed-rs/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/fultonengineeringservices/bge-m3-axum-fastembed-rs/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/fultonengineeringservices/bge-m3-axum-fastembed-rs/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/fultonengineeringservices/bge-m3-axum-fastembed-rs/compare/v0.2.1...v0.3.0
 [0.2.1]: https://github.com/fultonengineeringservices/bge-m3-axum-fastembed-rs/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/fultonengineeringservices/bge-m3-axum-fastembed-rs/releases/tag/v0.2.0
