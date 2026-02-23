@@ -43,6 +43,14 @@ curl -s http://localhost:8081/v1/sparse-embeddings \
 
 ## API Reference
 
+Full OpenAPI 3.1 specification: [`openapi.yaml`](./openapi.yaml)
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/v1/embeddings` | `POST` | Dense embeddings — OpenAI-compatible |
+| `/v1/sparse-embeddings` | `POST` | Sparse embeddings — BGE-M3 SPLADE-style |
+| `/health` | `GET` | Readiness probe with worker pool status |
+
 ### `GET /health`
 
 Returns `200 OK` once the worker pool is fully initialized. Returns `503 Service Unavailable`

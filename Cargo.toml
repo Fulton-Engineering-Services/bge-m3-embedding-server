@@ -26,6 +26,11 @@ uuid = { version = "1", features = ["v4"] }
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 proptest = "1"
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "embeddings"
+harness = false
 
 [profile.release]
 lto = "thin"
