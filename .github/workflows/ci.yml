@@ -67,7 +67,9 @@ jobs:
       - name: Remove Cargo.lock (lock file v4 is unreadable by cargo < 1.78)
         run: rm Cargo.lock
       - name: Check (MSRV)
-        run: cargo check --all-features
+        # --bins skips dev-deps; criterion pulls in aligned v0.4.3 which requires
+        # edition2024 (only stabilised in cargo 1.85) — not needed for the production binary
+        run: cargo check --bins
 
   coverage:
     name: Code Coverage
