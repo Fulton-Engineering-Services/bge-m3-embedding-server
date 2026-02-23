@@ -15,7 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - README API Reference section linking to `openapi.yaml`
 
 ### Changed
-- MSRV raised from 1.75 → 1.85 (transitive dependency `aligned v0.4.3` requires `edition2024`, stabilised in Rust 1.85)
+- MSRV raised from 1.75 → 1.88 (`aligned v0.4.3` requires `edition2024`/Rust 1.85; `ort v2.0.0-rc.11` requires Rust 1.88)
 
 ## [0.5.0] - 2026-02-23
 
