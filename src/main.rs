@@ -5,6 +5,7 @@ mod handler;
 mod models;
 mod state;
 
+use axum::extract::DefaultBodyLimit;
 use axum::{routing::get, routing::post, Router};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -46,6 +47,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/embeddings", post(handler::dense_embeddings))
         .route("/v1/sparse-embeddings", post(handler::sparse_embeddings))
         .route("/health", get(handler::health))
+        .layer(DefaultBodyLimit::max(2_097_152)) // 2 MiB explicit limit (SEC-2)
         .layer(TraceLayer::new_for_http())
         .with_state(Arc::clone(&state));
 
@@ -67,17 +69,19 @@ async fn main() -> anyhow::Result<()> {
             }
         }
 
-        // Warm-up probe: verify the pool can actually serve requests.
-        match state_for_readiness.pool.dense(vec!["ready".into()]).await {
-            Ok(_) => {
-                state_for_readiness.ready.store(true, Ordering::Release);
-                info!("Model ready — accepting requests");
-            }
-            Err(e) => {
-                error!("Readiness probe failed: {e}");
-                std::process::exit(1);
-            }
+        // Warm-up probe: verify the pool can serve both dense and sparse
+        // requests before accepting traffic (COR-3).
+        if let Err(e) = state_for_readiness.pool.dense(vec!["ready".into()]).await {
+            error!("Dense readiness probe failed: {e}");
+            std::process::exit(1);
         }
+        if let Err(e) = state_for_readiness.pool.sparse(vec!["ready".into()]).await {
+            error!("Sparse readiness probe failed: {e}");
+            std::process::exit(1);
+        }
+
+        state_for_readiness.ready.store(true, Ordering::Release);
+        info!("Models ready — accepting requests");
     });
 
     axum::serve(listener, app).await?;

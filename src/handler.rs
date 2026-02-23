@@ -12,6 +12,9 @@ use crate::state::AppState;
 // Internal helpers
 // ---------------------------------------------------------------------------
 
+/// Maximum characters allowed per individual input string (SEC-3).
+const MAX_STRING_CHARS: usize = 32_768;
+
 fn validate_input(texts: &[String], max_batch: usize) -> Result<(), AppError> {
     if texts.is_empty() {
         return Err(AppError::InvalidRequest(
@@ -24,6 +27,14 @@ fn validate_input(texts: &[String], max_batch: usize) -> Result<(), AppError> {
             texts.len(),
             max_batch
         )));
+    }
+    for (i, text) in texts.iter().enumerate() {
+        let char_count = text.chars().count();
+        if char_count > MAX_STRING_CHARS {
+            return Err(AppError::InvalidRequest(format!(
+                "input[{i}] length {char_count} exceeds maximum {MAX_STRING_CHARS} characters"
+            )));
+        }
     }
     Ok(())
 }
@@ -49,7 +60,9 @@ pub async fn dense_embeddings(
     let _model = req.model;
     validate_input(&texts, state.max_batch)?;
 
-    let prompt_tokens: usize = texts.iter().map(|t| t.len() / 4 + 1).sum();
+    // Approximate token count using char length (COR-4). Char-based is more
+    // accurate than byte-based for multi-byte UTF-8 inputs.
+    let prompt_tokens: usize = texts.iter().map(|t| t.chars().count() / 4 + 1).sum();
 
     let embeddings = state.pool.dense(texts).await?;
 
@@ -123,12 +136,10 @@ mod tests {
     use std::sync::atomic::AtomicBool;
 
     fn make_state(ready: bool, max_batch: usize) -> Arc<AppState> {
-        // We need a real EmbedPool channel to construct AppState, but we
-        // won't actually send requests in these unit tests — we only test
-        // the validation and readiness logic paths that return early.
-        let (pool, _handle) = EmbedPool::spawn(1, std::path::PathBuf::from("/nonexistent"));
+        // Use a closed channel — we only test validation/readiness paths
+        // that return before reaching the pool (TST-5, COR-7).
         Arc::new(AppState {
-            pool,
+            pool: EmbedPool::closed_for_test(),
             ready: AtomicBool::new(ready),
             max_batch,
         })
@@ -167,14 +178,14 @@ mod tests {
 
     // --- check_ready ---
 
-    #[tokio::test]
-    async fn check_ready_returns_ok_when_ready() {
+    #[test]
+    fn check_ready_returns_ok_when_ready() {
         let state = make_state(true, 10);
         assert!(check_ready(&state).is_ok());
     }
 
-    #[tokio::test]
-    async fn check_ready_returns_err_when_not_ready() {
+    #[test]
+    fn check_ready_returns_err_when_not_ready() {
         let state = make_state(false, 10);
         let result = check_ready(&state);
         assert!(
@@ -264,5 +275,38 @@ mod tests {
         };
         let result = sparse_embeddings(State(state), Json(req)).await;
         assert!(matches!(result, Err(AppError::InvalidRequest(_))));
+    }
+
+    #[tokio::test]
+    async fn sparse_embeddings_rejects_over_batch() {
+        use crate::models::TextInput;
+        let state = make_state(true, 2);
+        let req = SparseRequest {
+            input: TextInput(vec!["a".to_string(), "b".to_string(), "c".to_string()]),
+        };
+        let result = sparse_embeddings(State(state), Json(req)).await;
+        assert!(matches!(result, Err(AppError::InvalidRequest(_))));
+    }
+
+    // --- per-string length validation ---
+
+    #[test]
+    fn validate_input_rejects_oversized_string() {
+        let long = "x".repeat(super::MAX_STRING_CHARS + 1);
+        let texts = vec![long];
+        let result = validate_input(&texts, 256);
+        assert!(
+            matches!(result, Err(AppError::InvalidRequest(msg)) if msg.contains("exceeds maximum"))
+        );
+    }
+
+    #[test]
+    fn validate_input_accepts_at_char_limit() {
+        let at_limit = "x".repeat(super::MAX_STRING_CHARS);
+        let texts = vec![at_limit];
+        assert!(
+            validate_input(&texts, 256).is_ok(),
+            "string exactly at MAX_STRING_CHARS should be accepted"
+        );
     }
 }

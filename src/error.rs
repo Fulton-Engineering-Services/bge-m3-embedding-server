@@ -4,6 +4,7 @@ use axum::{
     Json,
 };
 use serde_json::json;
+use tracing::error;
 
 /// Application-level error type that maps to HTTP responses.
 #[derive(Debug)]
@@ -50,7 +51,8 @@ impl IntoResponse for AppError {
 
 impl From<anyhow::Error> for AppError {
     fn from(err: anyhow::Error) -> Self {
-        AppError::Internal(err.to_string())
+        error!(error = %err, "Internal error");
+        AppError::Internal("internal server error".to_string())
     }
 }
 
@@ -99,5 +101,17 @@ mod tests {
         assert_eq!(body["error"]["code"], 500);
         assert_eq!(body["error"]["type"], "internal_error");
         assert_eq!(body["error"]["message"], "unexpected failure");
+    }
+
+    #[tokio::test]
+    async fn from_anyhow_error_produces_generic_message() {
+        let err = anyhow::anyhow!("secret path /var/models/onnx failed to load");
+        let app_err: AppError = err.into();
+        let (status, body) = response_parts(app_err).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            body["error"]["message"], "internal server error",
+            "internal details must not leak to client"
+        );
     }
 }

@@ -159,6 +159,33 @@ mod tests {
     }
 
     #[test]
+    fn text_input_rejects_number() {
+        let json = "42";
+        let result = serde_json::from_str::<TextInput>(json);
+        assert!(
+            result.is_err(),
+            "numbers should not deserialize as TextInput"
+        );
+    }
+
+    #[test]
+    fn text_input_rejects_object() {
+        let json = r#"{"key": "value"}"#;
+        let result = serde_json::from_str::<TextInput>(json);
+        assert!(
+            result.is_err(),
+            "objects should not deserialize as TextInput"
+        );
+    }
+
+    #[test]
+    fn text_input_rejects_null() {
+        let json = "null";
+        let result = serde_json::from_str::<TextInput>(json);
+        assert!(result.is_err(), "null should not deserialize as TextInput");
+    }
+
+    #[test]
     fn sparse_response_matches_consumer_format() {
         let response = SparseResponse {
             data: vec![SparseEmbeddingData {

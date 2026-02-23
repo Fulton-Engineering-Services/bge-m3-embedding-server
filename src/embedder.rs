@@ -14,6 +14,9 @@ pub enum EmbedRequest {
         texts: Vec<String>,
         reply: oneshot::Sender<Result<Vec<Vec<f32>>>>,
     },
+    // TODO(ARC-2): EmbedPool currently exposes fastembed::SparseEmbedding
+    // directly, coupling callers to fastembed internals. A future
+    // SparseResult newtype would decouple this.
     Sparse {
         texts: Vec<String>,
         reply: oneshot::Sender<Result<Vec<SparseEmbedding>>>,
@@ -31,13 +34,18 @@ impl EmbedPool {
         let (tx, rx) = mpsc::channel::<EmbedRequest>(capacity);
         let rx = Arc::new(Mutex::new(rx));
 
+        // Readiness channel: each worker sends Ok(()) after loading models.
+        // Capacity = n so senders never block.
+        let (ready_tx, mut ready_rx) = mpsc::channel::<Result<()>>(n);
+
         let init_handle = tokio::task::spawn(
             async move {
-                let mut handles = Vec::with_capacity(n);
+                let mut worker_handles = Vec::with_capacity(n);
 
                 for id in 0..n {
                     let rx_clone = Arc::clone(&rx);
                     let cache_dir_clone = cache_dir.clone();
+                    let ready_tx_clone = ready_tx.clone();
 
                     let handle = tokio::task::spawn_blocking(move || {
                         let span = info_span!("worker", id = id);
@@ -59,9 +67,21 @@ impl EmbedPool {
                         )
                         .map_err(|e| anyhow::anyhow!("Failed to load sparse model: {e}"))?;
 
-                        info!("Worker {id} models loaded, entering request loop");
+                        info!("Worker {id} models loaded — signaling ready");
 
                         let rt = tokio::runtime::Handle::current();
+                        let _ = rt.block_on(ready_tx_clone.send(Ok(())));
+
+                        // CONCURRENCY NOTE (COR-2): The shared-receiver pattern
+                        // with Mutex serializes which worker is *waiting* for the
+                        // next message — only one worker holds the lock on recv()
+                        // at a time. The Mutex is released as soon as recv()
+                        // returns a message, allowing the next idle worker to
+                        // acquire it. Under normal load (ONNX inference takes
+                        // 10-100ms per request), at most one request is queued
+                        // behind the lock. This is acceptable for this service's
+                        // throughput requirements.
+                        info!("Worker {id} entering request loop");
                         loop {
                             let request = rt.block_on(async { rx_clone.lock().await.recv().await });
 
@@ -88,14 +108,33 @@ impl EmbedPool {
                         Ok::<(), anyhow::Error>(())
                     });
 
-                    handles.push(handle);
+                    worker_handles.push(handle);
                 }
 
-                for handle in handles {
-                    handle
-                        .await
-                        .map_err(|e| anyhow::anyhow!("Worker task panicked: {e}"))??;
+                // Drop our copy so recv() can detect early worker exit.
+                drop(ready_tx);
+
+                // Collect exactly n readiness signals.
+                for i in 0..n {
+                    match ready_rx.recv().await {
+                        Some(Ok(())) => {
+                            info!("Worker {i} signaled ready ({}/{n})", i + 1);
+                        }
+                        Some(Err(e)) => {
+                            return Err(anyhow::anyhow!("Worker failed to load models: {e}"));
+                        }
+                        None => {
+                            return Err(anyhow::anyhow!(
+                                "Worker exited before signaling readiness (got {i}/{n})"
+                            ));
+                        }
+                    }
                 }
+
+                // Workers continue running in the background. Their
+                // spawn_blocking tasks are detached when handles are dropped
+                // and will self-terminate when the channel closes (pool drop).
+                drop(worker_handles);
 
                 Ok(())
             }
@@ -131,5 +170,44 @@ impl EmbedPool {
         reply_rx
             .await
             .map_err(|_| anyhow::anyhow!("Worker dropped reply sender"))?
+    }
+}
+
+#[cfg(test)]
+impl EmbedPool {
+    /// Creates an EmbedPool with an already-closed channel for testing error paths.
+    pub(crate) fn closed_for_test() -> Self {
+        let (tx, rx) = mpsc::channel::<EmbedRequest>(1);
+        drop(rx);
+        Self { tx }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn dense_returns_error_when_channel_closed() {
+        let pool = EmbedPool::closed_for_test();
+        let result = pool.dense(vec!["hello".into()]).await;
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().to_string().contains("channel closed"),
+            "expected channel closed error"
+        );
+    }
+
+    #[tokio::test]
+    async fn sparse_returns_error_when_channel_closed() {
+        let pool = EmbedPool::closed_for_test();
+        let result = pool.sparse(vec!["hello".into()]).await;
+        // SparseEmbedding doesn't implement Debug, so use .err().unwrap()
+        // instead of .unwrap_err().
+        let err = result.err().expect("expected an error");
+        assert!(
+            err.to_string().contains("channel closed"),
+            "expected channel closed error"
+        );
     }
 }
