@@ -22,10 +22,13 @@ RUN touch src/main.rs && cargo build --release
 
 FROM ubuntu:24.04
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates libssl3t64 \
+    && apt-get install -y --no-install-recommends ca-certificates curl libssl3t64 \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /app/target/release/bge-m3-axum-fastembed-rs /usr/local/bin/
+
+HEALTHCHECK --interval=10s --timeout=3s --start-period=120s --retries=3 \
+    CMD curl -sf http://localhost:8081/health || exit 1
 
 EXPOSE 8081
 CMD ["bge-m3-axum-fastembed-rs"]

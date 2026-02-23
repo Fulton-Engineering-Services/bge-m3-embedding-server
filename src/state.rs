@@ -1,8 +1,8 @@
-use crate::embedder::Embedder;
+use crate::embedder::EmbedPool;
 use std::sync::atomic::AtomicBool;
-use tokio::sync::Mutex;
 
 pub struct AppState {
-    pub embedder: Mutex<Option<Embedder>>,
+    pub pool: EmbedPool,
     pub ready: AtomicBool,
+    pub max_batch: usize,
 }
