@@ -4,7 +4,7 @@ mod handler;
 mod models;
 mod state;
 
-use axum::{Router, routing::get, routing::post};
+use axum::{routing::get, routing::post, Router};
 use std::path::Path;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
@@ -20,8 +20,7 @@ use state::AppState;
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
 
@@ -47,10 +46,8 @@ async fn main() -> anyhow::Result<()> {
     let state_for_loader = Arc::clone(&state);
     tokio::spawn(async move {
         info!("Loading BGE-M3 sparse model...");
-        let result = tokio::task::spawn_blocking(move || {
-            Embedder::new(Path::new(&cache_dir))
-        })
-        .await;
+        let result =
+            tokio::task::spawn_blocking(move || Embedder::new(Path::new(&cache_dir))).await;
 
         match result {
             Ok(Ok(embedder)) => {

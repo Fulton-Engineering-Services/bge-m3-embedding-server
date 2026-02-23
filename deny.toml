@@ -1,0 +1,38 @@
+# cargo-deny configuration (v2 format, cargo-deny >= 0.16)
+# https://embarkstudios.github.io/cargo-deny/
+
+[advisories]
+unmaintained = "workspace"
+yanked = "warn"
+ignore = []
+
+[licenses]
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "OpenSSL",
+    "Zlib",
+    "CC0-1.0",
+    "Unlicense",
+    "MPL-2.0",                # option-ext (dirs-sys → hf-hub → fastembed)
+    "NCSA",                   # libfuzzer-sys (rav1e → image → fastembed)
+    "CDLA-Permissive-2.0",   # webpki-roots, webpki-root-certs (ureq → ort-sys)
+]
+
+[licenses.private]
+ignore = true
+
+[bans]
+multiple-versions = "warn"
+wildcards = "allow"
+
+[sources]
+unknown-registry = "warn"
+unknown-git = "warn"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
