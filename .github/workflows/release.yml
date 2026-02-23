@@ -93,6 +93,7 @@ jobs:
     needs: [version]
     if: needs.version.outputs.exists == 'false'
     permissions:
+      contents: read
       packages: write
     strategy:
       fail-fast: true
