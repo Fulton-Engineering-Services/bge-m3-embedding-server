@@ -4,8 +4,8 @@
 
 | Version | Supported |
 |---------|-----------|
-| 0.4.x   | ✓         |
-| 0.3.x   | ✗         |
+| 0.5.x   | ✓         |
+| 0.4.x   | ✗         |
 
 Older versions receive no security updates. Please upgrade to the latest release.
 

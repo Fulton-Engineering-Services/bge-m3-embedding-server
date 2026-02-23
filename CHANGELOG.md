@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-02-23
+
+### Added
+- `X-Request-ID` header on every response via `tower-http` `SetRequestIdLayer` + `PropagateRequestIdLayer` (UUID v4)
+- Model load timing: dense and sparse model load duration logged as structured `elapsed_ms` field
+- SBOM generation (`anchore/sbom-action`, SPDX format) attached to each GitHub Release
+- Docker image signing with `sigstore/cosign` (keyless OIDC) in the release workflow
+- MSRV CI job: `cargo check` on Rust 1.75 (matching `rust-version` in `Cargo.toml`)
+- Code coverage CI job: `cargo llvm-cov` → Codecov upload (`fail_ci_if_error: false`)
+- Beta channel test matrix: `test` job now runs on both `stable` and `beta` (`continue-on-error` for beta)
+- Property-based tests for `TextInput` deserialization using `proptest` (4 tests, 1024 generated cases)
+- Doc comments on `Config`, `AppError`, `AppState`, `validate_input`, `check_ready`
+- `CODE_OF_CONDUCT.md` (Contributor Covenant v2.1)
+- GitHub issue templates (`bug_report.yml`, `feature_request.yml`) and PR template
+
+### Changed
+- `.unwrap()` → `.expect("...")` in all test code (main.rs, handler.rs)
+- Test count: 53 → 59 unit tests
+
 ## [0.4.0] - 2026-02-23
 
 ### Added
@@ -54,7 +73,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Multi-arch Docker images (linux/amd64, linux/arm64) via GHCR
 - Automated release workflow via GitHub Actions
 
-[Unreleased]: https://github.com/fultonengineeringservices/bge-m3-axum-fastembed-rs/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/fultonengineeringservices/bge-m3-axum-fastembed-rs/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/fultonengineeringservices/bge-m3-axum-fastembed-rs/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/fultonengineeringservices/bge-m3-axum-fastembed-rs/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/fultonengineeringservices/bge-m3-axum-fastembed-rs/compare/v0.2.1...v0.3.0
 [0.2.1]: https://github.com/fultonengineeringservices/bge-m3-axum-fastembed-rs/compare/v0.2.0...v0.2.1
