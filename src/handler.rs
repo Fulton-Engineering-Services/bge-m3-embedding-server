@@ -405,4 +405,62 @@ mod tests {
             "string exactly at MAX_STRING_CHARS should be accepted"
         );
     }
+
+    // --- happy-path tests (using fixture pool) ---
+
+    #[tokio::test]
+    async fn dense_embeddings_returns_correct_shape() {
+        use crate::models::TextInput;
+        let fixture = vec![vec![0.1f32, 0.2, 0.3], vec![0.4, 0.5, 0.6]];
+        let state = Arc::new(AppState {
+            pool: EmbedPool::with_fixed_responses(fixture, vec![]),
+            ready: AtomicBool::new(true),
+            max_batch: 256,
+            total_workers: 1,
+        });
+        let req = DenseRequest {
+            input: TextInput(vec!["hello".into(), "world".into()]),
+            model: None,
+        };
+        let result = dense_embeddings(State(state), Json(req)).await;
+        assert!(result.is_ok(), "expected Ok but got: {:?}", result.err());
+        let Json(resp) = result.unwrap();
+        assert_eq!(resp.data.len(), 2);
+        assert_eq!(resp.data[0].embedding, vec![0.1f32, 0.2, 0.3]);
+        assert_eq!(resp.data[1].embedding, vec![0.4, 0.5, 0.6]);
+        assert_eq!(resp.data[0].index, 0);
+        assert_eq!(resp.data[1].index, 1);
+        assert_eq!(resp.object, "list");
+        assert_eq!(resp.model, "bge-m3");
+    }
+
+    #[tokio::test]
+    async fn sparse_embeddings_returns_correct_shape() {
+        use crate::models::TextInput;
+        // Construct SparseEmbedding using struct literal syntax.
+        // fastembed::SparseEmbedding has public fields: indices: Vec<usize>, values: Vec<f32>.
+        // It does not implement Clone or Debug.
+        let sparse_fixture = vec![fastembed::SparseEmbedding {
+            indices: vec![42usize],
+            values: vec![0.5f32],
+        }];
+        let state = Arc::new(AppState {
+            pool: EmbedPool::with_fixed_responses(vec![], sparse_fixture),
+            ready: AtomicBool::new(true),
+            max_batch: 256,
+            total_workers: 1,
+        });
+        let req = SparseRequest {
+            input: TextInput(vec!["hello".into()]),
+        };
+        let result = sparse_embeddings(State(state), Json(req)).await;
+        assert!(
+            result.is_ok(),
+            "expected Ok but got error from sparse handler"
+        );
+        let Json(resp) = result.unwrap();
+        assert_eq!(resp.data.len(), 1);
+        assert_eq!(resp.data[0].sparse_values.indices, vec![42u32]);
+        assert_eq!(resp.data[0].sparse_values.values, vec![0.5f32]);
+    }
 }

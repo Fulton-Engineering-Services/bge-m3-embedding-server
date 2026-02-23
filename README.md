@@ -1,3 +1,5 @@
+[![CI](https://github.com/fultonengineeringservices/bge-m3-axum-fastembed-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/fultonengineeringservices/bge-m3-axum-fastembed-rs/actions/workflows/ci.yml) [![Release](https://github.com/fultonengineeringservices/bge-m3-axum-fastembed-rs/actions/workflows/release.yml/badge.svg)](https://github.com/fultonengineeringservices/bge-m3-axum-fastembed-rs/actions/workflows/release.yml) [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](LICENSE-MIT) [![Docker Image](https://img.shields.io/badge/docker-ghcr.io-blue)](https://github.com/fultonengineeringservices/bge-m3-axum-fastembed-rs/pkgs/container/bge-m3-axum-fastembed-rs)
+
 # bge-m3-axum-fastembed-rs
 
 An Axum HTTP server that wraps [fastembed-rs](https://github.com/Anush008/fastembed-rs) to serve
