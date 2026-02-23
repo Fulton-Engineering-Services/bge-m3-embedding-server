@@ -1,6 +1,11 @@
 FROM rust:1.88-bookworm AS builder
 WORKDIR /app
 
+# ort-sys links pre-built ONNX Runtime C++ objects that need libstdc++
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends g++ \
+    && rm -rf /var/lib/apt/lists/*
+
 # Cache dependency compilation by building a dummy binary first
 COPY Cargo.toml Cargo.lock ./
 RUN mkdir src && echo "fn main(){}" > src/main.rs \
