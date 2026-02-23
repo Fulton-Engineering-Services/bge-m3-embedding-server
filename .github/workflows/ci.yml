@@ -22,12 +22,12 @@ jobs:
     name: Check & Lint
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+      - uses: dtolnay/rust-toolchain@efa25f7f19611383d5b0ccf2d1c8914531636bf9  # stable
         with:
           components: rustfmt, clippy
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5  # v2
 
       - name: Check formatting
         run: cargo fmt --all --check
@@ -39,11 +39,11 @@ jobs:
     name: Test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+      - uses: dtolnay/rust-toolchain@efa25f7f19611383d5b0ccf2d1c8914531636bf9  # stable
 
-      - uses: Swatinem/rust-cache@v2
-      - uses: taiki-e/install-action@cargo-nextest
+      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5  # v2
+      - uses: taiki-e/install-action@554bdce7edf79d43854a6b7c1e392e7da7eb97a9  # cargo-nextest
 
       - name: Run tests
         run: cargo nextest run --all-features --no-tests=warn
@@ -52,5 +52,5 @@ jobs:
     name: Supply Chain Security
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: EmbarkStudios/cargo-deny-action@v2
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+      - uses: EmbarkStudios/cargo-deny-action@3fd3802e88374d3fe9159b834c7714ec57d6c979  # v2

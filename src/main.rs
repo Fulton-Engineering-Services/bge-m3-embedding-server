@@ -55,12 +55,21 @@ async fn run_readiness_probe(
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
-        )
-        .try_init()
-        .ok();
+    let log_format = std::env::var("BGE_M3_LOG_FORMAT").unwrap_or_default();
+    let env_filter =
+        tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into());
+    if log_format.eq_ignore_ascii_case("json") {
+        tracing_subscriber::fmt()
+            .json()
+            .with_env_filter(env_filter)
+            .try_init()
+            .ok();
+    } else {
+        tracing_subscriber::fmt()
+            .with_env_filter(env_filter)
+            .try_init()
+            .ok();
+    }
 
     let cfg = Config::from_env();
 

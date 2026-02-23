@@ -212,6 +212,44 @@ impl EmbedPool {
             live_workers: Arc::new(AtomicUsize::new(0)),
         }
     }
+
+    /// Creates an [`EmbedPool`] that responds with fixed fixture data for testing happy paths.
+    ///
+    /// The pool has `live_workers = 1` so `check_ready` passes.
+    /// Responds to every dense request with `dense_fixture` and every sparse request
+    /// with `sparse_fixture`, regardless of input text.
+    ///
+    /// Note: `fastembed::SparseEmbedding` does not implement `Clone`, so the sparse
+    /// fixture is consumed on the first sparse call (via `drain`). Tests that call
+    /// sparse should use the fixture for a single request.
+    pub(crate) fn with_fixed_responses(
+        dense_fixture: Vec<Vec<f32>>,
+        sparse_fixture: Vec<fastembed::SparseEmbedding>,
+    ) -> Self {
+        let (tx, mut rx) = mpsc::channel::<EmbedRequest>(8);
+        let dense = Arc::new(dense_fixture);
+        let sparse = Arc::new(std::sync::Mutex::new(sparse_fixture));
+        tokio::spawn(async move {
+            while let Some(req) = rx.recv().await {
+                match req {
+                    EmbedRequest::Dense { reply, .. } => {
+                        let _ = reply.send(Ok((*dense).clone()));
+                    }
+                    EmbedRequest::Sparse { reply, .. } => {
+                        // SparseEmbedding doesn't implement Clone — drain the fixture
+                        // vec on each call. Tests that call sparse should use the
+                        // fixture for a single request.
+                        let result = sparse.lock().unwrap().drain(..).collect();
+                        let _ = reply.send(Ok(result));
+                    }
+                }
+            }
+        });
+        Self {
+            tx,
+            live_workers: Arc::new(AtomicUsize::new(1)),
+        }
+    }
 }
 
 #[cfg(test)]
