@@ -8,4 +8,5 @@ pub struct AppState {
     pub pool: EmbedPool,
     pub ready: AtomicBool,
     pub max_batch: usize,
+    pub total_workers: usize,
 }

@@ -5,8 +5,7 @@ on:
     branches: [main]
 
 permissions:
-  contents: write
-  packages: write
+  contents: read
 
 concurrency:
   group: release-${{ github.ref }}
@@ -47,7 +46,7 @@ jobs:
       - uses: taiki-e/install-action@cargo-nextest
 
       - name: Run tests
-        run: cargo nextest run --all-features --no-tests=pass
+        run: cargo nextest run --all-features --no-tests=warn
 
   deny:
     name: Supply Chain Security
@@ -93,6 +92,8 @@ jobs:
     name: Build (${{ matrix.platform }})
     needs: [version]
     if: needs.version.outputs.exists == 'false'
+    permissions:
+      packages: write
     strategy:
       fail-fast: true
       matrix:
@@ -148,6 +149,9 @@ jobs:
     name: Release
     needs: [version, build]
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
     steps:
       - uses: actions/checkout@v4
         with:

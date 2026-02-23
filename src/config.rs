@@ -40,7 +40,7 @@ mod tests {
     use std::collections::HashMap;
 
     fn lookup_from<'a>(map: &'a HashMap<&'a str, &'a str>) -> impl Fn(&str) -> Option<String> + 'a {
-        move |key| map.get(key).map(|v| v.to_string())
+        move |key| map.get(key).map(|&v| v.to_string())
     }
 
     #[test]

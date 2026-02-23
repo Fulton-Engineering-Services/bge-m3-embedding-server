@@ -3,10 +3,16 @@ name = "bge-m3-axum-fastembed-rs"
 version = "0.2.1"
 edition = "2021"
 license = "MIT OR Apache-2.0"
+description = "Axum HTTP server wrapping fastembed-rs to serve BGE-M3 dense and sparse embeddings"
+repository = "https://github.com/fultonengineeringservices/bge-m3-axum-fastembed-rs"
+readme = "README.md"
+keywords = ["embeddings", "bge-m3", "axum", "nlp", "fastembed"]
+categories = ["web-programming::http-server"]
+rust-version = "1.75"
 
 [dependencies]
 axum = "0.8"
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 fastembed = "5"
@@ -14,3 +20,20 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1"
 tower-http = { version = "0.6", features = ["trace"] }
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+panic = "abort"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }

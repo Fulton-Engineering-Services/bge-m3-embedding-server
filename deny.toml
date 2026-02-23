@@ -3,7 +3,7 @@
 
 [advisories]
 unmaintained = "workspace"
-yanked = "warn"
+yanked = "deny"
 ignore = []
 
 [licenses]

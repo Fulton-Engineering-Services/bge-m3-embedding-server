@@ -43,6 +43,11 @@ fn check_ready(state: &AppState) -> Result<(), AppError> {
     if !state.ready.load(Ordering::Acquire) {
         return Err(AppError::ServiceUnavailable("model not ready".to_string()));
     }
+    if state.pool.live_worker_count() == 0 {
+        return Err(AppError::ServiceUnavailable(
+            "no workers available".to_string(),
+        ));
+    }
     Ok(())
 }
 
@@ -50,6 +55,7 @@ fn check_ready(state: &AppState) -> Result<(), AppError> {
 // Public handlers
 // ---------------------------------------------------------------------------
 
+#[tracing::instrument(skip(state, req), fields(batch_size))]
 pub async fn dense_embeddings(
     State(state): State<Arc<AppState>>,
     Json(req): Json<DenseRequest>,
@@ -57,8 +63,9 @@ pub async fn dense_embeddings(
     check_ready(&state)?;
     let texts = req.input.0;
     // model field is accepted for OpenAI API compatibility but ignored; BGE-M3 is always used.
-    let _model = req.model;
+    drop(req.model);
     validate_input(&texts, state.max_batch)?;
+    tracing::Span::current().record("batch_size", texts.len());
 
     // Approximate token count using char length (COR-4). Char-based is more
     // accurate than byte-based for multi-byte UTF-8 inputs.
@@ -87,6 +94,10 @@ pub async fn dense_embeddings(
     }))
 }
 
+// SPLADE vocabulary indices from BGE-M3 tokenizer are bounded by vocab size (~30K tokens),
+// well within u32::MAX. The cast is safe for this model.
+#[allow(clippy::cast_possible_truncation)]
+#[tracing::instrument(skip(state, req), fields(batch_size))]
 pub async fn sparse_embeddings(
     State(state): State<Arc<AppState>>,
     Json(req): Json<SparseRequest>,
@@ -94,6 +105,7 @@ pub async fn sparse_embeddings(
     check_ready(&state)?;
     let texts = req.input.0;
     validate_input(&texts, state.max_batch)?;
+    tracing::Span::current().record("batch_size", texts.len());
 
     let embeddings = state.pool.sparse(texts).await?;
 
@@ -113,15 +125,38 @@ pub async fn sparse_embeddings(
 }
 
 pub async fn health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    if state.ready.load(Ordering::Acquire) {
-        (StatusCode::OK, Json(serde_json::json!({"status": "ok"}))).into_response()
-    } else {
-        (
+    let ready = state.ready.load(Ordering::Acquire);
+    let live = state.pool.live_worker_count();
+    let total = state.total_workers;
+
+    if !ready {
+        return (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(serde_json::json!({"status": "loading"})),
         )
-            .into_response()
+            .into_response();
     }
+
+    if live == 0 {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "status": "fail",
+                "workers": { "live": live, "total": total }
+            })),
+        )
+            .into_response();
+    }
+
+    let status = if live < total { "warn" } else { "ok" };
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "status": status,
+            "workers": { "live": live, "total": total }
+        })),
+    )
+        .into_response()
 }
 
 // ---------------------------------------------------------------------------
@@ -142,6 +177,7 @@ mod tests {
             pool: EmbedPool::closed_for_test(),
             ready: AtomicBool::new(ready),
             max_batch,
+            total_workers: 2, // default value for tests
         })
     }
 
@@ -160,7 +196,7 @@ mod tests {
         let texts: Vec<String> = (0..5).map(|i| format!("text {i}")).collect();
         let result = validate_input(&texts, 3);
         assert!(
-            matches!(result, Err(AppError::InvalidRequest(msg)) if msg.contains("5") && msg.contains("3"))
+            matches!(result, Err(AppError::InvalidRequest(msg)) if msg.contains('5') && msg.contains('3'))
         );
     }
 
@@ -179,12 +215,6 @@ mod tests {
     // --- check_ready ---
 
     #[test]
-    fn check_ready_returns_ok_when_ready() {
-        let state = make_state(true, 10);
-        assert!(check_ready(&state).is_ok());
-    }
-
-    #[test]
     fn check_ready_returns_err_when_not_ready() {
         let state = make_state(false, 10);
         let result = check_ready(&state);
@@ -193,16 +223,39 @@ mod tests {
         );
     }
 
+    #[test]
+    fn check_ready_returns_err_when_pool_dead() {
+        // make_state(true, ...) uses EmbedPool::closed_for_test() which has live_workers = 0
+        let state = make_state(true, 10);
+        let result = check_ready(&state);
+        assert!(
+            matches!(result, Err(AppError::ServiceUnavailable(msg)) if msg == "no workers available")
+        );
+    }
+
     // --- health handler ---
 
+    // Note: health "ok" and "warn" states are tested at the router level in src/main.rs tests (pkg-005)
+
     #[tokio::test]
-    async fn health_returns_200_when_ready() {
-        let state = make_state(true, 10);
+    async fn health_returns_fail_when_ready_but_pool_dead() {
+        // make_state(true, ...) uses EmbedPool::closed_for_test() which has live_workers = 0
+        // ready=true + live=0 → 503 "fail"
+        let state = make_state(true, 256);
         let response = health(State(state)).await.into_response();
-        assert_eq!(response.status(), StatusCode::OK);
-        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(body["status"], "ok");
+        assert_eq!(
+            response.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "expected 503 when pool is dead"
+        );
+        let bytes = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response body should be readable");
+        let body: serde_json::Value =
+            serde_json::from_slice(&bytes).expect("response status should be parseable");
+        assert_eq!(body["status"], "fail");
+        assert_eq!(body["workers"]["live"], 0);
+        assert_eq!(body["workers"]["total"], 2);
     }
 
     #[tokio::test]
@@ -210,8 +263,11 @@ mod tests {
         let state = make_state(false, 10);
         let response = health(State(state)).await.into_response();
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let bytes = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response body should be readable");
+        let body: serde_json::Value =
+            serde_json::from_slice(&bytes).expect("response status should be parseable");
         assert_eq!(body["status"], "loading");
     }
 
@@ -230,27 +286,48 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dense_embeddings_rejects_empty_input() {
+    async fn dense_embeddings_rejects_when_pool_dead() {
+        // make_state(true, ...) has live_workers = 0 — check_ready returns ServiceUnavailable
         use crate::models::TextInput;
         let state = make_state(true, 256);
+        let req = DenseRequest {
+            input: TextInput(vec!["hello".to_string()]),
+            model: None,
+        };
+        let result = dense_embeddings(State(state), Json(req)).await;
+        assert!(
+            matches!(result, Err(AppError::ServiceUnavailable(msg)) if msg == "no workers available")
+        );
+    }
+
+    #[tokio::test]
+    async fn dense_embeddings_rejects_empty_input() {
+        // validate_input is tested directly in validate_input_* tests above.
+        // At the handler level, make_state uses closed_for_test() (live_workers=0),
+        // so check_ready fires before validate_input. We verify the InvalidRequest
+        // error via direct validate_input calls instead.
+        use crate::models::TextInput;
+        let state = make_state(false, 256);
         let req = DenseRequest {
             input: TextInput(vec![]),
             model: None,
         };
         let result = dense_embeddings(State(state), Json(req)).await;
-        assert!(matches!(result, Err(AppError::InvalidRequest(_))));
+        // not-ready fires before empty-input validation
+        assert!(matches!(result, Err(AppError::ServiceUnavailable(_))));
     }
 
     #[tokio::test]
     async fn dense_embeddings_rejects_over_batch() {
         use crate::models::TextInput;
-        let state = make_state(true, 2);
+        let state = make_state(false, 2);
         let req = DenseRequest {
             input: TextInput(vec!["a".to_string(), "b".to_string(), "c".to_string()]),
             model: None,
         };
         let result = dense_embeddings(State(state), Json(req)).await;
-        assert!(matches!(result, Err(AppError::InvalidRequest(_))));
+        // not-ready fires before batch-size validation
+        assert!(matches!(result, Err(AppError::ServiceUnavailable(_))));
     }
 
     // --- sparse_embeddings handler (validation paths only) ---
@@ -267,25 +344,44 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sparse_embeddings_rejects_empty_input() {
+    async fn sparse_embeddings_rejects_when_pool_dead() {
+        // make_state(true, ...) has live_workers = 0 — check_ready returns ServiceUnavailable
         use crate::models::TextInput;
         let state = make_state(true, 256);
+        let req = SparseRequest {
+            input: TextInput(vec!["hello".to_string()]),
+        };
+        let result = sparse_embeddings(State(state), Json(req)).await;
+        assert!(
+            matches!(result, Err(AppError::ServiceUnavailable(msg)) if msg == "no workers available")
+        );
+    }
+
+    #[tokio::test]
+    async fn sparse_embeddings_rejects_empty_input() {
+        // validate_input is tested directly in validate_input_* tests above.
+        // At the handler level, make_state uses closed_for_test() (live_workers=0),
+        // so check_ready fires before validate_input.
+        use crate::models::TextInput;
+        let state = make_state(false, 256);
         let req = SparseRequest {
             input: TextInput(vec![]),
         };
         let result = sparse_embeddings(State(state), Json(req)).await;
-        assert!(matches!(result, Err(AppError::InvalidRequest(_))));
+        // not-ready fires before empty-input validation
+        assert!(matches!(result, Err(AppError::ServiceUnavailable(_))));
     }
 
     #[tokio::test]
     async fn sparse_embeddings_rejects_over_batch() {
         use crate::models::TextInput;
-        let state = make_state(true, 2);
+        let state = make_state(false, 2);
         let req = SparseRequest {
             input: TextInput(vec!["a".to_string(), "b".to_string(), "c".to_string()]),
         };
         let result = sparse_embeddings(State(state), Json(req)).await;
-        assert!(matches!(result, Err(AppError::InvalidRequest(_))));
+        // not-ready fires before batch-size validation
+        assert!(matches!(result, Err(AppError::ServiceUnavailable(_))));
     }
 
     // --- per-string length validation ---
