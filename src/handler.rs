@@ -137,6 +137,7 @@ pub async fn sparse_embeddings(
 pub async fn health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let ready = state.ready.load(Ordering::Acquire);
     let live = state.pool.live_worker_count();
+    let loaded = state.pool.loaded_worker_count();
     let total = state.total_workers;
 
     if !ready {
@@ -152,6 +153,18 @@ pub async fn health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
             StatusCode::SERVICE_UNAVAILABLE,
             Json(serde_json::json!({
                 "status": "fail",
+                "workers": { "live": live, "total": total }
+            })),
+        )
+            .into_response();
+    }
+
+    // Workers alive but models unloaded after idle timeout — will auto-reload on next request.
+    if loaded == 0 {
+        return (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "status": "idle",
                 "workers": { "live": live, "total": total }
             })),
         )
@@ -266,6 +279,27 @@ mod tests {
         assert_eq!(body["status"], "fail");
         assert_eq!(body["workers"]["live"], 0);
         assert_eq!(body["workers"]["total"], 2);
+    }
+
+    #[tokio::test]
+    async fn health_returns_idle_when_models_unloaded() {
+        // live_workers=1 but loaded_workers=0 — models were unloaded after idle timeout
+        let state = Arc::new(AppState {
+            pool: EmbedPool::idle_for_test(),
+            ready: AtomicBool::new(true),
+            max_batch: 256,
+            total_workers: 1,
+        });
+        let response = health(State(state)).await.into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response body should be readable");
+        let body: serde_json::Value =
+            serde_json::from_slice(&bytes).expect("response status should be parseable");
+        assert_eq!(body["status"], "idle");
+        assert_eq!(body["workers"]["live"], 1);
+        assert_eq!(body["workers"]["total"], 1);
     }
 
     #[tokio::test]

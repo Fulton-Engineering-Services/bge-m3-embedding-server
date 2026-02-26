@@ -94,10 +94,12 @@ async fn main() -> anyhow::Result<()> {
         workers = cfg.workers,
         max_batch = cfg.max_batch,
         cache_dir = %cfg.cache_dir,
+        idle_timeout_secs = cfg.idle_timeout.map(|d| d.as_secs()),
         "Starting bge-m3-axum-fastembed-rs"
     );
 
-    let (pool, init_handle) = EmbedPool::spawn(cfg.workers, PathBuf::from(&cfg.cache_dir));
+    let (pool, init_handle) =
+        EmbedPool::spawn(cfg.workers, PathBuf::from(&cfg.cache_dir), cfg.idle_timeout);
 
     let state = Arc::new(AppState {
         pool,
@@ -163,6 +165,32 @@ mod tests {
         let json: serde_json::Value =
             serde_json::from_slice(&body).expect("body should be valid JSON");
         assert_eq!(json["status"], "loading");
+    }
+
+    #[tokio::test]
+    async fn router_health_returns_200_idle_when_models_unloaded() {
+        let app = build_router(Arc::new(AppState {
+            pool: EmbedPool::idle_for_test(),
+            ready: AtomicBool::new(true),
+            max_batch: 256,
+            total_workers: 1,
+        }));
+        let req = Request::builder()
+            .method("GET")
+            .uri("/health")
+            .body(Body::empty())
+            .expect("request should build");
+        let resp: Response = app.oneshot(req).await.expect("router should respond");
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp
+            .into_body()
+            .collect()
+            .await
+            .expect("body should be readable")
+            .to_bytes();
+        let json: serde_json::Value =
+            serde_json::from_slice(&body).expect("body should be valid JSON");
+        assert_eq!(json["status"], "idle");
     }
 
     #[tokio::test]

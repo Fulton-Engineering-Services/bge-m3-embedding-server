@@ -1,4 +1,5 @@
 use std::env;
+use std::time::Duration;
 
 /// Runtime configuration loaded from environment variables.
 ///
@@ -23,6 +24,14 @@ pub struct Config {
     ///
     /// Set with `BGE_M3_MAX_BATCH`. Defaults to `256`. Minimum effective value is `1`.
     pub max_batch: usize,
+    /// Duration of inactivity after which workers unload their model instances from memory.
+    ///
+    /// Set with `BGE_M3_IDLE_TIMEOUT_SECS`. Defaults to `300` (5 minutes).
+    /// Set to `0` to disable idle unloading entirely.
+    ///
+    /// When unloaded, models are automatically reloaded on the next incoming request.
+    /// The reload blocks the request until complete (~10–30 s from cache).
+    pub idle_timeout: Option<Duration>,
 }
 
 impl Config {
@@ -44,11 +53,17 @@ impl Config {
             .unwrap_or(256)
             .max(1);
 
+        let idle_timeout_secs = lookup("BGE_M3_IDLE_TIMEOUT_SECS")
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(300);
+        let idle_timeout = (idle_timeout_secs > 0).then(|| Duration::from_secs(idle_timeout_secs));
+
         Self {
             cache_dir: lookup("BGE_M3_CACHE_DIR").unwrap_or_else(|| "/cache".to_string()),
             bind_addr: lookup("BGE_M3_BIND").unwrap_or_else(|| "0.0.0.0:8081".to_string()),
             workers,
             max_batch,
+            idle_timeout,
         }
     }
 }
@@ -71,6 +86,7 @@ mod tests {
         assert_eq!(cfg.bind_addr, "0.0.0.0:8081");
         assert_eq!(cfg.workers, 2);
         assert_eq!(cfg.max_batch, 256);
+        assert_eq!(cfg.idle_timeout, Some(Duration::from_secs(300)));
     }
 
     #[test]
@@ -96,6 +112,7 @@ mod tests {
             ("BGE_M3_BIND", "127.0.0.1:9090"),
             ("BGE_M3_WORKERS", "4"),
             ("BGE_M3_MAX_BATCH", "128"),
+            ("BGE_M3_IDLE_TIMEOUT_SECS", "600"),
         ]);
         let cfg = Config::from_lookup(lookup_from(&map));
 
@@ -103,5 +120,30 @@ mod tests {
         assert_eq!(cfg.bind_addr, "127.0.0.1:9090");
         assert_eq!(cfg.workers, 4);
         assert_eq!(cfg.max_batch, 128);
+        assert_eq!(cfg.idle_timeout, Some(Duration::from_secs(600)));
+    }
+
+    #[test]
+    fn idle_timeout_defaults_to_5_minutes() {
+        let map = HashMap::new();
+        let cfg = Config::from_lookup(lookup_from(&map));
+
+        assert_eq!(cfg.idle_timeout, Some(Duration::from_secs(300)));
+    }
+
+    #[test]
+    fn idle_timeout_disabled_when_zero() {
+        let map = HashMap::from([("BGE_M3_IDLE_TIMEOUT_SECS", "0")]);
+        let cfg = Config::from_lookup(lookup_from(&map));
+
+        assert_eq!(cfg.idle_timeout, None);
+    }
+
+    #[test]
+    fn idle_timeout_custom_value() {
+        let map = HashMap::from([("BGE_M3_IDLE_TIMEOUT_SECS", "60")]);
+        let cfg = Config::from_lookup(lookup_from(&map));
+
+        assert_eq!(cfg.idle_timeout, Some(Duration::from_secs(60)));
     }
 }
