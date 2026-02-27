@@ -222,29 +222,33 @@ first run.
 
 ## Architecture
 
-```
-HTTP request
-     │
-     ▼
-  Axum router
-     │
-     ├─ POST /v1/embeddings        ─┐
-     ├─ POST /v1/sparse-embeddings ─┤── handler sends EmbedRequest via mpsc channel
-     └─ GET  /health                │
-                                    ▼
-                       bounded mpsc channel (Arc<Mutex<Receiver>>)
-                          │            │
-                          ▼            ▼
-                      Worker 0      Worker 1  ...  Worker N
-                   (spawn_blocking) (spawn_blocking)
-                   TextEmbedding    TextEmbedding
-                   SparseTextEmb.   SparseTextEmb.
-                          │
-                          ▼
-                    Result sent back via oneshot channel
-                          │
-                          ▼
-                    JSON response to client
+```mermaid
+graph TD
+    Client["HTTP Request"]
+    Router["Axum Router"]
+    Dense["POST /v1/embeddings"]
+    Sparse["POST /v1/sparse-embeddings"]
+    Health["GET /health"]
+    Channel["Bounded mpsc Channel<br/>(Arc&lt;Mutex&lt;Receiver&gt;&gt;)"]
+    W0["Worker 0<br/>(spawn_blocking)<br/>TextEmbedding +<br/>SparseTextEmbedding"]
+    W1["Worker 1<br/>(spawn_blocking)<br/>TextEmbedding +<br/>SparseTextEmbedding"]
+    Wn["Worker N<br/>(spawn_blocking)<br/>TextEmbedding +<br/>SparseTextEmbedding"]
+    Reply["oneshot reply channel"]
+    Response["JSON Response"]
+
+    Client --> Router
+    Router --> Dense
+    Router --> Sparse
+    Router --> Health
+    Dense -->|"EmbedRequest"| Channel
+    Sparse -->|"EmbedRequest"| Channel
+    Channel --> W0
+    Channel --> W1
+    Channel --> Wn
+    W0 --> Reply
+    W1 --> Reply
+    Wn --> Reply
+    Reply --> Response
 ```
 
 **Key design decisions:**
