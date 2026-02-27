@@ -42,6 +42,7 @@ The server starts accepting requests once model warm-up completes (watch logs fo
 | `POST` | `/v1/embeddings` | Dense embeddings (OpenAI-compatible) |
 | `POST` | `/v1/sparse-embeddings` | Sparse embeddings (BGE-M3 SPLADE-style) |
 | `GET` | `/health` | Readiness probe — `200 OK` when ready, `503` while loading; see health states below |
+| `GET` | `/v1/models` | Fleet discovery — returns `{"object":"list","data":[{"id":"bge-m3","object":"model","type":"bge-m3"}]}` |
 
 ### Health States
 
@@ -99,3 +100,4 @@ To release: bump version in `Cargo.toml`, commit, push to `main`. The workflow h
 - `fastembed::SparseEmbedding` does not implement `Debug` — use `.err().expect()` instead of `.unwrap_err()` on `Result<Vec<SparseEmbedding>>`
 - Stale model cache causes silent worker load failures ("Worker exited before signaling readiness") — fix by clearing `BGE_M3_CACHE_DIR`
 - Config tests use `from_lookup()` closure pattern instead of `env::set_var` to avoid process-global state mutation under parallel test execution
+- Always run `cargo fmt --all` before pushing — CI fails `cargo fmt --all --check` even when all tests pass
