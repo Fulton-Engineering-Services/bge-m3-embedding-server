@@ -91,6 +91,24 @@ pub struct SparseValues {
 }
 
 // ---------------------------------------------------------------------------
+// Models list types
+// ---------------------------------------------------------------------------
+
+/// Top-level response for GET /v1/models (OpenAI-compatible).
+#[derive(Debug, Serialize)]
+pub struct ModelsResponse {
+    pub object: &'static str,
+    pub data: Vec<ModelEntry>,
+}
+
+/// A single model entry.
+#[derive(Debug, Serialize)]
+pub struct ModelEntry {
+    pub id: &'static str,
+    pub object: &'static str,
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -246,5 +264,20 @@ mod tests {
             let input: TextInput = serde_json::from_str(json).expect("empty array should deserialize");
             prop_assert_eq!(input.0.len(), 0);
         }
+    }
+
+    #[test]
+    fn models_response_serializes_openai_format() {
+        let resp = ModelsResponse {
+            object: "list",
+            data: vec![ModelEntry {
+                id: "bge-m3",
+                object: "model",
+            }],
+        };
+        let json = serde_json::to_value(&resp).expect("serialize");
+        assert_eq!(json["object"], "list");
+        assert_eq!(json["data"][0]["id"], "bge-m3");
+        assert_eq!(json["data"][0]["object"], "model");
     }
 }

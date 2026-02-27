@@ -35,6 +35,7 @@ pub(crate) fn build_router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/v1/embeddings", post(handler::dense_embeddings))
         .route("/v1/sparse-embeddings", post(handler::sparse_embeddings))
+        .route("/v1/models", get(handler::models))
         .route("/health", get(handler::health))
         .layer(DefaultBodyLimit::max(2_097_152))
         .layer(PropagateRequestIdLayer::x_request_id())
@@ -339,6 +340,21 @@ mod tests {
             .expect("request should build");
         let resp: Response = app.oneshot(req).await.expect("router should respond");
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn router_models_returns_200_with_bge_m3() {
+        let app = build_router(make_test_state(true, 256));
+        let req = Request::builder()
+            .method("GET")
+            .uri("/v1/models")
+            .body(Body::empty())
+            .expect("request should build");
+        let resp: Response = app.oneshot(req).await.expect("router should respond");
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.into_body().collect().await.expect("body readable").to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("valid json");
+        assert_eq!(json["data"][0]["id"], "bge-m3");
     }
 
     // --- RequestId middleware tests ---

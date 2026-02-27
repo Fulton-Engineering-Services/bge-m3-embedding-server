@@ -182,6 +182,18 @@ pub async fn health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
         .into_response()
 }
 
+/// Returns an OpenAI-compatible models list confirming BGE-M3 is resident.
+pub async fn models(State(_state): State<Arc<AppState>>) -> impl IntoResponse {
+    use crate::models::{ModelEntry, ModelsResponse};
+    Json(ModelsResponse {
+        object: "list",
+        data: vec![ModelEntry {
+            id: "bge-m3",
+            object: "model",
+        }],
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -414,6 +426,20 @@ mod tests {
         let result = sparse_embeddings(State(state), Json(req)).await;
         // not-ready fires before empty-input validation
         assert!(matches!(result, Err(AppError::ServiceUnavailable(_))));
+    }
+
+    #[tokio::test]
+    async fn models_handler_returns_bge_m3_entry() {
+        let state = make_state(true, 256);
+        let response = models(State(state)).await.into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body readable");
+        let body: serde_json::Value = serde_json::from_slice(&bytes).expect("valid json");
+        assert_eq!(body["object"], "list");
+        assert_eq!(body["data"][0]["id"], "bge-m3");
+        assert_eq!(body["data"][0]["object"], "model");
     }
 
     #[tokio::test]
