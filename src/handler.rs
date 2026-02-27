@@ -3,8 +3,8 @@ use std::sync::{atomic::Ordering, Arc};
 
 use crate::error::AppError;
 use crate::models::{
-    DenseEmbeddingData, DenseRequest, DenseResponse, SparseEmbeddingData, SparseRequest,
-    SparseResponse, SparseValues, Usage,
+    DenseEmbeddingData, DenseRequest, DenseResponse, ModelEntry, ModelsResponse,
+    SparseEmbeddingData, SparseRequest, SparseResponse, SparseValues, Usage,
 };
 use crate::state::AppState;
 
@@ -184,7 +184,6 @@ pub async fn health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
 
 /// Returns an OpenAI-compatible models list confirming BGE-M3 is resident.
 pub async fn models(State(_state): State<Arc<AppState>>) -> impl IntoResponse {
-    use crate::models::{ModelEntry, ModelsResponse};
     Json(ModelsResponse {
         object: "list",
         data: vec![ModelEntry {
