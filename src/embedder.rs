@@ -81,14 +81,23 @@ fn run_worker(
 
     info!("Loading models (worker {id})...");
     let load_start = std::time::Instant::now();
-    let (initial_dense, initial_sparse) = load_models(&cache_dir, id == 0)?;
-    tracing::info!(
-        elapsed_ms = load_start.elapsed().as_millis(),
-        "Models loaded (worker {id})"
-    );
+    let rt = Handle::current();
+    let (initial_dense, initial_sparse) = match load_models(&cache_dir, id == 0) {
+        Ok(models) => {
+            tracing::info!(
+                elapsed_ms = load_start.elapsed().as_millis(),
+                "Models loaded (worker {id})"
+            );
+            models
+        }
+        Err(e) => {
+            let _ =
+                rt.block_on(ready_tx.send(Err(anyhow::anyhow!("Worker {id} failed to load: {e}"))));
+            return Err(e);
+        }
+    };
 
     info!("Worker {id} models loaded — signaling ready");
-    let rt = Handle::current();
     let _ = rt.block_on(ready_tx.send(Ok(())));
 
     let mut dense_model: Option<TextEmbedding> = Some(initial_dense);
@@ -228,6 +237,21 @@ impl EmbedPool {
     /// `idle_timeout` — if `Some`, workers drop their model instances after this
     /// duration of inactivity and reload them transparently on the next request.
     /// Pass `None` to keep models loaded for the lifetime of the process.
+    ///
+    /// # Cold-start ordering
+    ///
+    /// Worker 0 (the "leader") is spawned and awaited **before** any follower
+    /// workers. This guarantees the model cache is warm before followers start.
+    ///
+    /// `hf-hub` acquires per-blob exclusive file locks (`flock(LOCK_EX)`) during
+    /// download with a hardcoded 5-second retry window. BGE-M3 ONNX models are
+    /// ~2 GB — a fresh download takes minutes, far exceeding that window. If all
+    /// workers start concurrently on an empty cache, followers fail with
+    /// `ApiError::LockAcquisition`. The leader-then-followers ordering avoids
+    /// the contention entirely; followers load from the now-warm local cache.
+    ///
+    /// Idle-timeout reloads are unaffected: model files remain on disk after
+    /// unload, so concurrent reloads never hit the network download path.
     pub fn spawn(
         n: usize,
         cache_dir: PathBuf,
@@ -242,7 +266,9 @@ impl EmbedPool {
         let (ready_tx, mut ready_rx) = mpsc::channel::<Result<()>>(n);
 
         let live_workers = Arc::new(AtomicUsize::new(n));
-        let loaded_workers = Arc::new(AtomicUsize::new(n));
+        // Start at 0; incremented as each worker successfully signals readiness.
+        // This avoids a stale count if the leader or a follower fails during init.
+        let loaded_workers = Arc::new(AtomicUsize::new(0));
         let live_workers_for_init = Arc::clone(&live_workers);
         let loaded_workers_for_init = Arc::clone(&loaded_workers);
 
@@ -250,14 +276,16 @@ impl EmbedPool {
             async move {
                 let mut worker_handles = Vec::with_capacity(n);
 
-                for id in 0..n {
+                // Closure that spawns a single worker, eliminating duplication
+                // between the leader (Phase 1) and follower (Phase 2) paths.
+                let spawn_worker = |id: usize,
+                                    ready_tx_clone: mpsc::Sender<Result<()>>|
+                 -> JoinHandle<Result<()>> {
                     let rx_clone = Arc::clone(&rx);
                     let cache_dir_clone = cache_dir.clone();
-                    let ready_tx_clone = ready_tx.clone();
                     let live_for_worker = Arc::clone(&live_workers_for_init);
                     let loaded_for_worker = Arc::clone(&loaded_workers_for_init);
-
-                    let handle = tokio::task::spawn_blocking(move || {
+                    tokio::task::spawn_blocking(move || {
                         run_worker(
                             id,
                             cache_dir_clone,
@@ -267,19 +295,43 @@ impl EmbedPool {
                             loaded_for_worker,
                             idle_timeout,
                         )
-                    });
+                    })
+                };
 
-                    worker_handles.push(handle);
+                // --- Phase 1: spawn leader worker (may download models) ---
+                worker_handles.push(spawn_worker(0, ready_tx.clone()));
+
+                // Await leader readiness — cache is warm after this succeeds.
+                match ready_rx.recv().await {
+                    Some(Ok(())) => {
+                        loaded_workers_for_init.fetch_add(1, Ordering::AcqRel);
+                        info!("Leader worker ready, model cache warm (1/{n})");
+                    }
+                    Some(Err(e)) => {
+                        return Err(anyhow::anyhow!("Leader worker failed to load models: {e}"));
+                    }
+                    None => {
+                        return Err(anyhow::anyhow!(
+                            "Leader worker exited before signaling readiness"
+                        ));
+                    }
+                }
+
+                // --- Phase 2: spawn follower workers (load from warm cache) ---
+                // When n == 1, both loops below are no-ops (1..1 is empty).
+                for id in 1..n {
+                    worker_handles.push(spawn_worker(id, ready_tx.clone()));
                 }
 
                 // Drop our copy so recv() can detect early worker exit.
                 drop(ready_tx);
 
-                // Collect exactly n readiness signals.
-                for i in 0..n {
+                // Collect follower readiness signals (n - 1 remaining).
+                for i in 1..n {
                     match ready_rx.recv().await {
                         Some(Ok(())) => {
-                            info!("Worker {i} signaled ready ({}/{n})", i + 1);
+                            loaded_workers_for_init.fetch_add(1, Ordering::AcqRel);
+                            info!("Follower worker signaled ready ({}/{n})", i + 1);
                         }
                         Some(Err(e)) => {
                             return Err(anyhow::anyhow!("Worker failed to load models: {e}"));
@@ -427,6 +479,53 @@ impl EmbedPool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Uses an impossible cache path that causes `load_models` to fail
+    /// immediately without any network access or delay.
+    fn bad_cache_dir() -> PathBuf {
+        PathBuf::from("/dev/null/impossible")
+    }
+
+    #[tokio::test]
+    async fn spawn_propagates_leader_load_failure() {
+        let (pool, init_handle) = EmbedPool::spawn(1, bad_cache_dir(), None);
+
+        let result = tokio::time::timeout(Duration::from_secs(5), init_handle)
+            .await
+            .expect("init_handle should resolve quickly, not hang")
+            .expect("JoinHandle should not panic");
+
+        assert!(
+            result.is_err(),
+            "init should return Err on leader load failure"
+        );
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("failed to load"),
+            "error should mention load failure, got: {msg}"
+        );
+
+        // COR-1: loaded_workers must be 0, not the optimistic `n`
+        assert_eq!(pool.loaded_worker_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn spawn_multi_worker_fails_fast_on_leader_failure() {
+        let (pool, init_handle) = EmbedPool::spawn(3, bad_cache_dir(), None);
+
+        let result = tokio::time::timeout(Duration::from_secs(5), init_handle)
+            .await
+            .expect("init_handle should resolve quickly, not hang")
+            .expect("JoinHandle should not panic");
+
+        assert!(
+            result.is_err(),
+            "init should fail without spawning followers"
+        );
+
+        // loaded_workers must still be 0 — no worker succeeded
+        assert_eq!(pool.loaded_worker_count(), 0);
+    }
 
     #[tokio::test]
     async fn dense_returns_error_when_channel_closed() {
