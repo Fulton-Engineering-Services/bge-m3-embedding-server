@@ -352,7 +352,12 @@ mod tests {
             .expect("request should build");
         let resp: Response = app.oneshot(req).await.expect("router should respond");
         assert_eq!(resp.status(), StatusCode::OK);
-        let body = resp.into_body().collect().await.expect("body readable").to_bytes();
+        let body = resp
+            .into_body()
+            .collect()
+            .await
+            .expect("body readable")
+            .to_bytes();
         let json: serde_json::Value = serde_json::from_slice(&body).expect("valid json");
         assert_eq!(json["data"][0]["id"], "bge-m3");
     }
