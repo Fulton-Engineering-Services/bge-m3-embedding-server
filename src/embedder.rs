@@ -81,14 +81,23 @@ fn run_worker(
 
     info!("Loading models (worker {id})...");
     let load_start = std::time::Instant::now();
-    let (initial_dense, initial_sparse) = load_models(&cache_dir, id == 0)?;
-    tracing::info!(
-        elapsed_ms = load_start.elapsed().as_millis(),
-        "Models loaded (worker {id})"
-    );
+    let rt = Handle::current();
+    let (initial_dense, initial_sparse) = match load_models(&cache_dir, id == 0) {
+        Ok(models) => {
+            tracing::info!(
+                elapsed_ms = load_start.elapsed().as_millis(),
+                "Models loaded (worker {id})"
+            );
+            models
+        }
+        Err(e) => {
+            let _ =
+                rt.block_on(ready_tx.send(Err(anyhow::anyhow!("Worker {id} failed to load: {e}"))));
+            return Err(e);
+        }
+    };
 
     info!("Worker {id} models loaded — signaling ready");
-    let rt = Handle::current();
     let _ = rt.block_on(ready_tx.send(Ok(())));
 
     let mut dense_model: Option<TextEmbedding> = Some(initial_dense);
@@ -340,8 +349,7 @@ impl EmbedPool {
                         }
                         None => {
                             return Err(anyhow::anyhow!(
-                                "Worker exited before signaling readiness (got {}/{n})",
-                                i + 1
+                                "Worker exited before signaling readiness (got {i}/{n})"
                             ));
                         }
                     }
