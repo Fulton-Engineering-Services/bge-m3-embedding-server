@@ -14,7 +14,7 @@ Axum HTTP server wrapping fastembed-rs to serve BGE-M3 dense and sparse embeddin
 cargo build
 
 # Run tests (requires cargo-nextest)
-cargo nextest run --all-features --no-tests=pass
+cargo nextest run --all-features --no-tests=warn
 
 # Lint
 cargo clippy --all-targets -- -D warnings
@@ -71,6 +71,7 @@ The server uses a **worker pool** pattern to handle concurrent embedding request
 - Workers are spawned via `spawn_blocking`, each loading dense + sparse model instances.
 - Work dispatched through bounded `mpsc` channel; workers share receiver via `Arc<Mutex<Receiver>>`.
 - Readiness: each worker signals via a separate `mpsc` readiness channel after model load. The init task collects all signals, then a warm-up probe runs both dense and sparse inference before setting the `AtomicBool` ready flag.
+- **Cold-start ordering**: worker 0 (the "leader") is spawned and awaited first to ensure the model cache is warm before followers start. This prevents `hf-hub` file-lock contention when `BGE_M3_WORKERS > 1` and the cache is empty.
 - **Idle unloading**: after `BGE_M3_IDLE_TIMEOUT_SECS` of no requests, workers drop their `Option<TextEmbedding>` and `Option<SparseTextEmbedding>`. On the next request, models are reloaded transparently (~10–30 s from cache). The `loaded_workers` counter drives the `"idle"` health state. Workers themselves never exit during idle — only their model instances are dropped.
 - HTTP observability is provided by `tower-http::TraceLayer`.
 
@@ -101,3 +102,5 @@ To release: bump version in `Cargo.toml`, commit, push to `main`. The workflow h
 - Stale model cache causes silent worker load failures ("Worker exited before signaling readiness") — fix by clearing `BGE_M3_CACHE_DIR`
 - Config tests use `from_lookup()` closure pattern instead of `env::set_var` to avoid process-global state mutation under parallel test execution
 - Always run `cargo fmt --all` before pushing — CI fails `cargo fmt --all --check` even when all tests pass
+- `gh pr merge` requires `--admin` to bypass branch protection, or `--auto` to queue for merge after CI passes
+- After a squash-merged PR, reset local main with `git reset --hard origin/main` to avoid divergent merge commits
