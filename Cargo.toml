@@ -1,6 +1,6 @@
 [package]
 name = "bge-m3-axum-fastembed-rs"
-version = "0.7.0"
+version = "0.8.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "Axum HTTP server wrapping fastembed-rs to serve BGE-M3 dense and sparse embeddings"
