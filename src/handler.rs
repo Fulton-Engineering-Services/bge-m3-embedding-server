@@ -104,7 +104,7 @@ pub async fn dense_embeddings(
     }))
 }
 
-// SPLADE vocabulary indices from BGE-M3 tokenizer are bounded by vocab size (~30K tokens),
+// BGE-M3 uses XLM-RoBERTa tokenizer; vocabulary indices are bounded by vocab_size=250,002,
 // well within u32::MAX. The cast is safe for this model.
 #[allow(clippy::cast_possible_truncation)]
 #[tracing::instrument(skip(state, req), fields(batch_size))]
