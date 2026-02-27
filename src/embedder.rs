@@ -228,6 +228,21 @@ impl EmbedPool {
     /// `idle_timeout` — if `Some`, workers drop their model instances after this
     /// duration of inactivity and reload them transparently on the next request.
     /// Pass `None` to keep models loaded for the lifetime of the process.
+    ///
+    /// # Cold-start ordering (COR-3)
+    ///
+    /// Worker 0 (the "leader") is spawned and awaited **before** any follower
+    /// workers. This guarantees the model cache is warm before followers start.
+    ///
+    /// `hf-hub` acquires per-blob exclusive file locks (`flock(LOCK_EX)`) during
+    /// download with a hardcoded 5-second retry window. BGE-M3 ONNX models are
+    /// ~2 GB — a fresh download takes minutes, far exceeding that window. If all
+    /// workers start concurrently on an empty cache, followers fail with
+    /// `ApiError::LockAcquisition`. The leader-then-followers ordering avoids
+    /// the contention entirely; followers load from the now-warm local cache.
+    ///
+    /// Idle-timeout reloads are unaffected: model files remain on disk after
+    /// unload, so concurrent reloads never hit the network download path.
     pub fn spawn(
         n: usize,
         cache_dir: PathBuf,
@@ -250,7 +265,46 @@ impl EmbedPool {
             async move {
                 let mut worker_handles = Vec::with_capacity(n);
 
-                for id in 0..n {
+                // --- Phase 1: spawn leader worker (may download models) ---
+                {
+                    let rx_clone = Arc::clone(&rx);
+                    let cache_dir_clone = cache_dir.clone();
+                    let ready_tx_clone = ready_tx.clone();
+                    let live_for_worker = Arc::clone(&live_workers_for_init);
+                    let loaded_for_worker = Arc::clone(&loaded_workers_for_init);
+
+                    let handle = tokio::task::spawn_blocking(move || {
+                        run_worker(
+                            0,
+                            cache_dir_clone,
+                            rx_clone,
+                            ready_tx_clone,
+                            live_for_worker,
+                            loaded_for_worker,
+                            idle_timeout,
+                        )
+                    });
+
+                    worker_handles.push(handle);
+                }
+
+                // Await leader readiness — cache is warm after this succeeds.
+                match ready_rx.recv().await {
+                    Some(Ok(())) => {
+                        info!("Leader worker ready, model cache warm (1/{n})");
+                    }
+                    Some(Err(e)) => {
+                        return Err(anyhow::anyhow!("Leader worker failed to load models: {e}"));
+                    }
+                    None => {
+                        return Err(anyhow::anyhow!(
+                            "Leader worker exited before signaling readiness"
+                        ));
+                    }
+                }
+
+                // --- Phase 2: spawn follower workers (load from warm cache) ---
+                for id in 1..n {
                     let rx_clone = Arc::clone(&rx);
                     let cache_dir_clone = cache_dir.clone();
                     let ready_tx_clone = ready_tx.clone();
@@ -275,18 +329,19 @@ impl EmbedPool {
                 // Drop our copy so recv() can detect early worker exit.
                 drop(ready_tx);
 
-                // Collect exactly n readiness signals.
-                for i in 0..n {
+                // Collect follower readiness signals (n - 1 remaining).
+                for i in 1..n {
                     match ready_rx.recv().await {
                         Some(Ok(())) => {
-                            info!("Worker {i} signaled ready ({}/{n})", i + 1);
+                            info!("Follower worker signaled ready ({}/{n})", i + 1);
                         }
                         Some(Err(e)) => {
                             return Err(anyhow::anyhow!("Worker failed to load models: {e}"));
                         }
                         None => {
                             return Err(anyhow::anyhow!(
-                                "Worker exited before signaling readiness (got {i}/{n})"
+                                "Worker exited before signaling readiness (got {}/{n})",
+                                i + 1
                             ));
                         }
                     }
