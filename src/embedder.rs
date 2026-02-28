@@ -181,14 +181,32 @@ fn run_worker(
 /// pointed at via `ORT_LIB_LOCATION`. If the EP fails to register, ORT
 /// silently falls back to the CPU EP with MLAS NEON kernels.
 ///
+/// Configuration rationale:
+/// - **`MLProgram`** — newer `CoreML` format with broader op coverage and
+///   better optimisation passes; requires macOS 12+ (production targets Tahoe/26).
+/// - **`FastPrediction`** — trades higher model-specialisation time and
+///   memory for lower per-request latency.
+/// - **Model cache** — caches the compiled `CoreML` model to
+///   `{cache_dir}/coreml`, eliminating 5–15 s recompilation per session
+///   load (critical for the idle-unload-reload cycle).
+/// - **`ProfileComputePlan`** — logs per-op hardware dispatch decisions.
+///   **Diagnostic only** — remove after benchmarking.
+///
 /// On all other platforms, returns an empty vec (CPU EP only).
-fn execution_providers() -> Vec<ort::ep::ExecutionProviderDispatch> {
+fn execution_providers(cache_dir: &Path) -> Vec<ort::ep::ExecutionProviderDispatch> {
     #[cfg(target_os = "macos")]
     {
-        vec![ort::ep::CoreML::default().build()]
+        let coreml_cache = cache_dir.join("coreml");
+        vec![ort::ep::CoreML::default()
+            .with_model_format(ort::ep::coreml::ModelFormat::MLProgram)
+            .with_specialization_strategy(ort::ep::coreml::SpecializationStrategy::FastPrediction)
+            .with_model_cache_dir(coreml_cache.display().to_string())
+            .with_profile_compute_plan(true) // TODO(phase3): remove after benchmarking
+            .build()]
     }
     #[cfg(not(target_os = "macos"))]
     {
+        let _ = cache_dir;
         vec![]
     }
 }
@@ -201,7 +219,7 @@ fn load_models(
     cache_dir: &Path,
     show_download_progress: bool,
 ) -> Result<(TextEmbedding, SparseTextEmbedding)> {
-    let eps = execution_providers();
+    let eps = execution_providers(cache_dir);
 
     let dense = TextEmbedding::try_new(
         TextInitOptions::new(EmbeddingModel::BGEM3)
