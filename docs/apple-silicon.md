@@ -25,8 +25,8 @@ graph LR
     GPU --- UMA
     ANE --- UMA
 
-    classDef active fill:#6f6,stroke:#333,stroke-width:2px
-    classDef idle fill:#ccc,stroke:#999,stroke-width:1px
+    classDef active fill:#555,stroke:#222,stroke-width:2px,color:#fff
+    classDef idle fill:#e0e0e0,stroke:#999,stroke-width:1px
 
     class CPU active
     class GPU,ANE idle
@@ -96,8 +96,8 @@ graph TD
     ORT -->|"depends on"| SYS
     SYS -->|"downloads at<br/>build time"| LIB
 
-    classDef crate fill:#e8f0fe,stroke:#4285f4,stroke-width:2px
-    classDef binary fill:#fce8e6,stroke:#ea4335,stroke-width:2px
+    classDef crate fill:#d0d0d0,stroke:#777,stroke-width:2px
+    classDef binary fill:#888,stroke:#444,stroke-width:2px,color:#fff
 
     class App,FE,ORT,SYS crate
     class LIB binary
@@ -182,8 +182,8 @@ graph TD
     CoreML -.-> AMX
     CPU -->|"NEON SIMD only"| Result["Embedding vectors"]
 
-    classDef active fill:#6f6,stroke:#333,stroke-width:2px
-    classDef inactive fill:#ccc,stroke:#999,stroke-width:1px,stroke-dasharray: 5 5
+    classDef active fill:#555,stroke:#222,stroke-width:2px,color:#fff
+    classDef inactive fill:#e0e0e0,stroke:#999,stroke-width:1px,stroke-dasharray: 5 5
 
     class Session,Partition,CPU,Result active
     class CoreML,AMX,ANE inactive
@@ -266,7 +266,7 @@ graph LR
 
     M1 --> M2 --> M3 --> M4
 
-    classDef chip fill:#e8f0fe,stroke:#4285f4,stroke-width:2px
+    classDef chip fill:#d0d0d0,stroke:#777,stroke-width:2px
     class M1,M2,M3,M4 chip
 ```
 
@@ -490,8 +490,8 @@ graph TD
     Dispatch --> GPU
     Dispatch --> CPUML
 
-    classDef active fill:#6f6,stroke:#333,stroke-width:2px
-    classDef coreml fill:#e8f0fe,stroke:#4285f4,stroke-width:2px
+    classDef active fill:#555,stroke:#222,stroke-width:2px,color:#fff
+    classDef coreml fill:#888,stroke:#444,stroke-width:2px,color:#fff
 
     class Session,Partition,CoreML,Compile,Dispatch,ANE,GPU,CPUML,CPU active
     class CoreML,Compile,Dispatch coreml
