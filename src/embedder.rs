@@ -1,22 +1,3 @@
-// =============================================================================
-// SPIKE: CoreML Execution Provider feasibility (fastembed 5.x)
-// =============================================================================
-// Finding: `TextInitOptions` and `SparseInitOptions` in fastembed 5.x expose
-// only `with_cache_dir()` and `with_show_download_progress()`. Neither provides
-// a `with_execution_providers(Vec<ExecutionProvider>)` or `SessionOptions`
-// injection point. CoreML EP cannot be enabled via the public fastembed API
-// without forking the crate or bypassing it to use `ort` directly.
-//
-// Conclusion: Build natively for `aarch64-apple-darwin` with the bundled ORT.
-// Vanilla ARM64 ORT automatically uses Accelerate.framework for BLAS on macOS,
-// giving ~3-5× throughput improvement over the x86_64 Docker container —
-// sufficient for the fleet embedding distribution goal.
-//
-// Future path (if CoreML becomes necessary): vendor fastembed, expose
-// `InitOptionsUserDefined` with a custom `SessionBuilder` callback, and supply
-// a `CoreMLExecutionProvider` built from source ORT with CoreML EP enabled.
-// =============================================================================
-
 use anyhow::Result;
 use fastembed::{
     EmbeddingModel, SparseEmbedding, SparseInitOptions, SparseModel, SparseTextEmbedding,
@@ -192,6 +173,26 @@ fn run_worker(
     Ok(())
 }
 
+/// Returns the execution providers to use for ONNX Runtime sessions.
+///
+/// On macOS (Apple Silicon), registers the `CoreML` Execution Provider to
+/// dispatch model subgraphs to the Neural Engine, GPU, or Accelerate (AMX).
+/// `CoreML` EP requires a source-built ORT with `-Donnxruntime_USE_COREML=ON`
+/// pointed at via `ORT_LIB_LOCATION`. If the EP fails to register, ORT
+/// silently falls back to the CPU EP with MLAS NEON kernels.
+///
+/// On all other platforms, returns an empty vec (CPU EP only).
+fn execution_providers() -> Vec<ort::ep::ExecutionProviderDispatch> {
+    #[cfg(target_os = "macos")]
+    {
+        vec![ort::ep::CoreML::default().build()]
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        vec![]
+    }
+}
+
 /// Loads both the dense and sparse BGE-M3 model instances from `cache_dir`.
 ///
 /// Called at worker startup and again after an idle unload whenever a new
@@ -200,17 +201,21 @@ fn load_models(
     cache_dir: &Path,
     show_download_progress: bool,
 ) -> Result<(TextEmbedding, SparseTextEmbedding)> {
+    let eps = execution_providers();
+
     let dense = TextEmbedding::try_new(
         TextInitOptions::new(EmbeddingModel::BGEM3)
             .with_cache_dir(cache_dir.to_path_buf())
-            .with_show_download_progress(show_download_progress),
+            .with_show_download_progress(show_download_progress)
+            .with_execution_providers(eps.clone()),
     )
     .map_err(|e| anyhow::anyhow!("Failed to load dense model: {e}"))?;
 
     let sparse = SparseTextEmbedding::try_new(
         SparseInitOptions::new(SparseModel::BGEM3)
             .with_cache_dir(cache_dir.to_path_buf())
-            .with_show_download_progress(false),
+            .with_show_download_progress(false)
+            .with_execution_providers(eps),
     )
     .map_err(|e| anyhow::anyhow!("Failed to load sparse model: {e}"))?;
 
