@@ -672,3 +672,126 @@ Measure latency, throughput, memory, embedding precision.
 
 **Phase 4 — Fixed-shape ANE exploration (deferred):** Re-export BGE-M3
 with static shapes; requires fastembed surgery for padding/truncation.
+
+## Phase Progress Log
+
+### Phases 1 & 2 — Completed
+
+Implemented in commit `3760c9f`:
+
+```rust
+fn execution_providers(cache_dir: &Path) -> Vec<ort::ep::ExecutionProviderDispatch> {
+    #[cfg(target_os = "macos")]
+    {
+        let coreml_cache = cache_dir.join("coreml");
+        vec![ort::ep::CoreML::default()
+            .with_model_format(ort::ep::coreml::ModelFormat::MLProgram)
+            .with_specialization_strategy(ort::ep::coreml::SpecializationStrategy::FastPrediction)
+            .with_model_cache_dir(coreml_cache.display().to_string())
+            .with_profile_compute_plan(true) // TODO(phase3): remove after benchmarking
+            .build()]
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = cache_dir;
+        vec![]
+    }
+}
+```
+
+`.cargo/config.toml` added with `target-cpu=native` for `aarch64-apple-darwin`.
+
+### Phase 3 — Benchmark Harness
+
+#### Corpus
+
+Curated from three production databases on `jpfulton-imac.lan` via the
+`db-backup` container. Stored at `benches/fixtures/corpus.json`.
+
+| Scenario | Source | Count | Char range | Description |
+|----------|--------|-------|------------|-------------|
+| `document_chunks` | `knowledgebase.chunks` | 50 | 337–1,599 | Stratified sample: 10 short, 20 medium, 20 long. Hamlet PDF + Spring AI docs. |
+| `tool_descriptions` | `coordinator.vector_store` | 75 | 33–283 | Complete set. Tool/capability descriptions for semantic memory retrieval. |
+| `code_symbols` | `codekeeper.symbols` | 50 | 22–120 | Random sample from 185K symbols. Class/method/field name_paths. |
+
+**Database inventory** (for future corpus expansion):
+
+| Database | Host container | Relevant tables | Row count | Notes |
+|----------|---------------|-----------------|-----------|-------|
+| `knowledgebase` | `coordinator-db` | `chunks`, `documents` | 386 chunks / 5 docs | `halfvec(1024)` dense + `sparsevec(250002)` sparse stored alongside content |
+| `coordinator` | `coordinator-db` | `vector_store`, `captures` | 75 vectors / 0 captures | Tool descriptions with `vector(1024)` embeddings |
+| `codekeeper` | `codekeeper-db` | `symbols`, `symbol_embeddings` | 185K symbols / 0 embeddings | Embeddings not yet generated; symbols have name_path + signature |
+| `langfuse` | `langfuse-db` | `observations`, `traces` | 0 / 0 | Not yet wired for tracing |
+
+**Extraction commands** (for reproducibility):
+
+```bash
+# From local machine — pipes through SSH to db-backup container
+# Knowledgebase chunks (stratified)
+ssh jpfulton-imac-ha "cd ~/dpos-ha-config && docker exec db-backup \
+  env PGPASSWORD=\$(grep KB_DB_PASSWORD .env | cut -d= -f2) \
+  psql -h coordinator-db -U knowledgebase -d knowledgebase -t -A -c \"
+    SELECT json_agg(row_to_json(t)) FROM (
+      (SELECT content, length(content) AS char_count, 'short' AS bucket
+       FROM chunks WHERE length(content) < 1000 ORDER BY random() LIMIT 10)
+      UNION ALL
+      (SELECT content, length(content), 'medium'
+       FROM chunks WHERE length(content) BETWEEN 1000 AND 1500 ORDER BY random() LIMIT 20)
+      UNION ALL
+      (SELECT content, length(content), 'long'
+       FROM chunks WHERE length(content) > 1500 ORDER BY random() LIMIT 20)
+    ) t\""
+
+# Coordinator vector_store (complete)
+ssh jpfulton-imac-ha "cd ~/dpos-ha-config && docker exec db-backup \
+  env PGPASSWORD=\$(grep COORDINATOR_DB_PASSWORD .env | cut -d= -f2) \
+  psql -h coordinator-db -U coordinator -d coordinator -t -A -c \"
+    SELECT json_agg(row_to_json(t)) FROM (
+      SELECT content, length(content) AS char_count
+      FROM vector_store WHERE content IS NOT NULL ORDER BY length(content)
+    ) t\""
+
+# Codekeeper symbols (random sample)
+ssh jpfulton-imac-ha "cd ~/dpos-ha-config && docker exec db-backup \
+  env PGPASSWORD=\$(grep CODEKEEPER_DB_PASSWORD .env | cut -d= -f2) \
+  psql -h codekeeper-db -U codekeeper -d codekeeper -t -A -c \"
+    SELECT json_agg(row_to_json(t)) FROM (
+      SELECT s.name_path AS content, length(s.name_path) AS char_count, s.kind
+      FROM symbols s ORDER BY random() LIMIT 50
+    ) t\""
+```
+
+#### Harness Design
+
+The benchmark tests at the `fastembed` API level — directly calling
+`TextEmbedding::embed()` and `SparseTextEmbedding::embed()` — bypassing
+the HTTP server and worker pool. This isolates ONNX inference timing
+from Axum routing, JSON serialization, and channel dispatch overhead.
+
+**EP configuration via environment variable** (`BGE_M3_BENCH_EP`):
+
+| Value | Execution providers | What it measures |
+|-------|-------------------|-----------------|
+| `mlas_only` | Empty vec (CPU EP, MLAS NEON) | Baseline — current production without CoreML |
+| `coreml_all` | `CoreML::default()` with `ComputeUnits::All` | CoreML decides GPU vs CPU per-subgraph |
+| `coreml_cpu_only` | `CoreML` with `ComputeUnits::CPUOnly` | Accelerate → AMX path (no GPU, no FP16 risk) |
+| `coreml_cpu_and_gpu` | `CoreML` with `ComputeUnits::CPUAndGPU` | GPU (Metal) + CPU mix |
+
+No recompilation between runs — change the env var and re-run.
+
+**Constraints:**
+- Requires `ORT_LIB_LOCATION` at build time for the custom ORT with CoreML EP
+- Requires model cache at `BGE_M3_CACHE_DIR` (defaults to `/tmp/bge-m3-cache`)
+- Inherently a local-machine benchmark — CI runners lack the custom ORT build
+- First run per EP config pays session-creation cost (CoreML compilation);
+  subsequent runs use the model cache
+
+#### Next Steps
+
+- [ ] Build `benches/coreml_bench.rs` harness
+- [ ] Run baseline measurements across all four EP configurations
+- [ ] Capture `ProfileComputePlan` output to confirm op dispatch targets
+- [ ] Compare embedding precision: cosine similarity of outputs across configs
+- [ ] Determine optimal `ComputeUnits` setting for production
+- [ ] Remove `with_profile_compute_plan(true)` after benchmarking
+- [ ] Rebuild custom ORT with `-DCMAKE_CXX_FLAGS="-mcpu=native"` for M3
