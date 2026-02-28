@@ -538,3 +538,137 @@ CoreML's `MLComputeUnits` setting controls which hardware is available:
 - [AMX reverse engineering (corsix/amx)](https://github.com/corsix/amx)
 - [ONNX Runtime MLAS](https://github.com/microsoft/onnxruntime/tree/main/onnxruntime/core/mlas/lib)
 - [Rust `native` CPU misdetection fix (rust-lang/rust#93889)](https://github.com/rust-lang/rust/issues/93889)
+
+---
+
+## Analysis: Full CoreML Optimization Path (Raw Data)
+
+> **Note:** Raw analysis outputs from model inspection and CoreML EP op
+> coverage analysis. To be synthesized into final documentation.
+
+### BGE-M3 ONNX Model Structure
+
+```
+Inputs:
+  input_ids:       INT64 [batch_size, sequence_length]    ← both dynamic
+  attention_mask:  INT64 [batch_size, sequence_length]    ← both dynamic
+
+Outputs:
+  token_embeddings:    FLOAT [batch_size, sequence_length, 1024]
+  sentence_embedding:  FLOAT [batch_size, Divsentence_embedding_dim_1]
+
+IR version:  6
+Opset:       ai.onnx v11
+Producer:    PyTorch 2.1.2
+```
+
+### Op Census (2,495 total, 28 unique types)
+
+| Op | Count | CoreML EP Support |
+|----|-------|-------------------|
+| Constant | 571 | N/A (weight tensors, absorbed into CoreML model) |
+| Add | 341 | Yes |
+| Gather | 198 | Yes |
+| Unsqueeze | 197 | Yes |
+| Shape | 196 | Yes |
+| MatMul | 192 | Yes |
+| Mul | 100 | Yes |
+| Concat | 98 | Yes |
+| ReduceMean | 98 | Yes |
+| Div | 98 | Yes |
+| Reshape | 97 | Yes |
+| Transpose | 96 | Yes |
+| Pow | 51 | Yes |
+| Sub | 50 | Yes |
+| Sqrt | 49 | Yes |
+| Softmax | 24 | Yes |
+| Erf | 24 | Yes |
+| Cast | 3 | Yes |
+| Equal | 2 | **No** |
+| Expand | 2 | **No** |
+| Slice | 1 | Yes |
+| ConstantOfShape | 1 | **No** |
+| Where | 1 | **No** |
+| Not | 1 | **No** |
+| CumSum | 1 | **No** |
+| Abs | 1 | **No** |
+| ReduceSum | 1 | Yes |
+| Clip | 1 | Yes |
+
+### CoreML EP Op Coverage Summary
+
+| Metric | Count | Percentage |
+|--------|-------|------------|
+| Total ops | 2,495 | |
+| Constant (weight) ops | 571 | (excluded from coverage calc) |
+| Compute ops | 1,924 | 100% |
+| CoreML-dispatchable | 1,915 | **99.5%** |
+| CPU EP fallback | 9 | 0.5% |
+
+The 9 unsupported compute ops (`Equal` ×2, `Expand` ×2, `ConstantOfShape`,
+`Where`, `Not`, `CumSum`, `Abs`) are in attention mask processing and
+sparse embedding logic — not in the critical compute path.
+
+### CoreML EP Supported Ops (from `op_builder_factory.cc`, ORT v1.23.2)
+
+```
+Add, ArgMax, AveragePool, BatchNormalization, Cast, Clip, Concat, Conv,
+ConvTranspose, DepthToSpace, Div, Erf, Flatten, Gather, Gelu, Gemm,
+GlobalAveragePool, GlobalMaxPool, GridSample, GroupNormalization,
+InstanceNormalization, LayerNormalization, LeakyRelu, LRN, MatMul, Max,
+MaxPool, Mul, Pad, Pow, PRelu, Reciprocal, ReduceMax, ReduceMean,
+ReduceMin, ReduceProd, ReduceSum, Relu, Reshape, Resize, Round, Shape,
+Sigmoid, Slice, Softmax, Split, Sqrt, Squeeze, Sub, Tanh, Transpose,
+Unsqueeze
+```
+
+### Dynamic Shape Impact on Compute Unit Eligibility
+
+| Compute Unit | Requires Static Shapes? | Accessible for BGE-M3? |
+|-------------|------------------------|----------------------|
+| Neural Engine (ANE) | Yes — hard requirement | **No** — both dims dynamic |
+| GPU (Metal) | No | Yes — with overhead |
+| CPU (Accelerate → AMX) | No | Yes |
+| CPU (MLAS NEON) | No | Yes — current fallback |
+
+### ComputeUnits Strategy Analysis
+
+| Setting | Dispatch Path | AMX? | FP16 Risk? | GPU Overhead? |
+|---------|--------------|------|-----------|--------------|
+| `All` (default) | CoreML decides GPU vs CPU per-subgraph | Via Accelerate if CPU chosen | Yes on GPU ops | Yes |
+| `CPUOnly` | All CoreML ops → Accelerate → AMX | **Yes** | **No** | **No** |
+| `CPUAndGPU` | Same as `All` (ANE excluded by shapes) | Via Accelerate if CPU chosen | Yes on GPU ops | Yes |
+| `CPUAndNeuralEngine` | Falls back to CPU (ANE can't handle dynamic) | Via Accelerate | No | No |
+
+Key insight: `CPUOnly` is the only path to guaranteed AMX usage without
+GPU context-switching overhead or FP16 silent conversion. MLAS explicitly
+disables AMX on macOS (`#ifndef __APPLE__` in `platform.cpp`).
+
+### `ort::ep::CoreML` Builder API (v2.0.0-rc.11)
+
+| Method | Type | Default | Notes |
+|--------|------|---------|-------|
+| `with_compute_units()` | `ComputeUnits` | `All` | Controls hardware dispatch targets |
+| `with_model_format()` | `ModelFormat` | `NeuralNetwork` | `MLProgram` requires macOS 12+ |
+| `with_model_cache_dir()` | `impl ToString` | None | Caches compiled CoreML model to disk |
+| `with_specialization_strategy()` | `SpecializationStrategy` | `Default` | `FastPrediction` trades load time for latency |
+| `with_profile_compute_plan()` | `bool` | `false` | Logs per-op hardware dispatch decisions |
+| `with_low_precision_accumulation_on_gpu()` | `bool` | `false` | FP16 accumulation on GPU |
+| `with_subgraphs()` | `bool` | `false` | Handle ops inside control flow |
+| `with_static_input_shapes()` | `bool` | `false` | Reject dynamic shapes entirely |
+
+### Phase Plan
+
+**Phase 1 — Observe:** Enable `with_profile_compute_plan(true)`, inspect
+dispatch decisions with `RUST_LOG=debug`.
+
+**Phase 2 — Configure:** `with_model_cache_dir()`, `with_model_format(MLProgram)`,
+`with_specialization_strategy(FastPrediction)`, `.cargo/config.toml` with
+`target-cpu=native`, cmake `-DCMAKE_CXX_FLAGS="-mcpu=native"`.
+
+**Phase 3 — Benchmark ComputeUnits:** Compare MLAS NEON baseline vs
+CoreML `CPUOnly` (Accelerate → AMX) vs CoreML `All` (GPU + CPU).
+Measure latency, throughput, memory, embedding precision.
+
+**Phase 4 — Fixed-shape ANE exploration (deferred):** Re-export BGE-M3
+with static shapes; requires fastembed surgery for padding/truncation.
