@@ -33,6 +33,10 @@ criterion = { version = "0.5", features = ["html_reports"] }
 name = "embeddings"
 harness = false
 
+[[bench]]
+name = "coreml"
+harness = false
+
 [profile.release]
 lto = "thin"
 codegen-units = 1
