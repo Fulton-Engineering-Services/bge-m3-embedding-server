@@ -132,9 +132,12 @@ fn bench_dense(c: &mut Criterion) {
     let mut names: Vec<&String> = corpus.scenarios.keys().collect();
     names.sort();
 
-    let mut group = c.benchmark_group(format!("dense/{label}"));
-    group.warm_up_time(Duration::from_secs(3));
-    group.measurement_time(Duration::from_secs(10));
+    // Use a fixed group name so Criterion can compare across EP configs
+    // via --save-baseline / --baseline. The EP label is logged to stderr.
+    let mut group = c.benchmark_group("dense");
+    group.warm_up_time(Duration::from_secs(2));
+    group.measurement_time(Duration::from_secs(5));
+    group.sample_size(20);
 
     for name in &names {
         let scenario = &corpus.scenarios[*name];
@@ -190,9 +193,10 @@ fn bench_sparse(c: &mut Criterion) {
     let mut names: Vec<&String> = corpus.scenarios.keys().collect();
     names.sort();
 
-    let mut group = c.benchmark_group(format!("sparse/{label}"));
-    group.warm_up_time(Duration::from_secs(3));
-    group.measurement_time(Duration::from_secs(10));
+    let mut group = c.benchmark_group("sparse");
+    group.warm_up_time(Duration::from_secs(2));
+    group.measurement_time(Duration::from_secs(5));
+    group.sample_size(20);
 
     for name in &names {
         let scenario = &corpus.scenarios[*name];
