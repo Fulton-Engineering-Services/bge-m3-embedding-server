@@ -6,6 +6,7 @@ mod models;
 mod state;
 mod weights;
 
+use crate::embedder::WorkerConfig;
 use axum::extract::DefaultBodyLimit;
 use axum::http::HeaderValue;
 use axum::{routing::get, routing::post, Router};
@@ -103,8 +104,10 @@ async fn main() -> anyhow::Result<()> {
     let (pool, init_handle) = EmbedPool::spawn(
         cfg.workers,
         PathBuf::from(&cfg.cache_dir),
-        cfg.idle_timeout,
-        cfg.onnx_batch_size,
+        WorkerConfig {
+            onnx_batch_size: cfg.onnx_batch_size,
+            idle_timeout: cfg.idle_timeout,
+        },
     );
 
     let state = Arc::new(AppState {

@@ -364,9 +364,17 @@ fn execution_providers(cache_dir: &Path) -> Vec<ort::ep::ExecutionProviderDispat
     #[cfg(target_os = "macos")]
     {
         let coreml_cache = cache_dir.join("coreml");
+        // ARC-6: Allow overriding the CoreML specialization strategy via env var.
+        // FastPrediction pre-allocates the full intermediate-tensor workspace, which
+        // can exceed available RAM on low-memory Macs. Set to "default" to fall back
+        // to the CoreML default strategy.
+        let strategy = match std::env::var("BGE_M3_COREML_STRATEGY").ok().as_deref() {
+            Some("default") => ort::ep::coreml::SpecializationStrategy::Default,
+            _ => ort::ep::coreml::SpecializationStrategy::FastPrediction,
+        };
         let builder = ort::ep::CoreML::default()
             .with_model_format(ort::ep::coreml::ModelFormat::MLProgram)
-            .with_specialization_strategy(ort::ep::coreml::SpecializationStrategy::FastPrediction)
+            .with_specialization_strategy(strategy)
             .with_model_cache_dir(coreml_cache.display().to_string());
         #[cfg(feature = "coreml-profile")]
         let builder = builder.with_profile_compute_plan(true);
@@ -414,11 +422,24 @@ impl Drop for WorkerGuard {
     }
 }
 
+/// Execution-policy configuration shared by all workers.
+///
+/// Groups the policy arguments that were previously passed as individual
+/// positional parameters to `run_worker`, keeping the function signature
+/// manageable as configuration options grow.
+#[derive(Clone)]
+pub(crate) struct WorkerConfig {
+    /// Maximum texts per ONNX `session.run()` call.
+    pub onnx_batch_size: usize,
+    /// Duration of inactivity before workers unload their model instances.
+    pub idle_timeout: Option<Duration>,
+}
+
 /// Body of a single embedding worker thread.
 ///
 /// Called from a `spawn_blocking` task. Loads models, signals readiness, then
 /// processes requests from the shared channel until it closes.
-#[allow(clippy::needless_pass_by_value, clippy::too_many_arguments)]
+#[allow(clippy::needless_pass_by_value)]
 fn run_worker(
     id: usize,
     cache_dir: PathBuf,
@@ -426,8 +447,7 @@ fn run_worker(
     ready_tx: mpsc::Sender<Result<()>>,
     live_workers: Arc<AtomicUsize>,
     loaded_workers: Arc<AtomicUsize>,
-    idle_timeout: Option<Duration>,
-    onnx_batch_size: usize,
+    config: WorkerConfig,
 ) -> Result<()> {
     let _guard = WorkerGuard(Arc::clone(&live_workers));
     let span = info_span!("worker", id = id);
@@ -466,7 +486,7 @@ fn run_worker(
     loop {
         // Apply idle timeout only when models are loaded.
         // Once unloaded, wait indefinitely — no timer wakeups needed.
-        let msg = if let Some(timeout) = idle_timeout.filter(|_| models.is_some()) {
+        let msg = if let Some(timeout) = config.idle_timeout.filter(|_| models.is_some()) {
             rt.block_on(async {
                 tokio::time::timeout(timeout, async { rx.lock().await.recv().await }).await
             })
@@ -526,13 +546,15 @@ fn run_worker(
 
                 match request {
                     EmbedRequest::Dense { texts, reply } => {
-                        let result = embed_dense(session, tokenizer, &texts, onnx_batch_size)
-                            .map_err(|e| anyhow::anyhow!("Dense embed error: {e}"));
+                        let result =
+                            embed_dense(session, tokenizer, &texts, config.onnx_batch_size)
+                                .map_err(|e| anyhow::anyhow!("Dense embed error: {e}"));
                         let _ = reply.send(result);
                     }
                     EmbedRequest::Sparse { texts, reply } => {
-                        let result = embed_sparse(session, tokenizer, &texts, onnx_batch_size)
-                            .map_err(|e| anyhow::anyhow!("Sparse embed error: {e}"));
+                        let result =
+                            embed_sparse(session, tokenizer, &texts, config.onnx_batch_size)
+                                .map_err(|e| anyhow::anyhow!("Sparse embed error: {e}"));
                         let _ = reply.send(result);
                     }
                 }
@@ -564,9 +586,7 @@ impl EmbedPool {
     /// Spawns `n` embedding worker threads and returns the pool plus an init
     /// handle that resolves once all workers have finished loading their models.
     ///
-    /// `idle_timeout` — if `Some`, workers drop their model instances after this
-    /// duration of inactivity and reload them transparently on the next request.
-    /// Pass `None` to keep models loaded for the lifetime of the process.
+    /// `config` — execution policy shared by all workers (batch size, idle timeout).
     ///
     /// # Cold-start ordering
     ///
@@ -585,8 +605,7 @@ impl EmbedPool {
     pub fn spawn(
         n: usize,
         cache_dir: PathBuf,
-        idle_timeout: Option<Duration>,
-        onnx_batch_size: usize,
+        config: WorkerConfig,
     ) -> (Self, JoinHandle<Result<()>>) {
         let capacity = n * 4;
         let (tx, rx) = mpsc::channel::<EmbedRequest>(capacity);
@@ -616,6 +635,7 @@ impl EmbedPool {
                     let cache_dir_clone = cache_dir.clone();
                     let live_for_worker = Arc::clone(&live_workers_for_init);
                     let loaded_for_worker = Arc::clone(&loaded_workers_for_init);
+                    let worker_config = config.clone();
                     tokio::task::spawn_blocking(move || {
                         run_worker(
                             id,
@@ -624,8 +644,7 @@ impl EmbedPool {
                             ready_tx_clone,
                             live_for_worker,
                             loaded_for_worker,
-                            idle_timeout,
-                            onnx_batch_size,
+                            worker_config,
                         )
                     })
                 };
@@ -820,7 +839,14 @@ mod tests {
 
     #[tokio::test]
     async fn spawn_propagates_leader_load_failure() {
-        let (pool, init_handle) = EmbedPool::spawn(1, bad_cache_dir(), None, 8);
+        let (pool, init_handle) = EmbedPool::spawn(
+            1,
+            bad_cache_dir(),
+            WorkerConfig {
+                onnx_batch_size: 8,
+                idle_timeout: None,
+            },
+        );
 
         let result = tokio::time::timeout(Duration::from_secs(5), init_handle)
             .await
@@ -843,7 +869,14 @@ mod tests {
 
     #[tokio::test]
     async fn spawn_multi_worker_fails_fast_on_leader_failure() {
-        let (pool, init_handle) = EmbedPool::spawn(3, bad_cache_dir(), None, 8);
+        let (pool, init_handle) = EmbedPool::spawn(
+            3,
+            bad_cache_dir(),
+            WorkerConfig {
+                onnx_batch_size: 8,
+                idle_timeout: None,
+            },
+        );
 
         let result = tokio::time::timeout(Duration::from_secs(5), init_handle)
             .await
@@ -991,6 +1024,38 @@ mod tests {
     }
 
     #[test]
+    fn sparse_project_zero_weight() {
+        let weight = ndarray::array![0.0, 0.0, 0.0];
+        let hidden = [1.0, 2.0, 3.0];
+        // dot = 0, + bias 1.0 = 1.0, ReLU = 1.0
+        let score = sparse_project(&hidden, &weight.view(), 1.0);
+        assert!(
+            (score - 1.0).abs() < 1e-6,
+            "zero weights with positive bias"
+        );
+    }
+
+    #[test]
+    fn sparse_project_negative_bias() {
+        let weight = ndarray::array![1.0, 1.0];
+        let hidden = [1.0, 1.0];
+        // dot = 2, + bias -3.0 = -1.0, ReLU = 0.0
+        let score = sparse_project(&hidden, &weight.view(), -3.0);
+        assert!(score.abs() < 1e-6, "negative bias should clamp via ReLU");
+    }
+
+    #[test]
+    fn sparse_maxpool_all_masked_out() {
+        // All non-special tokens have mask=0 (padding) → empty output
+        let ids = [100, 200, 300];
+        let mask = [0, 0, 0];
+        let scores = [0.5, 0.8, 0.3];
+        let (indices, values) = sparse_maxpool(&ids, &mask, &scores);
+        assert!(indices.is_empty(), "all-masked should produce empty output");
+        assert!(values.is_empty());
+    }
+
+    #[test]
     fn sparse_maxpool_basic() {
         // token_id 10 appears twice with scores 0.3, 0.7 → max = 0.7
         // token_id 20 appears once  with score  0.5     → 0.5
@@ -1052,5 +1117,107 @@ mod tests {
         let scores = [0.1, 0.2, 0.3];
         let (indices, _) = sparse_maxpool(&ids, &mask, &scores);
         assert_eq!(indices, vec![100, 200, 300], "indices should be sorted");
+    }
+
+    // -----------------------------------------------------------------------
+    // REPO_REVISION drift detection (ARC-3)
+    // -----------------------------------------------------------------------
+
+    /// Extracts the `REPO_REVISION` constant value from a source file by reading
+    /// it as text and finding the `const REPO_REVISION: &str = "...";` line.
+    fn extract_repo_revision(path: &str) -> String {
+        let content =
+            std::fs::read_to_string(path).unwrap_or_else(|e| panic!("failed to read {path}: {e}"));
+        for line in content.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with("const REPO_REVISION") {
+                // Extract the quoted value between the first pair of double quotes
+                let start = trimmed.find('"').expect("missing opening quote");
+                let end = trimmed[start + 1..]
+                    .find('"')
+                    .expect("missing closing quote");
+                return trimmed[start + 1..start + 1 + end].to_string();
+            }
+        }
+        panic!("REPO_REVISION not found in {path}");
+    }
+
+    #[test]
+    fn repo_revision_consistent_across_all_copies() {
+        let embedder = extract_repo_revision("src/embedder.rs");
+        let bench = extract_repo_revision("benches/coreml.rs");
+        let example = extract_repo_revision("examples/fp16_eval.rs");
+
+        assert_eq!(
+            embedder, bench,
+            "REPO_REVISION mismatch: src/embedder.rs ({embedder}) != benches/coreml.rs ({bench})"
+        );
+        assert_eq!(
+            embedder, example,
+            "REPO_REVISION mismatch: src/embedder.rs ({embedder}) != examples/fp16_eval.rs ({example})"
+        );
+        // Sanity: should look like a git commit SHA
+        assert_eq!(embedder.len(), 40, "REPO_REVISION should be a 40-char SHA");
+        assert!(
+            embedder.chars().all(|c| c.is_ascii_hexdigit()),
+            "REPO_REVISION should be hexadecimal"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Benchmark corpus shape validation (TST-5)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn benchmark_corpus_has_expected_shape() {
+        let content = std::fs::read_to_string("benches/fixtures/corpus.json")
+            .expect("corpus.json must be readable from project root");
+        let corpus: serde_json::Value =
+            serde_json::from_str(&content).expect("corpus.json must be valid JSON");
+
+        // Verify top-level structure
+        assert!(corpus.get("metadata").is_some(), "must have 'metadata' key");
+        assert!(
+            corpus.get("scenarios").is_some(),
+            "must have 'scenarios' key"
+        );
+
+        // Verify metadata.sources counts
+        let sources = &corpus["metadata"]["sources"];
+        assert_eq!(sources["knowledgebase_chunks"]["count"], 50);
+        assert_eq!(sources["coordinator_vector_store"]["count"], 75);
+        assert_eq!(sources["codekeeper_symbols"]["count"], 50);
+        assert_eq!(sources["boundary_cases"]["count"], 9);
+
+        // Verify scenarios have matching text counts
+        let scenarios = corpus["scenarios"]
+            .as_object()
+            .expect("scenarios must be object");
+        let expected: &[(&str, usize)] = &[
+            ("document_chunks", 50),
+            ("tool_descriptions", 75),
+            ("code_symbols", 50),
+            ("boundary_cases", 9),
+        ];
+        for &(name, count) in expected {
+            let texts = scenarios
+                .get(name)
+                .and_then(|s| s.get("texts"))
+                .and_then(|t| t.as_array())
+                .unwrap_or_else(|| panic!("scenarios.{name}.texts must be an array"));
+            assert_eq!(
+                texts.len(),
+                count,
+                "scenarios.{name} should have {count} texts, got {}",
+                texts.len()
+            );
+        }
+
+        // Total texts = 184
+        let total: usize = scenarios
+            .values()
+            .filter_map(|s| s.get("texts").and_then(|t| t.as_array()).map(Vec::len))
+            .sum();
+        assert_eq!(total, 184, "total corpus texts should be 184");
     }
 }

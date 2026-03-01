@@ -104,6 +104,12 @@ with a 120-second start period to allow time for model download and ONNX initial
 The Release workflow creates git tags automatically. **Do not create tags locally.**
 To release: bump version in `Cargo.toml`, commit, push to `main`. The workflow handles tag creation, multi-arch Docker builds, and GitHub Release.
 
+## Security Considerations
+
+- **Rate limiting** (SEC-3): No application-level rate limiting on embedding endpoints. This is an internal LAN service; concurrency is bounded by the worker pool (`BGE_M3_WORKERS`). Network-level controls (firewall rules, reverse proxy throttling) are the intended mitigation for production deployments.
+- **TLS CA bundles** (SEC-4): `hf-hub` uses `native-tls`, delegating certificate validation to the system keychain. Docker containers based on minimal base images may lack full CA bundles. Production Docker images should include `ca-certificates` or use `ORT_LIB_LOCATION` with pre-downloaded models to avoid runtime TLS calls.
+- **Cache directory path** (SEC-5): `BGE_M3_CACHE_DIR` is used without path normalization. This is an accepted risk because the variable is operator-controlled (set via environment or Docker compose). Symlink traversal or path injection requires host-level compromise.
+
 ## Gotchas
 
 - Stale model cache causes silent worker load failures ("Worker exited before signaling readiness") — fix by clearing `BGE_M3_CACHE_DIR`

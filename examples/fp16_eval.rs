@@ -162,6 +162,9 @@ fn embed_dense(
     tokenizer: &tokenizers::Tokenizer,
     texts: &[String],
 ) -> Result<Vec<Vec<f32>>> {
+    if texts.is_empty() {
+        return Ok(vec![]);
+    }
     let str_refs: Vec<&str> = texts.iter().map(String::as_str).collect();
     let encodings = tokenizer
         .encode_batch(str_refs, true)
@@ -207,6 +210,9 @@ fn embed_sparse(
     weights: &SparseLinearWeights,
     texts: &[String],
 ) -> Result<Vec<SparseFp16>> {
+    if texts.is_empty() {
+        return Ok(vec![]);
+    }
     let weight_arr = ArrayView1::from(&weights.weight);
     let mut results = Vec::with_capacity(texts.len());
 
@@ -237,6 +243,12 @@ fn embed_sparse(
         // The output name depends on the model variant:
         // - BAAI/bge-m3: "token_embeddings"
         // - Xenova/bge-m3 FP16: "last_hidden_state"
+        //
+        // NOTE(COR-4): Both extractions use `try_extract_array::<f32>()`. For the
+        // FP16 model variant (Xenova/bge-m3), this relies on ORT automatically
+        // promoting FP16 tensor data to F32 during extraction. Verified with
+        // ort 2.0.0-rc.11 on MLAS and CoreML EPs. If a future ORT version
+        // changes this behavior, extraction will fail with a type mismatch error.
         let token_emb = if let Ok(t) = outputs["token_embeddings"].try_extract_array::<f32>() {
             t
         } else {

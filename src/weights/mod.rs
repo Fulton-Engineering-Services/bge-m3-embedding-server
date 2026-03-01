@@ -35,8 +35,14 @@ pub(crate) fn sparse_linear() -> &'static (Array1<f32>, f32) {
             .tensor("bias")
             .expect("sparse_linear must contain 'bias' tensor");
 
-        let weight: Vec<f32> = weight_view
-            .data()
+        let weight_data = weight_view.data();
+        assert_eq!(
+            weight_data.len() % 4,
+            0,
+            "weight tensor byte length must be a multiple of 4, got {}",
+            weight_data.len()
+        );
+        let weight: Vec<f32> = weight_data
             .chunks_exact(4)
             .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
             .collect();
@@ -68,6 +74,15 @@ mod tests {
             "bias should be ~0.04520, got {bias}"
         );
         assert!(bias.is_finite(), "bias must be finite");
+        // TST-6: verify all weights are finite and not all-zero
+        assert!(
+            weight.iter().all(|w| w.is_finite()),
+            "all weight elements must be finite"
+        );
+        assert!(
+            weight.iter().any(|&w| w != 0.0),
+            "weight vector must not be all-zero"
+        );
     }
 
     #[test]
@@ -90,5 +105,27 @@ mod tests {
     fn bundled_file_size_matches() {
         // Size pinned to detect accidental replacement or corruption.
         assert_eq!(WEIGHTS_BYTES.len(), 4236, "expected 4,236 bytes");
+    }
+
+    #[test]
+    fn bundled_file_sha256_matches() {
+        use sha2::Digest;
+        use std::fmt::Write;
+        // Documented provenance hash — any change to the bundled file must update this.
+        const EXPECTED_SHA256: &str =
+            "a2601321f01abbb696d171a58a65ff35be1603d9cbc22c647dfe34b4568dd690";
+        let digest = {
+            let mut hasher = sha2::Sha256::new();
+            hasher.update(WEIGHTS_BYTES);
+            hasher.finalize()
+        };
+        let hex = digest.iter().fold(String::new(), |mut s, b| {
+            write!(s, "{b:02x}").expect("hex write");
+            s
+        });
+        assert_eq!(
+            hex, EXPECTED_SHA256,
+            "bundled sparse_linear.safetensors SHA-256 mismatch"
+        );
     }
 }

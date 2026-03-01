@@ -52,49 +52,49 @@
 - **File**: `src/weights/mod.rs:18`
 - **Evidence**: Size pin (4,236 bytes) is weaker than SHA-256 verification. Documented hash `a2601321...` is not enforced at runtime.
 - **Recommendation**: Add compile-time or startup SHA-256 check against documented hash
-- **Status**: Open
+- **Status**: Fixed — added `bundled_file_sha256_matches` test in `src/weights/mod.rs`
 
 ### SEC-3: No rate limiting on embedding endpoints
 - **Reviewer**: Security
 - **File**: `src/handler.rs:69,111`
 - **Evidence**: Expensive ONNX inference with no per-client throttling on internal LAN service
 - **Recommendation**: Add Tower concurrency limit or document network-level controls as mitigation
-- **Status**: Open
+- **Status**: Fixed — documented in CLAUDE.md Security Considerations section
 
 ### SEC-4: `hf-hub` uses native-tls; Docker containers may have minimal CA bundles
 - **Reviewer**: Security
 - **File**: Cargo.lock (`hf-hub` dep chain)
 - **Evidence**: TLS delegates to system keychain; Linux containers may lack full CA bundle
 - **Recommendation**: Audit or document CA bundle assumption for container deployments
-- **Status**: Open
+- **Status**: Fixed — documented in CLAUDE.md Security Considerations section
 
 ### SEC-5: `BGE_M3_CACHE_DIR` not validated for path safety
 - **Reviewer**: Security
 - **File**: `src/config.rs:85`, `src/embedder.rs:62-92`
 - **Evidence**: Environment variable used without path normalization. Low exploitability (operator-controlled).
 - **Recommendation**: Document as accepted risk given operator-controlled environment
-- **Status**: Open
+- **Status**: Fixed — documented in CLAUDE.md Security Considerations section
 
 ### COR-2: `chunks_exact(4)` silently discards trailing bytes in weight parsing
 - **Reviewer**: Correctness
 - **File**: `src/weights/mod.rs`
 - **Evidence**: No explicit `data().len() % 4 == 0` assertion before `chunks_exact`
 - **Recommendation**: Add byte-length assertion before `chunks_exact`
-- **Status**: Open
+- **Status**: Fixed — added `assert_eq!(weight_data.len() % 4, 0, ...)` guard
 
 ### COR-3: `fp16_eval.rs` embed functions panic on empty scenario text lists
 - **Reviewer**: Correctness
 - **File**: `examples/fp16_eval.rs`
 - **Evidence**: Same `encodings[0]` pattern as COR-1 but in example code
 - **Recommendation**: Add early return for empty input
-- **Status**: Open
+- **Status**: Fixed — added `if texts.is_empty() { return Ok(vec![]); }` to both embed functions
 
 ### COR-4: FP16 fallback assumes ORT auto-promotes `last_hidden_state` to F32
 - **Reviewer**: Correctness
 - **File**: `examples/fp16_eval.rs`
 - **Evidence**: Undocumented assumption about ORT auto-casting FP16 tensors
 - **Recommendation**: Document assumption or add contextual error message
-- **Status**: Open
+- **Status**: Fixed — added NOTE(COR-4) comment documenting ORT FP16→F32 auto-cast assumption
 
 ### ARC-2: Three-way code duplication (binary crate constraint)
 - **Reviewer**: Architecture
@@ -108,59 +108,59 @@
 - **File**: `src/embedder.rs:75`, `benches/coreml.rs:121`, `examples/fp16_eval.rs:45`
 - **Evidence**: Pin `5617a9f61b028005a4858fdac845db406aefb181` in 3 independent copies
 - **Recommendation**: Grep-based CI check asserting unique value
-- **Status**: Open
+- **Status**: Fixed — added `repo_revision_consistent_across_all_copies` test
 
 ### ARC-4: `docs/pr9-review-findings.md` committed as permanent doc
 - **Reviewer**: Architecture
 - **File**: `docs/pr9-review-findings.md`
 - **Evidence**: Review artifact mixed with reference docs; "Status: Fixed" entries become stale
 - **Recommendation**: Move to `docs/decisions/` ADR format or preserve in PR comments
-- **Status**: Open
+- **Status**: Fixed — moved to `docs/decisions/`
 
 ### ARC-5: `run_worker` takes 7 positional arguments
 - **Reviewer**: Architecture
 - **File**: `src/embedder.rs:444`
 - **Evidence**: Growing arg list with Clippy suppression; spans two concerns (identity/lifecycle + execution policy)
 - **Recommendation**: Group policy args into `WorkerConfig` struct
-- **Status**: Open
+- **Status**: Fixed — extracted `WorkerConfig` struct with `onnx_batch_size` and `idle_timeout`
 
 ### ARC-6: `FastPrediction` hardcoded with no production config escape hatch
 - **Reviewer**: Architecture
 - **File**: `src/embedder.rs:397-413`
 - **Evidence**: No env var to opt out of `FastPrediction` on low-RAM Macs
 - **Recommendation**: Expose `BGE_M3_COREML_COMPUTE_UNITS` env var or document the fixed choice
-- **Status**: Open
+- **Status**: Fixed — added `BGE_M3_COREML_STRATEGY` env var (`default` or `fast_prediction`)
 
 ### TST-2: `sparse_project` tests missing zero-weight and negative-bias edge cases
 - **Reviewer**: Tests
 - **File**: `src/embedder.rs` tests
 - **Recommendation**: Add targeted edge-case tests
-- **Status**: Open
+- **Status**: Fixed — added `sparse_project_zero_weight` and `sparse_project_negative_bias` tests
 
 ### TST-3: `sparse_maxpool` missing all-masked-out input test
 - **Reviewer**: Tests
 - **File**: `src/embedder.rs` tests
 - **Recommendation**: Add test with `mask = [0, 0, 0]` for non-special IDs
-- **Status**: Open
+- **Status**: Fixed — added `sparse_maxpool_all_masked_out` test
 
 ### TST-4: Weights module missing SHA-256 integrity test
 - **Reviewer**: Tests
 - **File**: `src/weights/mod.rs`
 - **Evidence**: Documented SHA-256 not enforced at test time
 - **Recommendation**: Promote documented hash to enforced test assertion
-- **Status**: Open
+- **Status**: Fixed — added `bundled_file_sha256_matches` test with documented hash
 
 ### TST-5: Benchmark corpus `boundary_cases` not verified by CI-runnable assertion
 - **Reviewer**: Tests
 - **File**: `benches/fixtures/corpus.json`
 - **Recommendation**: Lightweight JSON-parse unit test for corpus shape
-- **Status**: Open
+- **Status**: Fixed — added `benchmark_corpus_has_expected_shape` test validating structure and counts
 
 ### TST-6: `sparse_linear_loads_correct_shape` doesn't verify weight vector statistical properties
 - **Reviewer**: Tests
 - **File**: `src/weights/mod.rs`
 - **Recommendation**: Assert `weight.iter().all(|w| w.is_finite())` and non-zero check
-- **Status**: Open
+- **Status**: Fixed — added finiteness and non-zero assertions to existing test
 
 ---
 
