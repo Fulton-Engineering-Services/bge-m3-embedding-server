@@ -56,6 +56,8 @@ struct ModelFiles {
 }
 
 /// Downloads BGE-M3 model files from Hugging Face Hub (or returns cached paths).
+///
+/// Files are pinned to [`REPO_REVISION`] for supply-chain integrity.
 fn download_model_files(cache_dir: &Path, show_progress: bool) -> Result<ModelFiles> {
     let api = hf_hub::api::sync::ApiBuilder::new()
         .with_cache_dir(cache_dir.to_path_buf())
@@ -89,7 +91,7 @@ fn download_model_files(cache_dir: &Path, show_progress: bool) -> Result<ModelFi
     })
 }
 
-/// Loads and configures the tokenizer to match fastembed's BGE-M3 configuration.
+/// Loads and configures the BGE-M3 tokenizer.
 ///
 /// Truncation: `LongestFirst` at `MAX_SEQ_LENGTH` (512).
 /// Padding: `BatchLongest` with `pad_id=1`, `pad_token=<pad>`.
@@ -183,6 +185,49 @@ fn sparse_maxpool(ids: &[u32], mask: &[u32], scores: &[f32]) -> (Vec<usize>, Vec
 }
 
 // ---------------------------------------------------------------------------
+// Shared tokenization helper
+// ---------------------------------------------------------------------------
+
+/// Tokenizes a batch of texts and returns `(input_ids, attention_mask, encodings)`.
+///
+/// The returned `Array2<i64>` matrices have shape `[batch, seq_len]` with padding
+/// applied by `BatchLongest`. The raw `Encoding` vector is returned so callers
+/// that need per-token IDs (sparse path) can iterate without re-tokenizing.
+fn tokenize_to_arrays(
+    tokenizer: &tokenizers::Tokenizer,
+    texts: &[String],
+) -> Result<(
+    ndarray::Array2<i64>,
+    ndarray::Array2<i64>,
+    Vec<tokenizers::Encoding>,
+)> {
+    let str_refs: Vec<&str> = texts.iter().map(String::as_str).collect();
+    let encodings = tokenizer
+        .encode_batch(str_refs, true)
+        .map_err(|e| anyhow::anyhow!("Tokenization failed: {e}"))?;
+
+    debug_assert!(
+        !encodings.is_empty(),
+        "encode_batch returned empty vec for non-empty input"
+    );
+
+    let batch_len = encodings.len();
+    let seq_len = encodings[0].get_ids().len();
+
+    let mut ids_flat: Vec<i64> = Vec::with_capacity(batch_len * seq_len);
+    let mut mask_flat: Vec<i64> = Vec::with_capacity(batch_len * seq_len);
+    for enc in &encodings {
+        ids_flat.extend(enc.get_ids().iter().map(|&id| i64::from(id)));
+        mask_flat.extend(enc.get_attention_mask().iter().map(|&m| i64::from(m)));
+    }
+
+    let ids_array = ndarray::Array2::from_shape_vec((batch_len, seq_len), ids_flat)?;
+    let mask_array = ndarray::Array2::from_shape_vec((batch_len, seq_len), mask_flat)?;
+
+    Ok((ids_array, mask_array, encodings))
+}
+
+// ---------------------------------------------------------------------------
 // Embedding functions
 // ---------------------------------------------------------------------------
 
@@ -200,23 +245,9 @@ fn embed_dense(
     let mut all_embeddings = Vec::with_capacity(texts.len());
 
     for chunk in texts.chunks(batch_size) {
-        let str_refs: Vec<&str> = chunk.iter().map(String::as_str).collect();
-        let encodings = tokenizer
-            .encode_batch(str_refs, true)
-            .map_err(|e| anyhow::anyhow!("Tokenization failed: {e}"))?;
-
-        let batch_len = encodings.len();
-        let seq_len = encodings[0].get_ids().len();
-
-        let mut ids_flat: Vec<i64> = Vec::with_capacity(batch_len * seq_len);
-        let mut mask_flat: Vec<i64> = Vec::with_capacity(batch_len * seq_len);
-        for enc in &encodings {
-            ids_flat.extend(enc.get_ids().iter().map(|&id| i64::from(id)));
-            mask_flat.extend(enc.get_attention_mask().iter().map(|&m| i64::from(m)));
-        }
-
-        let ids_array = ndarray::Array2::from_shape_vec((batch_len, seq_len), ids_flat)?;
-        let mask_array = ndarray::Array2::from_shape_vec((batch_len, seq_len), mask_flat)?;
+        let (ids_array, mask_array, _encodings) = tokenize_to_arrays(tokenizer, chunk)?;
+        let batch_len = ids_array.nrows();
+        let seq_len = ids_array.ncols();
         let type_ids_array = ndarray::Array2::<i64>::zeros((batch_len, seq_len));
 
         let ids_tensor = TensorRef::from_array_view(ids_array.view())?;
@@ -263,23 +294,9 @@ fn embed_sparse(
     let mut all_sparse = Vec::with_capacity(texts.len());
 
     for chunk in texts.chunks(batch_size) {
-        let str_refs: Vec<&str> = chunk.iter().map(String::as_str).collect();
-        let encodings = tokenizer
-            .encode_batch(str_refs, true)
-            .map_err(|e| anyhow::anyhow!("Tokenization failed: {e}"))?;
-
-        let batch_len = encodings.len();
-        let seq_len = encodings[0].get_ids().len();
-
-        let mut ids_flat: Vec<i64> = Vec::with_capacity(batch_len * seq_len);
-        let mut mask_flat: Vec<i64> = Vec::with_capacity(batch_len * seq_len);
-        for enc in &encodings {
-            ids_flat.extend(enc.get_ids().iter().map(|&id| i64::from(id)));
-            mask_flat.extend(enc.get_attention_mask().iter().map(|&m| i64::from(m)));
-        }
-
-        let ids_array = ndarray::Array2::from_shape_vec((batch_len, seq_len), ids_flat)?;
-        let mask_array = ndarray::Array2::from_shape_vec((batch_len, seq_len), mask_flat)?;
+        let (ids_array, mask_array, encodings) = tokenize_to_arrays(tokenizer, chunk)?;
+        let batch_len = ids_array.nrows();
+        let seq_len = ids_array.ncols();
         let type_ids_array = ndarray::Array2::<i64>::zeros((batch_len, seq_len));
 
         let ids_tensor = TensorRef::from_array_view(ids_array.view())?;
@@ -466,6 +483,9 @@ fn run_worker(
                 tracing::info!("Worker {id} unloaded models after idle timeout");
             }
             Ok(None) => {
+                if models.is_some() {
+                    loaded_workers.fetch_sub(1, Ordering::AcqRel);
+                }
                 info!("Worker {id} channel closed, shutting down");
                 break;
             }

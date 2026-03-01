@@ -72,6 +72,13 @@ struct SparseLinearWeights {
     bias: f32,
 }
 
+// NOTE(ARC-4): Model loading, tokenization, and embedding functions below
+// intentionally duplicate logic from src/embedder.rs. The production code is
+// a binary crate (no lib target), so examples cannot import from it. This
+// example also has legitimate differences: no batch_size chunking (pairwise
+// comparison), last_hidden_state fallback for Xenova FP16 model variant, and
+// its own SparseLinearWeights/SparseFp16 types for FP16 evaluation output.
+
 fn load_sparse_weights() -> SparseLinearWeights {
     let data = include_bytes!("../src/weights/sparse_linear.safetensors");
     let tensors = safetensors::SafeTensors::deserialize(data).expect("Invalid safetensors");
@@ -204,9 +211,10 @@ fn embed_sparse(
     let mut results = Vec::with_capacity(texts.len());
 
     for text in texts {
-        let encoding = tokenizer
-            .encode(text.as_str(), true)
+        let encodings = tokenizer
+            .encode_batch(vec![text.as_str()], true)
             .map_err(|e| anyhow::anyhow!("Tokenization failed: {e}"))?;
+        let encoding = &encodings[0];
         let input_ids: Vec<i64> = encoding.get_ids().iter().map(|&id| i64::from(id)).collect();
         let attention_mask: Vec<i64> = encoding
             .get_attention_mask()
@@ -363,6 +371,9 @@ fn weight_correlation(
 }
 
 fn stats(vals: &[f64]) -> (f64, f64, f64) {
+    if vals.is_empty() {
+        return (f64::NAN, f64::NAN, f64::NAN);
+    }
     let min = vals.iter().copied().fold(f64::INFINITY, f64::min);
     let max = vals.iter().copied().fold(f64::NEG_INFINITY, f64::max);
     let mean = vals.iter().sum::<f64>() / vals.len() as f64;

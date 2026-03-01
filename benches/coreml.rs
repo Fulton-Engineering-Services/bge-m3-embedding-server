@@ -130,6 +130,13 @@ struct BenchModels {
     tokenizer: tokenizers::Tokenizer,
 }
 
+// NOTE(ARC-3): Model loading and embedding functions below intentionally
+// duplicate logic from src/embedder.rs. The production code is a binary crate
+// (no lib target), so benchmarks cannot import from it. The bench variants
+// also differ structurally (RefCell for Criterion closures, .expect() instead
+// of Result, impl AsRef<str> generics). A lib/bin split would eliminate this
+// but is not warranted for the current project size.
+
 fn load_bench_models(cache: &Path, eps: Vec<ort::ep::ExecutionProviderDispatch>) -> BenchModels {
     let api = hf_hub::api::sync::ApiBuilder::new()
         .with_cache_dir(cache.to_path_buf())

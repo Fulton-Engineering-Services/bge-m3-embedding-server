@@ -453,6 +453,91 @@ mod tests {
         assert!(matches!(result, Err(AppError::ServiceUnavailable(_))));
     }
 
+    // --- handler validation with ready pool (TST-5) ---
+    //
+    // These tests use `with_fixed_responses` so the pool is "alive" (live_workers=1)
+    // and `ready=true`, meaning `check_ready` passes. This exercises `validate_input`
+    // at the handler level — confirming the handler returns `InvalidRequest`, not
+    // `ServiceUnavailable`, for bad input when the service is actually ready.
+
+    #[tokio::test]
+    async fn dense_embeddings_returns_invalid_request_for_empty_input_when_ready() {
+        use crate::models::TextInput;
+        let state = Arc::new(AppState {
+            pool: EmbedPool::with_fixed_responses(vec![], vec![]),
+            ready: AtomicBool::new(true),
+            max_batch: 256,
+            total_workers: 1,
+        });
+        let req = DenseRequest {
+            input: TextInput(vec![]),
+            model: None,
+        };
+        let result = dense_embeddings(State(state), Json(req)).await;
+        assert!(
+            matches!(result, Err(AppError::InvalidRequest(ref msg)) if msg.contains("empty")),
+            "expected InvalidRequest for empty input, got: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn dense_embeddings_returns_invalid_request_for_over_batch_when_ready() {
+        use crate::models::TextInput;
+        let state = Arc::new(AppState {
+            pool: EmbedPool::with_fixed_responses(vec![], vec![]),
+            ready: AtomicBool::new(true),
+            max_batch: 2,
+            total_workers: 1,
+        });
+        let req = DenseRequest {
+            input: TextInput(vec!["a".into(), "b".into(), "c".into()]),
+            model: None,
+        };
+        let result = dense_embeddings(State(state), Json(req)).await;
+        assert!(
+            matches!(result, Err(AppError::InvalidRequest(ref msg)) if msg.contains("exceeds")),
+            "expected InvalidRequest for over-batch, got: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn sparse_embeddings_returns_invalid_request_for_empty_input_when_ready() {
+        use crate::models::TextInput;
+        let state = Arc::new(AppState {
+            pool: EmbedPool::with_fixed_responses(vec![], vec![]),
+            ready: AtomicBool::new(true),
+            max_batch: 256,
+            total_workers: 1,
+        });
+        let req = SparseRequest {
+            input: TextInput(vec![]),
+        };
+        let result = sparse_embeddings(State(state), Json(req)).await;
+        assert!(
+            matches!(result, Err(AppError::InvalidRequest(ref msg)) if msg.contains("empty")),
+            "expected InvalidRequest for empty input, got: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn sparse_embeddings_returns_invalid_request_for_over_batch_when_ready() {
+        use crate::models::TextInput;
+        let state = Arc::new(AppState {
+            pool: EmbedPool::with_fixed_responses(vec![], vec![]),
+            ready: AtomicBool::new(true),
+            max_batch: 2,
+            total_workers: 1,
+        });
+        let req = SparseRequest {
+            input: TextInput(vec!["a".into(), "b".into(), "c".into()]),
+        };
+        let result = sparse_embeddings(State(state), Json(req)).await;
+        assert!(
+            matches!(result, Err(AppError::InvalidRequest(ref msg)) if msg.contains("exceeds")),
+            "expected InvalidRequest for over-batch, got: {result:?}"
+        );
+    }
+
     // --- per-string length validation ---
 
     #[test]

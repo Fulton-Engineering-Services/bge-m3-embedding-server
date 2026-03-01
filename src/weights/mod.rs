@@ -1,6 +1,20 @@
 use ndarray::Array1;
 use std::sync::OnceLock;
 
+/// Bundled sparse-linear projection weights for BGE-M3 sparse embedding.
+///
+/// # Provenance
+///
+/// Extracted from the fastembed-rs crate (v4) which bundles the same file
+/// from the BAAI/bge-m3 checkpoint. The weights implement the sparse-linear
+/// layer described in the BGE-M3 paper: a single linear projection
+/// `hidden_size → 1` that maps each token's 1024-d hidden state to a scalar
+/// relevance score, followed by `ReLU` activation and max-pooling by vocab ID.
+///
+/// - **Source checkpoint**: `BAAI/bge-m3` (HF commit `5617a9f61b02800`)
+/// - **Tensors**: `weight` shape `[1024]` (F32), `bias` scalar (F32)
+/// - **File SHA-256**: `a2601321f01abbb696d171a58a65ff35be1603d9cbc22c647dfe34b4568dd690`
+/// - **File size**: 4,236 bytes
 static WEIGHTS_BYTES: &[u8] = include_bytes!("sparse_linear.safetensors");
 
 static SPARSE_LINEAR: OnceLock<(Array1<f32>, f32)> = OnceLock::new();
@@ -48,7 +62,12 @@ mod tests {
     fn sparse_linear_loads_correct_shape() {
         let (weight, bias) = sparse_linear();
         assert_eq!(weight.len(), 1024);
-        assert!(bias.abs() < 100.0, "bias should be a small number");
+        // Known bias value from BAAI/bge-m3 sparse_linear.safetensors
+        assert!(
+            (*bias - 0.045_196_53).abs() < 1e-6,
+            "bias should be ~0.04520, got {bias}"
+        );
+        assert!(bias.is_finite(), "bias must be finite");
     }
 
     #[test]
@@ -56,5 +75,20 @@ mod tests {
         let a = sparse_linear();
         let b = sparse_linear();
         assert!(std::ptr::eq(a, b), "should return the same cached ref");
+    }
+
+    #[test]
+    fn bundled_file_is_valid_safetensors() {
+        // Verify the embedded bytes parse without panic and contain expected tensors.
+        let tensors = safetensors::SafeTensors::deserialize(WEIGHTS_BYTES)
+            .expect("WEIGHTS_BYTES must be valid safetensors");
+        assert!(tensors.tensor("weight").is_ok(), "must contain 'weight'");
+        assert!(tensors.tensor("bias").is_ok(), "must contain 'bias'");
+    }
+
+    #[test]
+    fn bundled_file_size_matches() {
+        // Size pinned to detect accidental replacement or corruption.
+        assert_eq!(WEIGHTS_BYTES.len(), 4236, "expected 4,236 bytes");
     }
 }

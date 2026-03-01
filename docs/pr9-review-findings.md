@@ -52,63 +52,77 @@
 - **File**: `Cargo.toml:18`
 - **Impact**: RCs don't receive security patch backports; not in OSS CVE databases for cargo-deny
 - **Recommendation**: Track ort 2.0 stable; migrate when it ships
+- **Status**: Deferred — will address when ort 2.0 stable ships
 
 ### SEC-3: Bundled sparse_linear.safetensors has no provenance documentation
 - **File**: `src/weights/`
 - **Impact**: Auditor cannot confirm weights are genuine BGE-M3 extraction
 - **Recommendation**: Document extraction commands, source checkpoint SHA, bundled file SHA
+- **Status**: Fixed — added comprehensive provenance comment to `src/weights/mod.rs` documenting source checkpoint, SHA-256, tensor shapes, and file size
 
 ### COR-2: `encodings[0]` index without empty-batch guard
 - **File**: `src/embedder.rs:150,216`
 - **Impact**: Theoretical panic if `encode_batch` returns empty vec for non-empty input
 - **Recommendation**: Add debug-assert if `encodings.is_empty()`
+- **Status**: Fixed — extracted `tokenize_to_arrays` shared helper with `debug_assert!(!encodings.is_empty())`; both `embed_dense` and `embed_sparse` now call it
 
 ### COR-3: `stats()` in fp16_eval panics on empty slice
 - **File**: `examples/fp16_eval.rs:358-363`
 - **Impact**: Misleading output (`inf`/`NaN`) if all sparse overlaps are NaN
 - **Recommendation**: Add early return for empty input
+- **Status**: Fixed — added early return `(NaN, NaN, NaN)` for empty slice
 
 ### COR-4: `loaded_workers` not decremented on clean channel-close exit
 - **File**: `src/embedder.rs:428`
 - **Impact**: Health may report `ok` instead of `fail` after shutdown — low-risk accounting bug
 - **Recommendation**: Decrement `loaded_workers` when worker exits with models still loaded
+- **Status**: Fixed — added `loaded_workers.fetch_sub(1, ...)` in the `Ok(None)` (channel-closed) branch when models are still loaded
 
 ### COR-5: fp16_eval tokenization inconsistency (batched dense vs single sparse)
 - **File**: `examples/fp16_eval.rs:199-211`
 - **Impact**: Eval tool inconsistency, not production code
 - **Recommendation**: Use batched tokenization for both paths
+- **Status**: Fixed — changed sparse tokenization to `encode_batch(vec![text.as_str()], true)`
 
 ### ARC-2: embed_dense and embed_sparse duplicate tokenize→tensor→run pipeline
 - **File**: `src/embedder.rs:135-282`
 - **Recommendation**: Extract shared `tokenize_to_tensors` helper
+- **Status**: Fixed — merged with COR-2; both functions now call `tokenize_to_arrays`
 
 ### ARC-3: Benchmark fully duplicates production model loading + inference logic
 - **File**: `benches/coreml.rs:116-338`
 - **Recommendation**: Promote pure embedding functions for bench/test access
+- **Status**: Documented — cannot eliminate; binary crate has no `[lib]` section so bench/examples can't import. Added NOTE(ARC-3) documenting intentional duplication and legitimate behavioral differences (RefCell, .expect(), custom EP configs)
 
 ### ARC-4: fp16_eval re-implements load_tokenizer, load_session, sparse weights (3rd copy)
 - **File**: `examples/fp16_eval.rs:96-137`
 - **Recommendation**: Same root cause as ARC-3; three-way duplication is fragile
+- **Status**: Documented — same binary-crate constraint as ARC-3. Added NOTE(ARC-4) documenting intentional duplication and FP16 fallback logic unique to this example
 
 ### ARC-5: docs module table omits weights module; config table lacks BGE_M3_ONNX_BATCH_SIZE
 - **File**: `docs/architecture.md`
 - **Recommendation**: Update documentation tables
+- **Status**: Fixed — already addressed in high-priority ARC-1 documentation update
 
 ### TST-3: Weights module tests lack invalid-input/shape-mismatch cases
 - **File**: `src/weights/mod.rs:41-58`
 - **Recommendation**: Add test for truncated/corrupted bytes
+- **Status**: Fixed — added `bundled_file_is_valid_safetensors` and `bundled_file_size_matches` (pinned at 4,236 bytes) tests
 
 ### TST-4: `bias.abs() < 100.0` assertion is vacuous
 - **File**: `src/weights/mod.rs:49`
 - **Recommendation**: Assert actual known bias value or at minimum non-zero + finite
+- **Status**: Fixed — replaced with precise known-value check `(*bias - 0.045_196_53).abs() < 1e-6`
 
 ### TST-5: Handler tests can't exercise validate_input when pool is ready
 - **File**: `src/handler.rs`
 - **Recommendation**: Use `with_fixed_responses` in ready state for input validation tests
+- **Status**: Fixed — added 4 handler tests using `with_fixed_responses` + `ready=true` that confirm `InvalidRequest` (not `ServiceUnavailable`) for empty-input and over-batch on both dense and sparse endpoints
 
 ### TST-6: Benchmark corpus lacks boundary edge cases
 - **File**: `benches/fixtures/corpus.json`
 - **Recommendation**: Add 1-3 token texts and 512-token boundary texts
+- **Status**: Fixed — added `boundary_cases` scenario with 6 short texts (1-16 chars) and 3 near-512-token-limit texts (~2000-2100 chars)
 
 ---
 
