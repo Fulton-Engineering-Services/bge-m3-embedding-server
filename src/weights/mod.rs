@@ -26,12 +26,14 @@ pub(crate) fn sparse_linear() -> &'static (Array1<f32>, f32) {
             .chunks_exact(4)
             .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
             .collect();
-        let bias = f32::from_le_bytes([
-            bias_view.data()[0],
-            bias_view.data()[1],
-            bias_view.data()[2],
-            bias_view.data()[3],
-        ]);
+        let bias_data = bias_view.data();
+        assert_eq!(
+            bias_data.len(),
+            4,
+            "sparse_linear bias must be a scalar F32 (4 bytes), got {} bytes",
+            bias_data.len()
+        );
+        let bias = f32::from_le_bytes([bias_data[0], bias_data[1], bias_data[2], bias_data[3]]);
 
         assert_eq!(weight.len(), 1024, "sparse_linear weight must be [1024]");
         (Array1::from(weight), bias)

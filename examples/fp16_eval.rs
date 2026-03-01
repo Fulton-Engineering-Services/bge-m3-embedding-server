@@ -61,6 +61,7 @@ fn load_corpus() -> Result<Corpus> {
 // ── Constants ───────────────────────────────────────────────────────────
 
 const REPO_ID: &str = "BAAI/bge-m3";
+const REPO_REVISION: &str = "5617a9f61b028005a4858fdac845db406aefb181";
 const MAX_SEQ_LENGTH: usize = 512;
 const SPECIAL_TOKENS: [u32; 4] = [0, 1, 2, 3];
 
@@ -81,12 +82,14 @@ fn load_sparse_weights() -> SparseLinearWeights {
         .chunks_exact(4)
         .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
         .collect();
-    let bias = f32::from_le_bytes([
-        bias_view.data()[0],
-        bias_view.data()[1],
-        bias_view.data()[2],
-        bias_view.data()[3],
-    ]);
+    let bias_data = bias_view.data();
+    assert_eq!(
+        bias_data.len(),
+        4,
+        "sparse_linear bias must be a scalar F32 (4 bytes), got {} bytes",
+        bias_data.len()
+    );
+    let bias = f32::from_le_bytes([bias_data[0], bias_data[1], bias_data[2], bias_data[3]]);
     assert_eq!(weight.len(), 1024, "sparse_linear weight must be [1024]");
     SparseLinearWeights { weight, bias }
 }
@@ -99,7 +102,11 @@ fn download_model_files(cache_dir: &Path) -> Result<(PathBuf, PathBuf)> {
         .with_progress(true)
         .build()
         .map_err(|e| anyhow::anyhow!("Failed to build hf-hub API: {e}"))?;
-    let repo = api.model(REPO_ID.to_string());
+    let repo = api.repo(hf_hub::Repo::with_revision(
+        REPO_ID.to_string(),
+        hf_hub::RepoType::Model,
+        REPO_REVISION.to_string(),
+    ));
     let onnx_path = repo.get("onnx/model.onnx").context("model.onnx")?;
     repo.get("onnx/model.onnx_data")
         .context("model.onnx_data")?;

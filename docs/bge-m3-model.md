@@ -8,9 +8,8 @@ Multi-granularity) is a text embedding model that produces both **dense** and
 developed by the [FlagEmbedding](https://github.com/FlagOpen/FlagEmbedding)
 team at the **Beijing Academy of Artificial Intelligence (BAAI)**.
 
-This server wraps BGE-M3 via
-[fastembed-rs](https://github.com/Anush008/fastembed-rs) to expose its dense
-and sparse capabilities over an HTTP API. Consumers can use both
+This server exposes BGE-M3's dense and sparse capabilities over an HTTP API
+via direct [ONNX Runtime](https://onnxruntime.ai/) integration. Consumers can use both
 representations independently or combine them into a **hybrid scoring
 model** that blends semantic understanding with lexical precision — an
 approach that consistently outperforms either method alone.

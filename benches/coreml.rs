@@ -1,5 +1,12 @@
 // CoreML EP benchmark harness for comparing execution provider configurations.
 //
+// TODO(CI): These benchmarks require a full ORT build and model download, so they
+// cannot run in GitHub Actions CI (which lacks ORT_LIB_LOCATION and Apple Silicon).
+// End-to-end inference tests (embed_dense/embed_sparse with a real model) are also
+// missing from the unit test suite for the same reason. Consider adding a CI job on
+// a self-hosted Apple Silicon runner, or a lightweight integration test that mocks
+// the ORT session to validate tokenization + post-processing without model weights.
+//
 // Measures dense and sparse embedding inference at the ORT level,
 // bypassing the HTTP server and worker pool to isolate ONNX Runtime performance.
 //
@@ -114,6 +121,7 @@ fn build_execution_providers(cache: &Path) -> Vec<ort::ep::ExecutionProviderDisp
 // ---------------------------------------------------------------------------
 
 const REPO_ID: &str = "BAAI/bge-m3";
+const REPO_REVISION: &str = "5617a9f61b028005a4858fdac845db406aefb181";
 const MAX_SEQ_LENGTH: usize = 512;
 const SPECIAL_TOKENS: [u32; 4] = [0, 1, 2, 3];
 
@@ -129,7 +137,11 @@ fn load_bench_models(cache: &Path, eps: Vec<ort::ep::ExecutionProviderDispatch>)
         .build()
         .expect("Failed to build hf-hub API");
 
-    let repo = api.model(REPO_ID.to_string());
+    let repo = api.repo(hf_hub::Repo::with_revision(
+        REPO_ID.to_string(),
+        hf_hub::RepoType::Model,
+        REPO_REVISION.to_string(),
+    ));
 
     let onnx_path = repo
         .get("onnx/model.onnx")
@@ -193,12 +205,14 @@ fn load_sparse_weights() -> (ndarray::Array1<f32>, f32) {
         .chunks_exact(4)
         .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
         .collect();
-    let bias = f32::from_le_bytes([
-        bias_view.data()[0],
-        bias_view.data()[1],
-        bias_view.data()[2],
-        bias_view.data()[3],
-    ]);
+    let bias_data = bias_view.data();
+    assert_eq!(
+        bias_data.len(),
+        4,
+        "sparse_linear bias must be a scalar F32 (4 bytes), got {} bytes",
+        bias_data.len()
+    );
+    let bias = f32::from_le_bytes([bias_data[0], bias_data[1], bias_data[2], bias_data[3]]);
     (ndarray::Array1::from(weight), bias)
 }
 

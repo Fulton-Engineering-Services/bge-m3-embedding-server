@@ -1,9 +1,10 @@
 # Architecture Overview
 
-`bge-m3-axum-fastembed-rs` is an Axum HTTP server that wraps
-[fastembed-rs](https://github.com/Anush008/fastembed-rs) to serve **BGE-M3
-dense and sparse embeddings** over an OpenAI-compatible REST API. It is
-designed for low-latency, concurrent inference in Docker-based deployments.
+`bge-m3-axum-fastembed-rs` is an Axum HTTP server that serves **BGE-M3
+dense and sparse embeddings** over an OpenAI-compatible REST API via direct
+[ONNX Runtime](https://onnxruntime.ai/) integration. It is designed for
+low-latency, concurrent inference in Docker-based and native deployments,
+with optional CoreML EP acceleration on Apple Silicon.
 
 ## High-Level Component Diagram
 
@@ -21,9 +22,9 @@ graph TB
         Pool["EmbedPool<br/>(mpsc channel + atomics)"]
 
         subgraph "Worker Pool (spawn_blocking)"
-            W0["Worker 0<br/>Dense + Sparse Models"]
-            W1["Worker 1<br/>Dense + Sparse Models"]
-            Wn["Worker N<br/>Dense + Sparse Models"]
+            W0["Worker 0<br/>ORT Session + Tokenizer"]
+            W1["Worker 1<br/>ORT Session + Tokenizer"]
+            Wn["Worker N<br/>ORT Session + Tokenizer"]
         end
     end
 
@@ -50,7 +51,8 @@ graph TB
 | `config` | `src/config.rs` | Env-var configuration (`Config::from_env`) |
 | `state` | `src/state.rs` | Shared `AppState` struct |
 | `handler` | `src/handler.rs` | HTTP handlers and input validation |
-| `embedder` | `src/embedder.rs` | Worker pool, model loading, channel dispatch |
+| `embedder` | `src/embedder.rs` | Worker pool, ORT session + tokenizer loading, inference, channel dispatch |
+| `weights` | `src/weights/mod.rs` | Bundled sparse-linear projection weights (`sparse_linear.safetensors`) |
 | `models` | `src/models.rs` | Request/response serde types |
 | `error` | `src/error.rs` | `AppError` → HTTP status code mapping |
 
@@ -152,16 +154,20 @@ graph TB
 
 ## Model Lifecycle
 
-Each worker independently manages its own pair of model instances
-(`TextEmbedding` for dense, `SparseTextEmbedding` for sparse). Models
-transition through three states during a worker's lifetime:
+Each worker independently manages a single `Option<(ort::session::Session, tokenizers::Tokenizer)>`.
+A single ORT session produces both `sentence_embedding` (dense) and `token_embeddings`
+(sparse) outputs in one forward pass. The sparse-linear projection (weight `[1024]` +
+bias scalar from bundled `sparse_linear.safetensors`) is applied as a post-processing
+step on the `token_embeddings` output.
 
-1. **Loading** — Models initialized from ONNX files at startup (or reload).
-2. **Loaded** — Models in memory, processing requests.
-3. **Unloaded** — Models dropped after `BGE_M3_IDLE_TIMEOUT_SECS` of
+Models transition through three states during a worker's lifetime:
+
+1. **Loading** — ORT session and tokenizer initialized from ONNX files at startup (or reload).
+2. **Loaded** — Session and tokenizer in memory, processing requests.
+3. **Unloaded** — Session and tokenizer dropped after `BGE_M3_IDLE_TIMEOUT_SECS` of
    inactivity; reloaded from cache on next request.
 
-Workers themselves never exit during idle — only their model instances are
+Workers themselves never exit during idle — only their session/tokenizer pair is
 dropped. The `live_workers` atomic tracks thread liveness while
 `loaded_workers` tracks model presence. This distinction drives the health
 endpoint's ability to differentiate `"ok"` from `"idle"` states.
@@ -178,3 +184,4 @@ All configuration is read once at startup from environment variables via
 | `BGE_M3_WORKERS` | `2` | Worker thread count (min 1) |
 | `BGE_M3_MAX_BATCH` | `256` | Max texts per request (min 1) |
 | `BGE_M3_IDLE_TIMEOUT_SECS` | `300` | Idle unload timeout; `0` disables |
+| `BGE_M3_ONNX_BATCH_SIZE` | `8` (macOS) / `256` (other) | Max texts per `session.run()` call; chunked to avoid CoreML OOM |

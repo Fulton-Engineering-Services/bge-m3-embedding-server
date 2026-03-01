@@ -37,6 +37,10 @@ pub enum EmbedRequest {
 // ---------------------------------------------------------------------------
 
 const REPO_ID: &str = "BAAI/bge-m3";
+/// Pinned HF commit — prevents silent model updates and provides supply-chain
+/// integrity for the ONNX weights and tokenizer. Update this hash intentionally
+/// after verifying a new revision produces equivalent embeddings.
+const REPO_REVISION: &str = "5617a9f61b028005a4858fdac845db406aefb181";
 const MAX_SEQ_LENGTH: usize = 512;
 
 /// CLS, PAD, SEP/EOS, UNK — excluded from sparse output.
@@ -59,7 +63,11 @@ fn download_model_files(cache_dir: &Path, show_progress: bool) -> Result<ModelFi
         .build()
         .map_err(|e| anyhow::anyhow!("Failed to build hf-hub API: {e}"))?;
 
-    let repo = api.model(REPO_ID.to_string());
+    let repo = api.repo(hf_hub::Repo::with_revision(
+        REPO_ID.to_string(),
+        hf_hub::RepoType::Model,
+        REPO_REVISION.to_string(),
+    ));
 
     let onnx_path = repo
         .get("onnx/model.onnx")
@@ -124,6 +132,57 @@ fn load_session(
 }
 
 // ---------------------------------------------------------------------------
+// Pure math helpers (testable without ORT)
+// ---------------------------------------------------------------------------
+
+/// L2-normalizes `vec` in place. If the norm is zero, leaves the vector unchanged.
+fn normalize_l2(vec: &mut [f32]) {
+    let norm: f32 = vec.iter().map(|x| x * x).sum::<f32>().sqrt();
+    if norm > 0.0 {
+        for x in vec.iter_mut() {
+            *x /= norm;
+        }
+    }
+}
+
+/// Projects a single token's hidden state through the sparse-linear layer.
+///
+/// Returns `max(0, dot(hidden, weight) + bias)` (ReLU-gated score).
+fn sparse_project(hidden: &[f32], weight: &ndarray::ArrayView1<f32>, bias: f32) -> f32 {
+    let hidden_view = ArrayView1::from(hidden);
+    (hidden_view.dot(weight) + bias).max(0.0)
+}
+
+/// Max-pools sparse scores by vocabulary token ID, excluding special tokens
+/// and tokens masked by the attention mask.
+///
+/// Returns sorted `(indices, values)` vectors suitable for `SparseEmbedding`.
+fn sparse_maxpool(ids: &[u32], mask: &[u32], scores: &[f32]) -> (Vec<usize>, Vec<f32>) {
+    let mut token_weights: HashMap<usize, f32> = HashMap::new();
+
+    for (j, &token_id) in ids.iter().enumerate() {
+        if mask[j] == 0 {
+            continue;
+        }
+        if SPECIAL_TOKENS.contains(&token_id) {
+            continue;
+        }
+        let score = scores[j];
+        if score > 0.0 {
+            token_weights
+                .entry(token_id as usize)
+                .and_modify(|w| *w = w.max(score))
+                .or_insert(score);
+        }
+    }
+
+    let mut indices: Vec<usize> = token_weights.keys().copied().collect();
+    indices.sort_unstable();
+    let values: Vec<f32> = indices.iter().map(|k| token_weights[k]).collect();
+    (indices, values)
+}
+
+// ---------------------------------------------------------------------------
 // Embedding functions
 // ---------------------------------------------------------------------------
 
@@ -174,15 +233,12 @@ fn embed_dense(
 
         for i in 0..batch_len {
             let row = emb.index_axis(ndarray::Axis(0), i);
-            let slice = row.as_slice().expect("embedding should be contiguous");
-
-            let norm: f32 = slice.iter().map(|x| x * x).sum::<f32>().sqrt();
-            let normalized: Vec<f32> = if norm > 0.0 {
-                slice.iter().map(|x| x / norm).collect()
-            } else {
-                slice.to_vec()
-            };
-            all_embeddings.push(normalized);
+            let mut vec = row
+                .as_slice()
+                .expect("embedding should be contiguous")
+                .to_vec();
+            normalize_l2(&mut vec);
+            all_embeddings.push(vec);
         }
     }
 
@@ -241,39 +297,20 @@ fn embed_sparse(
         for (i, enc) in encodings.iter().enumerate() {
             let ids = enc.get_ids();
             let mask = enc.get_attention_mask();
-
             let batch_hidden = token_emb.index_axis(ndarray::Axis(0), i);
-            let mut token_weights: HashMap<usize, f32> = HashMap::new();
 
-            for j in 0..ids.len() {
-                if mask[j] == 0 {
-                    continue;
-                }
-                let token_id = ids[j];
-                if SPECIAL_TOKENS.contains(&token_id) {
-                    continue;
-                }
+            // Project each token's hidden state through sparse_linear.
+            let scores: Vec<f32> = (0..ids.len())
+                .map(|j| {
+                    let hidden = batch_hidden.index_axis(ndarray::Axis(0), j);
+                    let hidden_slice = hidden
+                        .as_slice()
+                        .expect("hidden state should be contiguous");
+                    sparse_project(hidden_slice, &weight_view, *bias)
+                })
+                .collect();
 
-                let hidden = batch_hidden.index_axis(ndarray::Axis(0), j);
-                let hidden_slice = hidden
-                    .as_slice()
-                    .expect("hidden state should be contiguous");
-                let hidden_view = ArrayView1::from(hidden_slice);
-
-                let score = (hidden_view.dot(&weight_view) + bias).max(0.0);
-
-                if score > 0.0 {
-                    token_weights
-                        .entry(token_id as usize)
-                        .and_modify(|w| *w = w.max(score))
-                        .or_insert(score);
-                }
-            }
-
-            let mut indices: Vec<usize> = token_weights.keys().copied().collect();
-            indices.sort_unstable();
-            let values: Vec<f32> = indices.iter().map(|k| token_weights[k]).collect();
-
+            let (indices, values) = sparse_maxpool(ids, mask, &scores);
             all_sparse.push(SparseEmbedding { indices, values });
         }
     }
@@ -842,5 +879,120 @@ mod tests {
         let pool = EmbedPool::idle_for_test();
         assert_eq!(pool.live_worker_count(), 1);
         assert_eq!(pool.loaded_worker_count(), 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // Pure-math helper tests (no ORT session needed)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn normalize_l2_unit_vector() {
+        let mut v = vec![3.0, 4.0];
+        normalize_l2(&mut v);
+        let expected_norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+        assert!((expected_norm - 1.0).abs() < 1e-6, "should be unit length");
+        assert!((v[0] - 0.6).abs() < 1e-6);
+        assert!((v[1] - 0.8).abs() < 1e-6);
+    }
+
+    #[test]
+    fn normalize_l2_zero_vector_unchanged() {
+        let mut v = vec![0.0, 0.0, 0.0];
+        normalize_l2(&mut v);
+        assert!(v.iter().all(|&x| x == 0.0), "zero vector should stay zero");
+    }
+
+    #[test]
+    fn normalize_l2_already_unit() {
+        let mut v = vec![1.0, 0.0, 0.0];
+        normalize_l2(&mut v);
+        assert!((v[0] - 1.0).abs() < 1e-6);
+        assert!(v[1].abs() < 1e-6);
+        assert!(v[2].abs() < 1e-6);
+    }
+
+    #[test]
+    fn sparse_project_positive_score() {
+        let weight = ndarray::array![1.0, 2.0, 3.0];
+        let hidden = [1.0, 1.0, 1.0];
+        // dot = 1+2+3 = 6, + bias 0.5 = 6.5, ReLU = 6.5
+        let score = sparse_project(&hidden, &weight.view(), 0.5);
+        assert!((score - 6.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn sparse_project_relu_clamps_negative() {
+        let weight = ndarray::array![1.0, 1.0];
+        let hidden = [-5.0, -5.0];
+        // dot = -10, + bias 0.0 = -10, ReLU = 0
+        let score = sparse_project(&hidden, &weight.view(), 0.0);
+        assert!(
+            score.abs() < 1e-6,
+            "negative scores should be clamped to zero"
+        );
+    }
+
+    #[test]
+    fn sparse_maxpool_basic() {
+        // token_id 10 appears twice with scores 0.3, 0.7 → max = 0.7
+        // token_id 20 appears once  with score  0.5     → 0.5
+        let ids = [10, 20, 10];
+        let mask = [1, 1, 1];
+        let scores = [0.3, 0.5, 0.7];
+        let (indices, values) = sparse_maxpool(&ids, &mask, &scores);
+        assert_eq!(indices, vec![10, 20]);
+        assert!((values[0] - 0.7).abs() < 1e-6); // max(0.3, 0.7)
+        assert!((values[1] - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn sparse_maxpool_filters_special_tokens() {
+        // IDs 0, 1, 2, 3 are SPECIAL_TOKENS — should be excluded
+        let ids = [0, 1, 2, 3, 100];
+        let mask = [1, 1, 1, 1, 1];
+        let scores = [0.9, 0.9, 0.9, 0.9, 0.5];
+        let (indices, values) = sparse_maxpool(&ids, &mask, &scores);
+        assert_eq!(indices, vec![100]);
+        assert!((values[0] - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn sparse_maxpool_respects_attention_mask() {
+        // mask=0 means the token is padding → excluded
+        let ids = [100, 200];
+        let mask = [1, 0];
+        let scores = [0.5, 0.9];
+        let (indices, values) = sparse_maxpool(&ids, &mask, &scores);
+        assert_eq!(indices, vec![100]);
+        assert!((values[0] - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn sparse_maxpool_skips_zero_scores() {
+        let ids = [100, 200];
+        let mask = [1, 1];
+        let scores = [0.0, 0.5];
+        let (indices, values) = sparse_maxpool(&ids, &mask, &scores);
+        assert_eq!(indices, vec![200], "zero-score tokens should be excluded");
+        assert!((values[0] - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn sparse_maxpool_empty_input() {
+        let ids: [u32; 0] = [];
+        let mask: [u32; 0] = [];
+        let scores: [f32; 0] = [];
+        let (indices, values) = sparse_maxpool(&ids, &mask, &scores);
+        assert!(indices.is_empty());
+        assert!(values.is_empty());
+    }
+
+    #[test]
+    fn sparse_maxpool_returns_sorted_indices() {
+        let ids = [300, 100, 200];
+        let mask = [1, 1, 1];
+        let scores = [0.1, 0.2, 0.3];
+        let (indices, _) = sparse_maxpool(&ids, &mask, &scores);
+        assert_eq!(indices, vec![100, 200, 300], "indices should be sorted");
     }
 }
