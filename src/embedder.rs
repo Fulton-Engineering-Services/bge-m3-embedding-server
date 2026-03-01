@@ -206,10 +206,9 @@ fn tokenize_to_arrays(
         .encode_batch(str_refs, true)
         .map_err(|e| anyhow::anyhow!("Tokenization failed: {e}"))?;
 
-    debug_assert!(
-        !encodings.is_empty(),
-        "encode_batch returned empty vec for non-empty input"
-    );
+    if encodings.is_empty() {
+        anyhow::bail!("tokenizer returned empty batch for non-empty input");
+    }
 
     let batch_len = encodings.len();
     let seq_len = encodings[0].get_ids().len();
@@ -929,6 +928,45 @@ mod tests {
         assert!((v[0] - 1.0).abs() < 1e-6);
         assert!(v[1].abs() < 1e-6);
         assert!(v[2].abs() < 1e-6);
+    }
+
+    #[test]
+    fn normalize_l2_sign_preservation() {
+        let mut v = vec![-3.0, 4.0];
+        normalize_l2(&mut v);
+        assert!(
+            (v[0] - (-0.6)).abs() < 1e-6,
+            "negative sign must be preserved"
+        );
+        assert!((v[1] - 0.8).abs() < 1e-6);
+    }
+
+    #[test]
+    fn normalize_l2_single_element() {
+        let mut v = vec![5.0];
+        normalize_l2(&mut v);
+        assert!(
+            (v[0] - 1.0).abs() < 1e-6,
+            "single positive element normalizes to 1.0"
+        );
+
+        let mut v2 = vec![-7.0];
+        normalize_l2(&mut v2);
+        assert!(
+            (v2[0] - (-1.0)).abs() < 1e-6,
+            "single negative element normalizes to -1.0"
+        );
+    }
+
+    #[test]
+    fn normalize_l2_output_norm_is_one() {
+        let mut v = vec![1.0, 2.0, 3.0, 4.0, 5.0];
+        normalize_l2(&mut v);
+        let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+        assert!(
+            (norm - 1.0).abs() < 1e-6,
+            "output norm must equal 1.0, got {norm}"
+        );
     }
 
     #[test]

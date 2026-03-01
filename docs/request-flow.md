@@ -47,7 +47,7 @@ sequenceDiagram
         Note right of Worker: ~10–30 s reload
     end
 
-    Worker->>Worker: TextEmbedding::embed(texts)
+    Worker->>Worker: embed_dense(&session, &tokenizer, texts, batch_size)
     Worker-->>Pool: reply_tx.send(Ok(embeddings))
     Pool-->>Handler: await reply_rx
 
@@ -60,8 +60,8 @@ sequenceDiagram
 The sparse path is structurally identical. The differences are:
 
 - Sends `EmbedRequest::Sparse` through the channel
-- Worker invokes `SparseTextEmbedding::embed()` instead of
-  `TextEmbedding::embed()`
+- Worker invokes `embed_sparse()` instead of `embed_dense()` — both use
+  the same single ORT session; only the output tensor and post-processing differ
 - Response body uses `SparseResponse` with `indices` + `values` per
   embedding instead of a flat `f32` vector
 
@@ -79,7 +79,7 @@ sequenceDiagram
     Handler->>Pool: pool.sparse(texts)
     Pool->>Worker: EmbedRequest::Sparse { texts, reply_tx }
 
-    Worker->>Worker: SparseTextEmbedding::embed(texts)
+    Worker->>Worker: embed_sparse(&session, &tokenizer, texts, batch_size)
     Worker-->>Handler: Vec<SparseEmbedding>
 
     Handler->>Handler: Map indices (usize → u32)<br/>Build SparseResponse
