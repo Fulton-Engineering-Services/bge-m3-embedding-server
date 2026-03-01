@@ -1553,3 +1553,153 @@ retrieval comparison during normal development use) rather than formal
 retrieval-agreement testing — the embedding-level metrics are convincing enough
 to proceed with the simpler "switch and use it" approach described in the
 evaluation plan.
+
+---
+
+## Removing fastembed — Cost/Benefit Analysis
+
+### What fastembed provides today
+
+The service uses fastembed through exactly two types (`TextEmbedding` and
+`SparseTextEmbedding`) and two call sites in `src/embedder.rs`. fastembed's
+contribution reduces to five things:
+
+| Responsibility | What fastembed does | Complexity |
+|---------------|--------------------|----|
+| Model download | `hf-hub` integration — fetches `BAAI/bge-m3` on first run, caches locally | Low — ~50 lines behind `EmbeddingModel::BGEM3` + `with_cache_dir()` |
+| Tokenization | Loads `tokenizer.json`, runs HuggingFace tokenizer, pads/truncates, converts to `i64` tensors | Low — standard `tokenizers` crate usage |
+| ORT session management | Creates `ort::Session`, runs `session.run()` | Thin wrapper — we already pass EPs through |
+| Dense post-processing | CLS pooling from `sentence_embedding` output | Effectively a no-op for BGE-M3 (model exports the pooled tensor directly) |
+| Sparse post-processing | `post_process_bgem3`: reads `token_embeddings`, applies `sparse_linear.safetensors` (1024→1 linear + bias + ReLU), max-pools by token ID, excludes special tokens | Non-trivial but small — already reimplemented in `examples/fp16_eval.rs` |
+
+### What fastembed costs
+
+**The duplicate-session problem is the single biggest cost.** Both
+`TextEmbedding` and `SparseTextEmbedding` independently load the same ONNX
+file (`onnx/model.onnx`, 2.1 GB) into separate `ort::Session` instances. They
+read different output tensors from the same model (`sentence_embedding` for
+dense, `token_embeddings` for sparse). fastembed's API provides no way to share
+a session — each type owns its session privately.
+
+```
+2 workers × 2 sessions/worker × 2.1 GB = 8.4 GB model weights
+                                          ~~~~~~
+                          4.2 GB of this is pure duplication
+```
+
+**API constraints we have been working around:**
+
+| Constraint | Impact |
+|-----------|--------|
+| No `try_new_from_user_defined` for `SparseTextEmbedding` | Forced raw ORT for FP16 sparse in Phase A eval |
+| No control over `ort::Session` beyond execution providers | Cannot use `PrepackedWeights`, memory arena config, `.ort` format, `commit_from_memory_directly` |
+| `embed()` takes `Vec<String>`, returns `Vec<Vec<f32>>` | Data copies across the API boundary that direct tensor access avoids |
+| `onnx_batch_size` is a workaround | fastembed's `DEFAULT_BATCH_SIZE` (256) is baked in; we had to add a parameter they don't expose |
+| Model selection is enum-based | Cannot point at a custom ONNX file (FP16, INT8) without `UserDefinedEmbeddingModel`, which only exists for dense |
+
+### What direct ORT unlocks
+
+**1. Single session for both dense and sparse.** One `ort::Session` loads the
+model once and reads both `sentence_embedding` (or `last_hidden_state`) and
+`token_embeddings` from the same inference call. Eliminates the duplicate
+weight load.
+
+| Config | Sessions | Model weight memory |
+|--------|----------|-------------------|
+| fastembed, 2 workers | 4 (2 dense + 2 sparse) | 8.4 GB |
+| Direct ORT, 2 workers | 2 (1 per worker) | 4.2 GB |
+| Direct ORT, 1 worker | 1 | 2.1 GB |
+
+**2. Dense + sparse in a single `session.run()`.** The transformer forward
+pass (the expensive part) runs once, producing all output tensors. Currently,
+a request needing both embeddings runs the transformer *twice* through
+separate sessions. This is a latency opportunity independent of CoreML — the
+forward pass dominates wall-clock time.
+
+**3. Model flexibility.** Point at any ONNX file — FP16, INT8, Q4F16, or a
+future fine-tuned variant. No enum, no `UserDefinedEmbeddingModel`. The
+`Xenova/bge-m3` model zoo becomes directly usable.
+
+**4. `PrepackedWeights` across workers.** ORT's `PrepackedWeights` allows
+multiple sessions loading the same file to share pre-packed weight buffers.
+Only applies to CPU EP ops (CoreML bypasses prepacking), but reduces memory
+on the MLAS/CPU fallback path. fastembed exposes no access to this API.
+
+**5. Direct tensor access.** Get `ArrayView` directly from ORT output and
+pass it to response serialization without fastembed's intermediate
+`Vec<Vec<f32>>` copies. Marginal latency improvement, meaningful allocation
+reduction for large batches.
+
+**6. Session-level control.** Memory arena configuration, intra-op thread
+count, graph optimization level, `.ort` runtime format (skips ONNX graph
+parsing), `commit_from_memory_directly` (load from byte slice or memory map).
+
+### Replacement surface
+
+The code we would need to write is small. `examples/fp16_eval.rs` already
+demonstrates most of it:
+
+| Component | Est. lines | Notes |
+|-----------|-----------|-------|
+| Tokenization | ~15 | `tokenizers::Tokenizer::from_file()`, encode, pad, convert to `i64` ndarray |
+| ORT session creation | ~20 | `Session::builder()` with EPs, optimization level, commit from file |
+| Dense inference + CLS pooling | ~10 | `session.run()`, extract `sentence_embedding` or CLS-pool from hidden states |
+| Sparse post-processing | ~40 | Linear projection, ReLU, max-pool by token ID — already written in `fp16_eval.rs` |
+| Batch chunking | ~10 | Split input into `onnx_batch_size` chunks, concatenate results |
+| Model download / cache | ~30 | `hf-hub` crate directly, or a documented `curl` / `huggingface-cli download` step in the install script |
+| **Total** | **~125** | Replaces the entire fastembed dependency |
+
+The worker pool, channel dispatch, idle unloading, health checks, and HTTP
+layer are completely unaffected. Only `load_models()` and the two `embed()`
+call sites in `run_worker()` change.
+
+### Model download after removal
+
+fastembed's automatic HuggingFace download on first run is the one convenience
+that would be lost. Three replacement options:
+
+| Option | Complexity | Trade-off |
+|--------|-----------|-----------|
+| Use `hf-hub` crate directly | ~10 lines | It's already a transitive dep. Download a specific repo/revision to cache dir at startup. |
+| Document manual download | Zero code | The install script (`ops/install-bge-m3-service.sh`) already sets up the cache dir. Add a `curl` or `huggingface-cli download` step. Simplest option. |
+| Bundle model in container / install | Build-time only | Eliminates runtime download entirely. The FP16 model is 1.08 GB — feasible for Docker but large for git. |
+
+For production (`launchd` service on `jpfulton-imac.lan`), the install script
+already manages the cache directory. Adding a download step there is trivial
+and removes the need for any runtime download logic.
+
+### Projected memory impact
+
+Combining fastembed removal (shared session) with other options from the RAM
+reduction inventory:
+
+| Configuration | Sessions | Weight memory | Workspace | Total (est.) |
+|---------------|----------|--------------|-----------|-------------|
+| **Current** (fastembed, FP32, 2 workers, CoreML) | 4 | 8.4 GB | 3–22 GB × 4 | 25–44 GB |
+| Direct ORT, FP32, 2 workers, CoreML | 2 | 4.2 GB | 3–22 GB × 2 | 16–30 GB |
+| Direct ORT, FP16, 2 workers, CoreML | 2 | 2.2 GB | 3–22 GB × 2 | 14–26 GB |
+| Direct ORT, FP16, 1 worker, CoreML | 1 | 1.1 GB | 3–22 GB | 8–14 GB |
+| Direct ORT, FP16, 1 worker, no FastPrediction | 1 | 1.1 GB | ~0 | 5–6 GB |
+
+The shared-session savings (eliminating duplicate weight loads) are additive
+with every other option in the RAM reduction inventory. fastembed removal is
+a prerequisite for reaching the lower memory configurations.
+
+### Assessment
+
+fastembed was the right choice at project start — it provided model download,
+tokenization, and inference behind a simple `.embed()` API with zero ORT
+knowledge required. As the project has moved into CoreML optimization, memory
+profiling, and FP16 evaluation, fastembed has become the primary constraint:
+
+- It forces duplicate model loads that waste 4.2 GB per 2-worker deployment
+- It blocks FP16 sparse inference (no `UserDefinedEmbeddingModel` for sparse)
+- It prevents single-pass dense+sparse inference from a shared session
+- It hides session-level ORT controls behind an opaque API
+
+The replacement code (~125 lines of inference logic) is straightforward, well-
+understood from the Phase A evaluation work, and unlocks every item in the RAM
+reduction inventory. The worker pool architecture, HTTP layer, health checks,
+and idle unloading are completely unaffected.
+
+Removing fastembed is the enabling step for the remaining optimization work.
