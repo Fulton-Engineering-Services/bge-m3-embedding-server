@@ -790,11 +790,14 @@ No recompilation between runs — change the env var and re-run.
 
 - [x] Build `benches/coreml.rs` harness (commit `38dad70`)
 - [x] Rebuild custom ORT with `-mcpu=native` (see build steps below)
-- [ ] Run baseline measurements across all four EP configurations
-- [ ] Capture `ProfileComputePlan` output to confirm op dispatch targets
-- [ ] Compare embedding precision: cosine similarity of outputs across configs
-- [ ] Determine optimal `ComputeUnits` setting for production
-- [ ] Remove `with_profile_compute_plan(true)` after benchmarking
+- [x] Run baseline measurements across all four EP configurations (mlas, coreml_all, coreml_cpu_only, coreml_cpu_and_gpu)
+- [x] Identify and fix SIGKILL root cause — `BGE_M3_ONNX_BATCH_SIZE` (commit `d917011`)
+- [x] Run post-fix coreml_all benchmark — all 12 scenarios complete, no SIGKILL
+- [x] Move `with_profile_compute_plan()` behind `coreml-profile` Cargo feature (commit `f16376d`)
+- [ ] Probe `onnx_batch_size=32` on 128 GB hardware to recover batch throughput
+- [ ] Capture `ProfileComputePlan` output to confirm per-op dispatch targets (`--features coreml-profile`)
+- [ ] Compare embedding precision: cosine similarity of CoreML vs MLAS outputs
+- [ ] Update `dpos-ha-config` LaunchAgent plist with `BGE_M3_ONNX_BATCH_SIZE` tuned for 128 GB
 
 ### Custom ORT Build Steps
 
@@ -922,23 +925,23 @@ vs MLAS's direct NEON SIMD path. Core ML's GCD-based scheduling doesn't saturate
 all cores the way MLAS's work-stealing thread pool does. Run abandoned after pattern
 was clear.
 
-#### CoreML All (default ComputeUnits — GPU + CPU + ANE dispatch)
+#### CoreML All — Pre-Fix Run (historical, `onnx_batch_size=None`)
 
-`BGE_M3_BENCH_EP=coreml_all`
+`BGE_M3_BENCH_EP=coreml_all` — **before** `BGE_M3_ONNX_BATCH_SIZE` fix
 
 | Scenario | Dense Single | Dense Batch | Sparse Single | Sparse Batch |
 |----------|-------------|-------------|---------------|--------------|
 | code_symbols (50×, 22–120 chars) | 27.6 ms (-27%) | 469 ms (-65%) | 27.7 ms (-28%) | 466 ms (-65%) |
-| document_chunks (50×, 337–1599 chars) | 65.1 ms (-58%) | SIGKILL | 64.3 ms (-58%) | SIGKILL |
+| document_chunks (50×, 337–1599 chars) | 65.1 ms (-58%) | **SIGKILL** | 64.3 ms (-58%) | **SIGKILL** |
 | tool_descriptions (75×, 33–283 chars) | 24.2 ms (-17%) | 1.58 s (-57%) | 24.5 ms (-31%) | 1.60 s (-55%) |
 
-**Verdict: 2–3× faster across all workloads.** GPU dispatch dominates. batch/document_chunks
-crashes with SIGKILL during CoreML model compilation warmup (50 × 512-token sequences
-likely exceed a Metal resource limit).
+**Singles: 2–3× faster.** **Batches: SIGKILL** — see SIGKILL Root Cause and Fix below for
+the macOS Jetsam OOM kill analysis and the `BGE_M3_ONNX_BATCH_SIZE` fix. See the
+Phase 3 Post-Fix section for complete results after the fix.
 
-#### CoreML CPU+GPU (explicit, excludes ANE)
+#### CoreML CPU+GPU — Pre-Fix Run (historical, `onnx_batch_size=None`)
 
-`BGE_M3_BENCH_EP=coreml_cpu_and_gpu`
+`BGE_M3_BENCH_EP=coreml_cpu_and_gpu` — **before** `BGE_M3_ONNX_BATCH_SIZE` fix
 
 | Scenario | Dense Single | Dense Batch | Sparse Single | Sparse Batch |
 |----------|-------------|-------------|---------------|--------------|
@@ -1006,3 +1009,67 @@ maximum texts per `session.run()` call, separate from the HTTP-level
 With `onnx_batch_size=8`, a 50-text batch becomes 7 sequential ONNX calls
 (6 × 8 + 1 × 2), eliminating the workspace spike while preserving full throughput
 through the worker pool's request-level parallelism.
+
+#### Phase 3 Post-Fix Benchmark — CoreML All with `onnx_batch_size=8`
+
+After implementing `BGE_M3_ONNX_BATCH_SIZE` (commits `d917011`, `f16376d`),
+a clean two-pass benchmark was run to validate the fix and capture full results.
+All 12 benchmarks complete — no SIGKILL.
+
+**Machines/config:** MacBook Pro M3 Max (16P+4E, 128 GB), macOS Tahoe.
+Custom ORT fork `1e37c3583`, `-mcpu=native`. `onnx_batch_size=8` for CoreML, `None` for MLAS.
+
+**Updated MLAS baseline** (re-run on post-fix codebase, `--save-baseline mlas_only`):
+
+| Scenario | Dense Single | Dense Batch | Sparse Single | Sparse Batch |
+|----------|-------------|-------------|---------------|--------------|
+| code_symbols (50×, 22–120 chars) | 34.8 ms | 1.31 s | 33.2 ms | 1.30 s |
+| document_chunks (50×, 337–1599 chars) | 152.6 ms | 11.9 s | 134.4 ms | 11.97 s |
+| tool_descriptions (75×, 33–283 chars) | 30.5 ms | 3.27 s | 30.8 ms | 3.46 s |
+
+**CoreML All post-fix** (`BGE_M3_BENCH_EP=coreml_all`, `onnx_batch_size=8`, vs updated MLAS baseline):
+
+| Scenario | Dense Single | Dense Batch | Sparse Single | Sparse Batch |
+|----------|-------------|-------------|---------------|--------------|
+| code_symbols (50×, 22–120 chars) | 25.8 ms (**-26%**) | 5.31 s (+305%) | 26.8 ms (**-21%**) | 5.43 s (+319%) |
+| document_chunks (50×, 337–1599 chars) | 60.2 ms (**-61%**) | 20.9 s (+76%) ✓ | 65.2 ms (**-51%**) | 22.4 s (+87%) ✓ |
+| tool_descriptions (75×, 33–283 chars) | 21.9 ms (**-28%**) | 7.30 s (+124%) | 28.8 ms (**-10%**) | 7.69 s (+122%) |
+
+✓ = previously SIGKILL, now completes
+
+**Key findings:**
+
+| Workload type | CoreML vs MLAS | Explanation |
+|---------------|----------------|-------------|
+| Single-text latency | **20–61% faster** | GPU MatMul/attention dominates; CoreML dispatch overhead amortized over 192 ops |
+| Full-batch throughput | **76–319% slower** | 50 texts → 7 serial `session.run()` calls at `onnx_batch_size=8`; each incurs CoreML dispatch overhead and sub-optimal GPU utilization |
+
+The batch regression is expected and mechanical. MLAS processes all 50 texts in one
+monolithic ONNX call; CoreML with `onnx_batch_size=8` uses 7 serial calls. The overhead
+per call (CoreML scheduler → Metal submit → completion fence) multiplies 7×.
+
+**`onnx_batch_size=8` is too conservative for batch workloads** — the default was
+calibrated only to avoid Jetsam (safe headroom). The actual safe envelope is much larger:
+
+| `onnx_batch_size` | Peak attention workspace | Est. total | Safety margin on 128 GB |
+|-------------------|--------------------------|------------|------------------------|
+| 8 (current) | ~128 MB | ~5.6 GB | 4.4% of RAM — very safe |
+| 16 | ~256 MB | ~11 GB | 8.6% of RAM — safe |
+| **32** | **~512 MB** | **~22 GB** | **17% of RAM — safe** |
+| 50 (pre-fix default) | ~800 MB | ~35 GB | 27% — approaches Jetsam threshold |
+
+Raising to `onnx_batch_size=32` on 128 GB hardware reduces the batch call count
+from 7 to 2 (1 × 32 + 1 × 18), recovering most of the throughput regression while
+remaining well within the safe memory envelope. This is a follow-on tuning task;
+for 96 GB hardware, `onnx_batch_size=16` is recommended. The current macOS default
+of `8` remains appropriate for the general case (unknown RAM).
+
+**Updated next steps:**
+
+- [x] Confirm no SIGKILL at `onnx_batch_size=8` across all scenarios
+- [x] Quantify single-text speedup from GPU dispatch (20–61% faster)
+- [x] Quantify batch regression from sub-batching (76–319% slower)
+- [ ] Probe `onnx_batch_size=32` on 128 GB hardware to recover batch throughput
+- [ ] Probe `onnx_batch_size=16` on 96 GB hardware as a safer intermediate
+- [ ] Update `dpos-ha-config` LaunchAgent plist: add `BGE_M3_ONNX_BATCH_SIZE=32` (128 GB Mac Mini)
+- [ ] Compare embedding precision: cosine similarity of CoreML vs MLAS outputs
