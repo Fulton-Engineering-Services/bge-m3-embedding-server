@@ -1116,3 +1116,37 @@ throughput — but should not be the default since document-length text will hit
 pressure. The batch performance regression relative to MLAS is an inherent cost of the
 `FastPrediction` workspace pre-allocation model; single-text latency (20–61% faster) is
 the primary production benefit of CoreML on this model.
+
+#### Production Relevance of Batch vs Single-Text Benchmarks
+
+The batch regression (76–319% slower at `onnx_batch_size=8`) dominates the benchmark
+results but is largely irrelevant to the production experience. The service's two
+consumers have distinct access patterns:
+
+| Consumer | Operation | Texts/request | Latency-sensitive? |
+|----------|-----------|---------------|-------------------|
+| `dpos-coordinator` | Semantic memory lookup | 1 | **Yes** — user/agent waiting |
+| `mcp-local-knowledge-base` | Search query embedding | 1 | **Yes** — user waiting |
+| `mcp-local-knowledge-base` | Document chunk indexing | 10–50 | No — background task |
+
+The **interactive/online path** (queries, semantic lookups) submits a single text per
+request. `onnx_batch_size` is irrelevant here — 1 text = 1 ONNX call regardless of
+the batch limit. This is where CoreML delivers **20–61% lower latency**, and it is
+the workload that directly affects user-perceived performance.
+
+The **batch/indexing path** (embedding document chunks during ingestion) submits
+10–50 texts per request. This is where the `onnx_batch_size=8` sub-batching cost
+manifests. However:
+
+1. **Background operation** — no user is blocked waiting for indexing to complete.
+2. **Infrequent** — occurs when new documents are added, not on every query.
+3. **Worker-pool isolated** — with `BGE_M3_WORKERS=2`, one worker processes the
+   indexing batch while the other remains available for interactive queries.
+
+The benchmark `single/*` results (20–61% faster) directly predict the production
+benefit. The `batch/*` results (76–319% slower) describe a throughput regression
+on a non-latency-sensitive background path — real but low-impact.
+
+**Bottom line:** CoreML's value proposition for this service is single-text latency,
+not batch throughput. The `onnx_batch_size=8` default is correct, and the batch
+regression is an acceptable trade-off for the interactive speedup.
