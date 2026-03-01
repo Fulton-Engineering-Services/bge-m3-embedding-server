@@ -958,14 +958,51 @@ excludes ANE (dynamic shapes prevent ANE eligibility), so explicitly setting
 2. **GPU dispatch provides 2–3× speedup** over MLAS NEON for all text lengths.
    The M3 Max's integrated GPU handles matmul/attention much faster than P-cores.
 
-3. **batch/document_chunks SIGKILL is a production concern.** The CoreML model
-   compilation for large batch × long sequence combinations crashes. The server's
-   `BGE_M3_MAX_BATCH=256` default may need to be lowered, or batching in the
-   worker should be capped when CoreML is active.
-
-4. **CoreML CPU-only is never the right choice.** Accelerate/AMX via Core ML
+3. **CoreML CPU-only is never the right choice.** Accelerate/AMX via Core ML
    adds dispatch overhead that MLAS avoids by inlining NEON SIMD kernels directly.
 
-5. **The idle-unload/reload cycle benefits from CoreML model caching.** The
+4. **The idle-unload/reload cycle benefits from CoreML model caching.** The
    `with_model_cache_dir()` option ensures that CoreML model compilation only
    happens once; reloads use the cached `.mlmodelc` artifacts.
+
+#### SIGKILL Root Cause and Fix
+
+The `batch/document_chunks` SIGKILL (signal 9) during CoreML warmup is caused by
+macOS's Jetsam OOM killer, not a code error. Root cause:
+
+**`MLProgram` + `FastPrediction` pre-allocates the full inference workspace** at
+model-compilation time (first `session.run()` call for a new input shape). For
+BGE-M3 (24 transformer layers, 16 attention heads, 1 024 hidden dim, 4 096 FFN
+intermediate dim) at `batch=50, seq=512`:
+
+| Tensor | Shape | Size |
+|--------|-------|------|
+| Attention scores per layer | `[50, 16, 512, 512]` × float32 | 800 MB |
+| FFN intermediate per layer | `[50, 512, 4 096]` × float32 | 400 MB |
+| Q+K+V projections per layer | `[50, 512, 1 024]` × 3 × float32 | 300 MB |
+| **Worst-case total (24 layers)** | all simultaneously pre-allocated | **~35 GB** |
+
+With 96 GB RAM, macOS Jetsam kills the process at ~70–80% memory pressure. This
+was not GPU-specific: `coreml_cpu_only` crashed too, confirming it's unified-memory
+(RAM) exhaustion, not a Metal buffer limit.
+
+**Why 50 texts at once?** `fastembed::TextEmbedding::embed(texts, None)` chunks
+the input using `DEFAULT_BATCH_SIZE = 256`. With 50 texts < 256, all 50 go into
+a single `session.run()` call, producing a `[50, 512]` input tensor and the
+memory spike above.
+
+**Fix: `BGE_M3_ONNX_BATCH_SIZE` env var** (see `src/config.rs`). Controls the
+maximum texts per `session.run()` call, separate from the HTTP-level
+`BGE_M3_MAX_BATCH`. Defaults to `8` on macOS, `256` elsewhere.
+
+| `onnx_batch_size` | Attn scores | Worst-case total | Status |
+|-------------------|-------------|------------------|--------|
+| 50 (default) | 800 MB | ~35 GB | SIGKILL |
+| 16 | 256 MB | ~11 GB | risky |
+| 8 (macOS default) | 128 MB | ~5.6 GB | **safe** |
+| 4 | 64 MB | ~2.8 GB | very safe |
+| 1 | 16 MB | ~0.7 GB | minimal |
+
+With `onnx_batch_size=8`, a 50-text batch becomes 7 sequential ONNX calls
+(6 × 8 + 1 × 2), eliminating the workspace spike while preserving full throughput
+through the worker pool's request-level parallelism.

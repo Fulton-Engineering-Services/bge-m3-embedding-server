@@ -68,6 +68,23 @@ fn cache_dir() -> PathBuf {
     )
 }
 
+/// Returns the ONNX sub-batch size to pass to `embed()`.
+///
+/// Mirrors the production default: `CoreML` EPs use `Some(8)` to avoid
+/// `MLProgram` `FastPrediction` workspace OOM kills; MLAS uses `None`
+/// (fastembed default, no pre-allocation issue).
+///
+/// Override with `BGE_M3_BENCH_ONNX_BATCH=<n>`.
+fn onnx_batch_size() -> Option<usize> {
+    if let Ok(val) = std::env::var("BGE_M3_BENCH_ONNX_BATCH") {
+        return val.parse::<usize>().ok();
+    }
+    match ep_name().as_str() {
+        "mlas_only" => None,
+        _ => Some(8),
+    }
+}
+
 fn build_execution_providers(
     cache: &Path,
 ) -> Vec<ort::ep::ExecutionProviderDispatch> {
@@ -113,6 +130,7 @@ fn bench_dense(c: &mut Criterion) {
     let label = ep_name();
 
     eprintln!("[bench] Loading dense model with EP={label} ...");
+    let onnx_bs = onnx_batch_size();
     let mut model = TextEmbedding::try_new(
         fastembed::TextInitOptions::new(EmbeddingModel::BGEM3)
             .with_cache_dir(cache.clone())
@@ -122,9 +140,9 @@ fn bench_dense(c: &mut Criterion) {
     .expect("Failed to load dense model");
 
     // Warmup — triggers CoreML model compilation on first run.
-    eprintln!("[bench] Dense warmup inference ...");
+    eprintln!("[bench] Dense warmup inference (onnx_batch_size={onnx_bs:?}) ...");
     model
-        .embed(vec!["warmup text for CoreML compilation"], None)
+        .embed(vec!["warmup text for CoreML compilation"], onnx_bs)
         .expect("Dense warmup failed");
     eprintln!("[bench] Dense model ready.");
 
@@ -148,7 +166,7 @@ fn bench_dense(c: &mut Criterion) {
             BenchmarkId::new("single", *name),
             &single,
             |b, texts| {
-                b.iter(|| model.embed(*texts, None).expect("embed failed"));
+                b.iter(|| model.embed(*texts, onnx_bs).expect("embed failed"));
             },
         );
 
@@ -157,7 +175,7 @@ fn bench_dense(c: &mut Criterion) {
             BenchmarkId::new("batch", *name),
             &scenario.texts,
             |b, texts| {
-                b.iter(|| model.embed(texts, None).expect("embed failed"));
+                b.iter(|| model.embed(texts, onnx_bs).expect("embed failed"));
             },
         );
     }
@@ -176,6 +194,7 @@ fn bench_sparse(c: &mut Criterion) {
     let label = ep_name();
 
     eprintln!("[bench] Loading sparse model with EP={label} ...");
+    let onnx_bs = onnx_batch_size();
     let mut model = SparseTextEmbedding::try_new(
         fastembed::SparseInitOptions::new(SparseModel::BGEM3)
             .with_cache_dir(cache.clone())
@@ -184,9 +203,9 @@ fn bench_sparse(c: &mut Criterion) {
     )
     .expect("Failed to load sparse model");
 
-    eprintln!("[bench] Sparse warmup inference ...");
+    eprintln!("[bench] Sparse warmup inference (onnx_batch_size={onnx_bs:?}) ...");
     model
-        .embed(vec!["warmup text for CoreML compilation"], None)
+        .embed(vec!["warmup text for CoreML compilation"], onnx_bs)
         .expect("Sparse warmup failed");
     eprintln!("[bench] Sparse model ready.");
 
@@ -206,7 +225,7 @@ fn bench_sparse(c: &mut Criterion) {
             BenchmarkId::new("single", *name),
             &single,
             |b, texts| {
-                b.iter(|| model.embed(*texts, None).expect("embed failed"));
+                b.iter(|| model.embed(*texts, onnx_bs).expect("embed failed"));
             },
         );
 
@@ -214,7 +233,7 @@ fn bench_sparse(c: &mut Criterion) {
             BenchmarkId::new("batch", *name),
             &scenario.texts,
             |b, texts| {
-                b.iter(|| model.embed(texts, None).expect("embed failed"));
+                b.iter(|| model.embed(texts, onnx_bs).expect("embed failed"));
             },
         );
     }

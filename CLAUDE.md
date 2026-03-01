@@ -63,6 +63,7 @@ The server starts accepting requests once model warm-up completes (watch logs fo
 | `BGE_M3_WORKERS` | `2` | Number of worker threads (each loads its own model instance; min 1) |
 | `BGE_M3_MAX_BATCH` | `256` | Maximum number of texts accepted per request (min 1) |
 | `BGE_M3_IDLE_TIMEOUT_SECS` | `300` | Seconds of inactivity before models are unloaded; `0` disables idle unloading |
+| `BGE_M3_ONNX_BATCH_SIZE` | `8` (macOS) / `256` (other) | Max texts per ONNX `session.run()` call. On macOS, CoreML `MLProgram` with `FastPrediction` pre-allocates the full intermediate-tensor workspace; BGE-M3 at batch=50×seq=512 can peak at ~35 GB, triggering Jetsam OOM kills. Chunking to 8 keeps peak under 6 GB. |
 
 ## Architecture
 

@@ -100,7 +100,7 @@ async fn main() -> anyhow::Result<()> {
     );
 
     let (pool, init_handle) =
-        EmbedPool::spawn(cfg.workers, PathBuf::from(&cfg.cache_dir), cfg.idle_timeout);
+        EmbedPool::spawn(cfg.workers, PathBuf::from(&cfg.cache_dir), cfg.idle_timeout, cfg.onnx_batch_size);
 
     let state = Arc::new(AppState {
         pool,

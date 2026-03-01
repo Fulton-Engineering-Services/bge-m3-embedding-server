@@ -46,7 +46,7 @@ impl Drop for WorkerGuard {
 ///
 /// Called from a `spawn_blocking` task. Loads models, signals readiness, then
 /// processes requests from the shared channel until it closes.
-#[allow(clippy::needless_pass_by_value)]
+#[allow(clippy::needless_pass_by_value, clippy::too_many_arguments)]
 fn run_worker(
     id: usize,
     cache_dir: PathBuf,
@@ -55,6 +55,7 @@ fn run_worker(
     live_workers: Arc<AtomicUsize>,
     loaded_workers: Arc<AtomicUsize>,
     idle_timeout: Option<Duration>,
+    onnx_batch_size: usize,
 ) -> Result<()> {
     let _guard = WorkerGuard(Arc::clone(&live_workers));
     let span = info_span!("worker", id = id);
@@ -153,7 +154,7 @@ fn run_worker(
                         let result = dense_model
                             .as_mut()
                             .expect("dense model loaded after reload check")
-                            .embed(texts, None)
+                            .embed(texts, Some(onnx_batch_size))
                             .map_err(|e| anyhow::anyhow!("Dense embed error: {e}"));
                         let _ = reply.send(result);
                     }
@@ -161,7 +162,7 @@ fn run_worker(
                         let result = sparse_model
                             .as_mut()
                             .expect("sparse model loaded after reload check")
-                            .embed(texts, None)
+                            .embed(texts, Some(onnx_batch_size))
                             .map_err(|e| anyhow::anyhow!("Sparse embed error: {e}"));
                         let _ = reply.send(result);
                     }
@@ -189,8 +190,6 @@ fn run_worker(
 /// - **Model cache** — caches the compiled `CoreML` model to
 ///   `{cache_dir}/coreml`, eliminating 5–15 s recompilation per session
 ///   load (critical for the idle-unload-reload cycle).
-/// - **`ProfileComputePlan`** — logs per-op hardware dispatch decisions.
-///   **Diagnostic only** — remove after benchmarking.
 ///
 /// On all other platforms, returns an empty vec (CPU EP only).
 fn execution_providers(cache_dir: &Path) -> Vec<ort::ep::ExecutionProviderDispatch> {
@@ -201,7 +200,6 @@ fn execution_providers(cache_dir: &Path) -> Vec<ort::ep::ExecutionProviderDispat
             .with_model_format(ort::ep::coreml::ModelFormat::MLProgram)
             .with_specialization_strategy(ort::ep::coreml::SpecializationStrategy::FastPrediction)
             .with_model_cache_dir(coreml_cache.display().to_string())
-            .with_profile_compute_plan(true) // TODO(phase3): remove after benchmarking
             .build()]
     }
     #[cfg(not(target_os = "macos"))]
@@ -279,6 +277,7 @@ impl EmbedPool {
         n: usize,
         cache_dir: PathBuf,
         idle_timeout: Option<Duration>,
+        onnx_batch_size: usize,
     ) -> (Self, JoinHandle<Result<()>>) {
         let capacity = n * 4;
         let (tx, rx) = mpsc::channel::<EmbedRequest>(capacity);
@@ -317,6 +316,7 @@ impl EmbedPool {
                             live_for_worker,
                             loaded_for_worker,
                             idle_timeout,
+                            onnx_batch_size,
                         )
                     })
                 };
@@ -511,7 +511,7 @@ mod tests {
 
     #[tokio::test]
     async fn spawn_propagates_leader_load_failure() {
-        let (pool, init_handle) = EmbedPool::spawn(1, bad_cache_dir(), None);
+        let (pool, init_handle) = EmbedPool::spawn(1, bad_cache_dir(), None, 8);
 
         let result = tokio::time::timeout(Duration::from_secs(5), init_handle)
             .await
@@ -534,7 +534,7 @@ mod tests {
 
     #[tokio::test]
     async fn spawn_multi_worker_fails_fast_on_leader_failure() {
-        let (pool, init_handle) = EmbedPool::spawn(3, bad_cache_dir(), None);
+        let (pool, init_handle) = EmbedPool::spawn(3, bad_cache_dir(), None, 8);
 
         let result = tokio::time::timeout(Duration::from_secs(5), init_handle)
             .await
