@@ -28,9 +28,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
-use fastembed::{
-    EmbeddingModel, SparseModel, SparseTextEmbedding, TextEmbedding,
-};
+use fastembed::{EmbeddingModel, SparseModel, SparseTextEmbedding, TextEmbedding};
 
 // ---------------------------------------------------------------------------
 // Corpus loading
@@ -63,9 +61,7 @@ fn ep_name() -> String {
 }
 
 fn cache_dir() -> PathBuf {
-    PathBuf::from(
-        std::env::var("BGE_M3_CACHE_DIR").unwrap_or_else(|_| "/tmp/bge-m3-cache".into()),
-    )
+    PathBuf::from(std::env::var("BGE_M3_CACHE_DIR").unwrap_or_else(|_| "/tmp/bge-m3-cache".into()))
 }
 
 /// Returns the ONNX sub-batch size to pass to `embed()`.
@@ -85,9 +81,7 @@ fn onnx_batch_size() -> Option<usize> {
     }
 }
 
-fn build_execution_providers(
-    cache: &Path,
-) -> Vec<ort::ep::ExecutionProviderDispatch> {
+fn build_execution_providers(cache: &Path) -> Vec<ort::ep::ExecutionProviderDispatch> {
     let config = ep_name();
     let coreml_cache = cache.join("coreml");
 
@@ -97,9 +91,7 @@ fn build_execution_providers(
     let base = || {
         ort::ep::CoreML::default()
             .with_model_format(ort::ep::coreml::ModelFormat::MLProgram)
-            .with_specialization_strategy(
-                ort::ep::coreml::SpecializationStrategy::FastPrediction,
-            )
+            .with_specialization_strategy(ort::ep::coreml::SpecializationStrategy::FastPrediction)
             .with_model_cache_dir(coreml_cache.display().to_string())
     };
 
@@ -162,13 +154,9 @@ fn bench_dense(c: &mut Criterion) {
 
         // Single-text latency (first text from scenario).
         let single = &scenario.texts[0..1];
-        group.bench_with_input(
-            BenchmarkId::new("single", *name),
-            &single,
-            |b, texts| {
-                b.iter(|| model.embed(*texts, onnx_bs).expect("embed failed"));
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("single", *name), &single, |b, texts| {
+            b.iter(|| model.embed(*texts, onnx_bs).expect("embed failed"));
+        });
 
         // Full-batch throughput (all texts from scenario).
         group.bench_with_input(
@@ -221,13 +209,9 @@ fn bench_sparse(c: &mut Criterion) {
         let scenario = &corpus.scenarios[*name];
 
         let single = &scenario.texts[0..1];
-        group.bench_with_input(
-            BenchmarkId::new("single", *name),
-            &single,
-            |b, texts| {
-                b.iter(|| model.embed(*texts, onnx_bs).expect("embed failed"));
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("single", *name), &single, |b, texts| {
+            b.iter(|| model.embed(*texts, onnx_bs).expect("embed failed"));
+        });
 
         group.bench_with_input(
             BenchmarkId::new("batch", *name),

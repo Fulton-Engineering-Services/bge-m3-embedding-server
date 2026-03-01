@@ -34,6 +34,9 @@ tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 proptest = "1"
 criterion = { version = "0.5", features = ["html_reports"] }
+tokenizers = { version = "0.22", default-features = false, features = ["onig"] }
+safetensors = "0.4"
+ndarray = "0.17"
 
 [[bench]]
 name = "embeddings"
