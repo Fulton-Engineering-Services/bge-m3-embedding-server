@@ -1325,3 +1325,152 @@ this to 6–8 GB but requires bypassing fastembed's model selection.
 
 These options are documented for future design work. No implementation decisions
 have been made.
+
+---
+
+## FP16 Quantization — Precision Evaluation Framework
+
+### Current system state
+
+The system is in early development testing. All persisted embeddings in both
+PostgreSQL databases (`knowledgebase.chunks` and `coordinator.vector_store`) can
+be discarded and re-indexed from source. This eliminates the mixed-precision
+transition problem — there is no need to maintain compatibility with existing
+FP32-generated vectors or handle a gradual migration. A clean re-index after
+switching models is the simplest and correct approach.
+
+### Where precision loss can occur
+
+FP16 (IEEE 754 half-precision) has 10 bits of mantissa vs FP32's 23 bits. For
+BGE-M3 (568M parameters, XLM-RoBERTa architecture), the impact surfaces in:
+
+1. **Weight representation** — model parameters rounded to FP16-representable
+   values. For well-trained transformer models, parameters cluster in ranges that
+   FP16 represents well. This is generally benign.
+
+2. **Intermediate activations** — attention scores (`Q·K^T / √d`), layer norms,
+   softmax. However, on Apple Silicon the ANE and GPU already run inference in
+   FP16 internally even with FP32 weights — the hardware down-casts at compute
+   time. An FP16 model aligns stored format with what the hardware already does.
+
+3. **Output embeddings** — the final 1024-dim dense vector. Small perturbations
+   flow directly into cosine similarity.
+
+### The "already FP16" insight
+
+`mcp-local-knowledge-base` stores dense embeddings as PostgreSQL `halfvec` (FP16):
+
+```
+Current:   FP32 model → FP32 embedding → halfvec cast (FP16) → cosine search
+With FP16: FP16 model → FP16 embedding → halfvec storage     → cosine search
+```
+
+The stored vectors are **already quantized to FP16 at rest**. The only difference
+is whether quantization happens inside the model or at the database boundary. This
+significantly de-risks the FP16 approach — precision at search time is already
+FP16 regardless of model precision.
+
+Since the system can be cleanly re-indexed, both the query path and the stored
+corpus will use FP16 embeddings. There is no mixed-precision scenario to evaluate.
+
+### What the consumers actually need
+
+Both consumers use **rank-based** retrieval, not raw similarity scores:
+
+| Consumer | Retrieval method | Why rank matters more than score magnitude |
+|----------|-----------------|-------------------------------------------|
+| `mcp-local-knowledge-base` | Reciprocal Rank Fusion (k=60) of dense cosine + sparse dot-product | RRF discards raw scores entirely — only ordinal position in each leg matters. |
+| `dpos-coordinator` | Hybrid merge of lexical `ts_rank` + semantic cosine, 50/50 weighted average | Score magnitude matters but is averaged with a separate lexical signal. |
+
+The critical question is whether FP16 preserves **rank order**, not whether raw
+cosine similarity shifts by 0.001.
+
+The one exception is **similarity thresholds**: dpos-coordinator uses 0.5 for
+memory search and 0.2 for tool search. If FP16 systematically shifts scores
+downward, marginal results near these boundaries could be affected.
+
+### Sparse embedding stability
+
+The sparse output comes from `ReLU(hidden_state @ weight + bias)` applied to
+per-token hidden states. FP16 perturbations in hidden states could change which
+tokens activate above zero (the ReLU boundary). Two things to measure:
+
+- **Activation agreement** — what percentage of non-zero sparse indices are
+  identical between FP32 and FP16?
+- **Weight magnitude correlation** — for shared non-zero indices, how closely do
+  the SPLADE weights agree?
+
+The sparse linear weights are stored in a compiled-in `sparse_linear.safetensors`
+file (part of fastembed, not the ONNX model). These weights stay at whatever
+precision fastembed loads them in. The FP16 perturbation only affects the hidden
+states fed into this linear layer.
+
+### Evaluation plan
+
+Since all persisted embeddings can be discarded, the evaluation simplifies to: does
+FP16 produce retrieval results of equivalent quality to FP32?
+
+**Phase A — Embedding-level fidelity (fast, automated)**
+
+Generate embeddings for all 175 texts in `benches/fixtures/corpus.json` using both
+FP32 and FP16 models. Measure:
+
+| Metric | Target | What it tells you |
+|--------|--------|-------------------|
+| Per-text cosine similarity (FP32 vs FP16 dense) | > 0.999 | Raw vector alignment |
+| Max absolute difference per dimension | < 0.01 | Worst-case per-element drift |
+| Sparse activation overlap (Jaccard index of non-zero indices) | > 0.95 | Token-level agreement |
+| Sparse weight correlation (Pearson's r on shared indices) | > 0.99 | Weight magnitude agreement |
+
+If cosine similarity > 0.999 across the corpus, rank order is almost certainly
+preserved. The corpus already covers all three production scenarios (document
+chunks at varying lengths, tool descriptions, code symbols).
+
+**Phase B — Retrieval-level agreement (the metric that actually matters)**
+
+Using the production PostgreSQL databases, run a retrieval comparison:
+
+1. Re-index a sample of existing documents with FP16 into a parallel table/schema
+2. Take 10–20 representative search queries (from logs or synthetic)
+3. For each query, embed with FP16 and search both the FP32 and FP16 indexes
+4. Measure **overlap@K** (% of results in common) and **rank correlation**
+   (Kendall's tau) for the top-10 results
+
+Since the system is in early dev, an even simpler approach: switch to FP16, do a
+full re-index, and qualitatively evaluate search quality during normal development
+use. If retrieval quality feels the same, it is — the human evaluation of "did I
+find the right document?" is the ground truth.
+
+**Phase C — Threshold sensitivity (dpos-coordinator only)**
+
+For the memory search threshold of 0.5:
+
+1. Find chunks that score between 0.45–0.55 with FP32 queries
+2. Re-score with FP16 queries and check for threshold crossings
+3. Same for tool search at 0.2 (but this threshold is so loose that FP16 drift is
+   unlikely to matter)
+
+Since the system can be fully re-indexed, Phase C is less critical — both query
+and corpus vectors will be FP16, so any systematic score shift applies uniformly
+to both sides and largely cancels out in the cosine computation.
+
+### ANE dispatch implications
+
+The Apple Neural Engine operates natively in FP16. With an FP32 model, CoreML
+inserts FP32→FP16 casts for ANE-eligible ops, and some ops may fall back to CPU
+when the cast introduces unacceptable precision loss. With an FP16 model:
+
+- No casts needed — every op is already in the ANE's native format
+- More ops may be eligible for ANE dispatch (the `coreml-profile` feature flag
+  would reveal this)
+- The compiled CoreML model cache may be smaller (FP16 weights in the artifact)
+
+FP16 could **improve latency** in addition to saving RAM, by enabling broader ANE
+coverage.
+
+### Literature context
+
+BGE-M3's architecture (XLM-RoBERTa, 568M params) is well within the regime where
+FP16 quantization is essentially lossless. Published evaluations of FP16
+transformer models typically show < 0.1% degradation on retrieval benchmarks. INT8
+is where measurable (but still small, 0.5–2%) degradation begins to appear.
