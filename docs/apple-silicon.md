@@ -1246,3 +1246,82 @@ handle the gap.
 This trade-off is deferred to deployment configuration, not baked into the code.
 The `BGE_M3_WORKERS` env var already supports `1`. The decision depends on the
 deployment target's available RAM and concurrent request patterns.
+
+---
+
+## RAM Reduction Options — Full Inventory
+
+The options below are organized by implementation effort. They are additive — many
+can be combined. Estimated savings are relative to the CoreML 2-worker projection
+of 25–44 GB.
+
+### Key architectural insight
+
+Both `TextEmbedding` (dense) and `SparseTextEmbedding` (sparse) load the **same
+2.1 GB ONNX file** (`BAAI/bge-m3 → onnx/model.onnx` + `onnx/model.onnx_data`)
+into separate ORT sessions. The sparse model reads a different output tensor
+(`token_embeddings` vs `sentence_embedding`) and applies an extra linear layer from
+a compiled-in `sparse_linear.safetensors`. So 2 workers × 2 model types = **4 copies
+of the same 2.1 GB weights** in memory. This duplication is the single biggest lever.
+
+ORT's `PrepackedWeights` API allows weight sharing across sessions loading the same
+file, but only for CPU EP ops — CoreML EP bypasses prepacking entirely.
+
+### Tier 1 — Configuration-only (no code changes)
+
+| # | Option | Est. Savings | Trade-off |
+|---|--------|-------------|-----------|
+| 1 | **`BGE_M3_WORKERS=1`** | ~7 GB (MLAS) or ~12–22 GB (CoreML) | Requests queue behind a single worker. P99 ~120 ms queued still beats MLAS P50 for long texts. |
+| 2 | **Shorter idle timeout** | Full model memory when idle | Already implemented (`BGE_M3_IDLE_TIMEOUT_SECS`). With CoreML model cache, reload ~5–10 s from compiled cache vs ~15–30 s cold. |
+| 3 | **Smaller `BGE_M3_ONNX_BATCH_SIZE`** | Reduces FastPrediction workspace | Already at 8 (safe). Going to 4 halves workspace but doubles wall-clock for batch indexing. |
+
+### Tier 2 — Moderate code changes
+
+| # | Option | Est. Savings | Trade-off |
+|---|--------|-------------|-----------|
+| 4 | **Drop `FastPrediction` → use `Default` specialization** | Eliminates 3–22 GB pre-allocated workspace per session | Higher per-request latency (est. 10–30% regression). Eliminates the single biggest CoreML memory consumer. |
+| 5 | **Shared ORT session (dense + sparse in same worker)** | ~2.1 GB per worker (eliminate duplicate session) | Requires reaching below fastembed's API to share a single `ort::Session` for both output tensors. Significant refactor or fastembed bypass. |
+| 6 | **`PrepackedWeights` across workers** | Modest — CPU EP ops only | CoreML EP bypasses prepacking entirely. Savings primarily on CPU-fallback ops. Estimated 100–500 MB. |
+| 7 | **Disable CPU memory arena** | Small — reduces unused arena slack | `CPU::with_arena_allocator(false)` trades RSS for fragmentation. Marginal benefit. |
+
+### Tier 3 — Model-level (significant effort)
+
+| # | Option | Est. Savings | Trade-off |
+|---|--------|-------------|-----------|
+| 8 | **FP16 quantized model** | ~1.08 GB vs 2.16 GB per session (50%) | Available from `Xenova/bge-m3`. ANE-native format. Must bypass fastembed's model enum or fork it. Possible small precision loss. |
+| 9 | **INT8 quantized model** | ~543 MB vs 2.16 GB per session (75%) | Largest per-session savings. CoreML may not dispatch INT8 to ANE. Must validate embedding quality (cosine similarity vs FP32). Available from `Xenova/bge-m3`. |
+| 10 | **Bypass fastembed entirely** | Enables all ORT options + model flexibility | Direct `ort::Session` usage. Unlocks `PrepackedWeights`, custom model paths, `commit_from_memory_directly` for `.ort` format. Lose fastembed's tokenizer management, model download logic, and model enum. Substantial rewrite. |
+
+### Quantized model availability (Xenova/bge-m3)
+
+| Variant | File | Size | Notes |
+|---------|------|------|-------|
+| FP32 (current) | `model.onnx` + `model.onnx_data` | 2,162 MB | Default fastembed model |
+| FP16 | `model_fp16.onnx` | 1,082 MB | Half precision, ANE-friendly |
+| INT4 (Q4) | `model_q4.onnx` | 1,190 MB | Block-quantized 4-bit |
+| Q4F16 | `model_q4f16.onnx` | 668 MB | INT4 weights + FP16 activations |
+| INT8 | `model_quantized.onnx` | 543 MB | Dynamic INT8 (Optimum default) |
+| UINT8 | `model_uint8.onnx` | 542 MB | Static unsigned INT8 |
+
+### Projected memory by configuration
+
+Combining options produces different memory profiles for 2-worker and 1-worker
+configurations. All estimates assume CoreML EP.
+
+| Configuration | Sessions | Per-session weights | Workspace (FastPred) | Total (est.) |
+|---------------|----------|--------------------|-----------------------|-------------|
+| FP32 × 2 workers (current projection) | 4 | 2.16 GB × 4 = 8.6 GB | 3–22 GB × 4 | 25–44 GB |
+| FP32 × 1 worker | 2 | 2.16 GB × 2 = 4.3 GB | 3–22 GB × 2 | 12–22 GB |
+| FP32 × 1 worker, no FastPrediction | 2 | 2.16 GB × 2 = 4.3 GB | ~0 | 8–10 GB |
+| FP16 × 1 worker | 2 | 1.08 GB × 2 = 2.2 GB | 3–22 GB × 2 | 10–18 GB |
+| FP16 × 1 worker, no FastPrediction | 2 | 1.08 GB × 2 = 2.2 GB | ~0 | 6–8 GB |
+| INT8 × 1 worker, no FastPrediction | 2 | 0.54 GB × 2 = 1.1 GB | ~0 | 5–6 GB |
+| Shared session + FP16 × 1 worker | 1 | 1.08 GB × 1 = 1.1 GB | 3–22 GB × 1 | 6–10 GB |
+
+The most practical path is likely options 1 + 4 (1 worker, drop FastPrediction):
+**8–10 GB total**, beating the MLAS 2-worker baseline of 14 GB while preserving
+CoreML's 20–61% single-text latency advantage. Adding FP16 (option 8) could push
+this to 6–8 GB but requires bypassing fastembed's model selection.
+
+These options are documented for future design work. No implementation decisions
+have been made.
