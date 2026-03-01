@@ -1051,25 +1051,68 @@ per call (CoreML scheduler → Metal submit → completion fence) multiplies 7×
 **`onnx_batch_size=8` is too conservative for batch workloads** — the default was
 calibrated only to avoid Jetsam (safe headroom). The actual safe envelope is much larger:
 
-| `onnx_batch_size` | Peak attention workspace | Est. total | Safety margin on 128 GB |
-|-------------------|--------------------------|------------|------------------------|
-| 8 (current) | ~128 MB | ~5.6 GB | 4.4% of RAM — very safe |
-| 16 | ~256 MB | ~11 GB | 8.6% of RAM — safe |
-| **32** | **~512 MB** | **~22 GB** | **17% of RAM — safe** |
-| 50 (pre-fix default) | ~800 MB | ~35 GB | 27% — approaches Jetsam threshold |
-
-Raising to `onnx_batch_size=32` on 128 GB hardware reduces the batch call count
-from 7 to 2 (1 × 32 + 1 × 18), recovering most of the throughput regression while
-remaining well within the safe memory envelope. This is a follow-on tuning task;
-for 96 GB hardware, `onnx_batch_size=16` is recommended. The current macOS default
-of `8` remains appropriate for the general case (unknown RAM).
+The safety table above uses `seq_len=512` (worst case). Actual workspace scales with
+`batch × seq_len²` — so safe headroom is text-length dependent (see probe below).
 
 **Updated next steps:**
 
 - [x] Confirm no SIGKILL at `onnx_batch_size=8` across all scenarios
 - [x] Quantify single-text speedup from GPU dispatch (20–61% faster)
 - [x] Quantify batch regression from sub-batching (76–319% slower)
-- [ ] Probe `onnx_batch_size=32` on 128 GB hardware to recover batch throughput
-- [ ] Probe `onnx_batch_size=16` on 96 GB hardware as a safer intermediate
-- [ ] Update `dpos-ha-config` LaunchAgent plist: add `BGE_M3_ONNX_BATCH_SIZE=32` (128 GB Mac Mini)
+- [x] Probe `onnx_batch_size=32` — text-length dependence confirmed (see below)
 - [ ] Compare embedding precision: cosine similarity of CoreML vs MLAS outputs
+- [ ] Update `dpos-ha-config` LaunchAgent plist with `BGE_M3_ONNX_BATCH_SIZE` tuned for workload
+
+#### `onnx_batch_size=32` Probe — Partial Results and Finding
+
+**Short texts (code_symbols, 22–120 chars, ~8–30 tokens):**
+
+| Benchmark | MLAS | batch=8 | **batch=32** | Improvement over batch=8 |
+|-----------|------|---------|--------------|--------------------------|
+| `dense/batch/code_symbols` | 1.31 s | 5.31 s | **2.17 s** | **-59%** |
+| `sparse/batch/code_symbols` | 1.30 s | 5.43 s | *(not reached)* | — |
+
+`dense/batch/code_symbols` at batch=32 reduces from 5.31 s to 2.17 s — a 59% improvement,
+and only +66% above MLAS (vs +305% at batch=8). The 50-text batch is handled in 2 ONNX calls
+(32 + 18) instead of 7. For short texts, batch=32 is clearly better.
+
+**Long texts (document_chunks, 337–1599 chars, ~100–400 tokens): run abandoned.**
+
+The probe timed out on `dense/batch/document_chunks`. Root cause is the attention workspace
+scaling quadratically with sequence length:
+
+| Config | Attention scores per layer | Layers | Workspace |
+|--------|---------------------------|--------|-----------|
+| batch=8, seq=512 | `[8, 16, 512, 512]` × f32 = 128 MB | 24 | ~5.6 GB |
+| batch=32, seq=400 | `[32, 16, 400, 400]` × f32 = 3.3 GB | 24 | **~78 GB** |
+| batch=32, seq=512 | `[32, 16, 512, 512]` × f32 = 512 MB… wait | 24 | ~22 GB |
+
+The document_chunks corpus has texts up to 1,599 chars. After tokenization, batches of 32
+texts are padded to the longest token sequence in the batch — often 350–400 tokens. At that
+seq_len, the `FastPrediction` workspace reaches ~78 GB on 128 GB unified memory, causing
+severe macOS memory pressure, paging overhead, and ~200+ seconds per ONNX call (vs ~3 s
+expected). No SIGKILL, but effectively unusable.
+
+**Key finding: `onnx_batch_size` safety is `batch × seq_len²` — not batch alone.**
+
+The `seq_len=512` worst-case table above is only safe at smaller batch sizes. The true
+constraint surface:
+
+| `onnx_batch_size` | seq_len=64 (code) | seq_len=256 (mixed) | seq_len=512 (long docs) |
+|-------------------|-------------------|---------------------|------------------------|
+| 8 | ~0.1 GB | ~1.5 GB | ~5.6 GB ✓ |
+| 16 | ~0.2 GB | ~3.0 GB | ~11 GB ✓ |
+| 32 | ~0.4 GB | ~6.0 GB | ~22 GB ✓* |
+| 64 | ~0.8 GB | ~12 GB | ~44 GB ⚠ |
+
+\* Safe at seq_len=512 (22 GB), but document_chunks texts tokenize to ~350–400 tokens,
+producing `[32, ~400]` batches — pushing the workspace to ~78 GB. The seq_len=512 table
+understates real risk for this corpus.
+
+**Production recommendation: `onnx_batch_size=8` is the correct macOS default.** It is
+safe for all text lengths. For workloads that are exclusively short texts (code symbols,
+short queries), `BGE_M3_ONNX_BATCH_SIZE=32` can be set manually to recover batch
+throughput — but should not be the default since document-length text will hit memory
+pressure. The batch performance regression relative to MLAS is an inherent cost of the
+`FastPrediction` workspace pre-allocation model; single-text latency (20–61% faster) is
+the primary production benefit of CoreML on this model.
