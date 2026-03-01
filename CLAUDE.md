@@ -7,6 +7,12 @@ Axum HTTP server wrapping fastembed-rs to serve BGE-M3 dense and sparse embeddin
 - **mcp-local-knowledge-base** — calls `/v1/sparse-embeddings` and `/v1/embeddings` to index and search documents
 - **dpos-coordinator** — calls `/v1/embeddings` for semantic memory retrieval
 
+## Features
+
+| Feature | Description |
+|---------|-------------|
+| `coreml-profile` | Emit per-op CoreML hardware dispatch decisions to stderr at model load. Diagnostic only — use when profiling which ops land on GPU vs CPU. |
+
 ## Build & Test Commands
 
 ```bash

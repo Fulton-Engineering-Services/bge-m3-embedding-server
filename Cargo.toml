@@ -23,6 +23,12 @@ anyhow = "1"
 tower-http = { version = "0.6", features = ["trace", "request-id"] }
 uuid = { version = "1", features = ["v4"] }
 
+[features]
+## Emit per-op CoreML hardware dispatch decisions to stderr at model load time.
+## Diagnostic only — enable when profiling which ops run on GPU vs CPU.
+## Usage: cargo bench --bench coreml --features coreml-profile
+coreml-profile = []
+
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"

@@ -190,17 +190,23 @@ fn run_worker(
 /// - **Model cache** — caches the compiled `CoreML` model to
 ///   `{cache_dir}/coreml`, eliminating 5–15 s recompilation per session
 ///   load (critical for the idle-unload-reload cycle).
+/// - **`coreml-profile` feature** — when compiled with
+///   `--features coreml-profile`, enables `ProfileComputePlan` which logs
+///   per-op hardware dispatch decisions (GPU vs CPU vs ANE) to stderr.
+///   Diagnostic only; excluded from default builds by `#[cfg]`.
 ///
 /// On all other platforms, returns an empty vec (CPU EP only).
 fn execution_providers(cache_dir: &Path) -> Vec<ort::ep::ExecutionProviderDispatch> {
     #[cfg(target_os = "macos")]
     {
         let coreml_cache = cache_dir.join("coreml");
-        vec![ort::ep::CoreML::default()
+        let builder = ort::ep::CoreML::default()
             .with_model_format(ort::ep::coreml::ModelFormat::MLProgram)
             .with_specialization_strategy(ort::ep::coreml::SpecializationStrategy::FastPrediction)
-            .with_model_cache_dir(coreml_cache.display().to_string())
-            .build()]
+            .with_model_cache_dir(coreml_cache.display().to_string());
+        #[cfg(feature = "coreml-profile")]
+        let builder = builder.with_profile_compute_plan(true);
+        vec![builder.build()]
     }
     #[cfg(not(target_os = "macos"))]
     {
