@@ -1,6 +1,6 @@
 # CLAUDE.md — bge-m3-axum-fastembed-rs
 
-Axum HTTP server wrapping fastembed-rs to serve BGE-M3 dense and sparse embeddings.
+Axum HTTP server serving BGE-M3 dense and sparse embeddings via direct ONNX Runtime integration.
 
 ## Consumers
 
@@ -75,11 +75,12 @@ The server starts accepting requests once model warm-up completes (watch logs fo
 
 The server uses a **worker pool** pattern to handle concurrent embedding requests:
 
-- Workers are spawned via `spawn_blocking`, each loading dense + sparse model instances.
+- Workers are spawned via `spawn_blocking`, each loading a **single ORT session** that produces both dense and sparse outputs from one ONNX model.
 - Work dispatched through bounded `mpsc` channel; workers share receiver via `Arc<Mutex<Receiver>>`.
 - Readiness: each worker signals via a separate `mpsc` readiness channel after model load. The init task collects all signals, then a warm-up probe runs both dense and sparse inference before setting the `AtomicBool` ready flag.
 - **Cold-start ordering**: worker 0 (the "leader") is spawned and awaited first to ensure the model cache is warm before followers start. This prevents `hf-hub` file-lock contention when `BGE_M3_WORKERS > 1` and the cache is empty.
-- **Idle unloading**: after `BGE_M3_IDLE_TIMEOUT_SECS` of no requests, workers drop their `Option<TextEmbedding>` and `Option<SparseTextEmbedding>`. On the next request, models are reloaded transparently (~10–30 s from cache). The `loaded_workers` counter drives the `"idle"` health state. Workers themselves never exit during idle — only their model instances are dropped.
+- **Idle unloading**: after `BGE_M3_IDLE_TIMEOUT_SECS` of no requests, workers drop their `Option<(Session, Tokenizer)>`. On the next request, models are reloaded transparently (~10–30 s from cache). The `loaded_workers` counter drives the `"idle"` health state. Workers themselves never exit during idle — only their model instances are dropped.
+- **Sparse projection**: sparse embeddings are computed by projecting token hidden states through a bundled `sparse_linear.safetensors` weight vector (4 KB), then applying ReLU and max-pooling. This replaces fastembed's separate sparse model with a single-session approach.
 - HTTP observability is provided by `tower-http::TraceLayer`.
 
 ## Docker
@@ -105,7 +106,6 @@ To release: bump version in `Cargo.toml`, commit, push to `main`. The workflow h
 
 ## Gotchas
 
-- `fastembed::SparseEmbedding` does not implement `Debug` — use `.err().expect()` instead of `.unwrap_err()` on `Result<Vec<SparseEmbedding>>`
 - Stale model cache causes silent worker load failures ("Worker exited before signaling readiness") — fix by clearing `BGE_M3_CACHE_DIR`
 - Config tests use `from_lookup()` closure pattern instead of `env::set_var` to avoid process-global state mutation under parallel test execution
 - Always run `cargo fmt --all` before pushing — CI fails `cargo fmt --all --check` even when all tests pass

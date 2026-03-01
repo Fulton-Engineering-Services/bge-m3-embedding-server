@@ -1,6 +1,6 @@
 // CoreML EP benchmark harness for comparing execution provider configurations.
 //
-// Measures dense and sparse embedding inference at the fastembed API level,
+// Measures dense and sparse embedding inference at the ORT level,
 // bypassing the HTTP server and worker pool to isolate ONNX Runtime performance.
 //
 // Configuration via environment variables:
@@ -23,12 +23,16 @@
 //
 // Requires ORT_LIB_LOCATION at build time for custom ORT with CoreML EP.
 
+#![allow(clippy::cast_possible_truncation)]
+
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
-use fastembed::{EmbeddingModel, SparseModel, SparseTextEmbedding, TextEmbedding};
+use ndarray::ArrayView1;
+use ort::value::TensorRef;
 
 // ---------------------------------------------------------------------------
 // Corpus loading
@@ -64,20 +68,17 @@ fn cache_dir() -> PathBuf {
     PathBuf::from(std::env::var("BGE_M3_CACHE_DIR").unwrap_or_else(|_| "/tmp/bge-m3-cache".into()))
 }
 
-/// Returns the ONNX sub-batch size to pass to `embed()`.
+/// Returns the ONNX sub-batch size.
 ///
-/// Mirrors the production default: `CoreML` EPs use `Some(8)` to avoid
-/// `MLProgram` `FastPrediction` workspace OOM kills; MLAS uses `None`
-/// (fastembed default, no pre-allocation issue).
-///
-/// Override with `BGE_M3_BENCH_ONNX_BATCH=<n>`.
-fn onnx_batch_size() -> Option<usize> {
+/// `CoreML` EPs use 8 to avoid `MLProgram` `FastPrediction` workspace OOM;
+/// MLAS uses 256 (large enough to avoid chunking in practice).
+fn onnx_batch_size() -> usize {
     if let Ok(val) = std::env::var("BGE_M3_BENCH_ONNX_BATCH") {
-        return val.parse::<usize>().ok();
+        return val.parse::<usize>().unwrap_or(8);
     }
     match ep_name().as_str() {
-        "mlas_only" => None,
-        _ => Some(8),
+        "mlas_only" => 256,
+        _ => 8,
     }
 }
 
@@ -85,9 +86,6 @@ fn build_execution_providers(cache: &Path) -> Vec<ort::ep::ExecutionProviderDisp
     let config = ep_name();
     let coreml_cache = cache.join("coreml");
 
-    // Base CoreML builder with shared options. On non-Apple platforms the EP
-    // silently fails to register and ORT falls back to the CPU EP — equivalent
-    // to mlas_only.
     let base = || {
         ort::ep::CoreML::default()
             .with_model_format(ort::ep::coreml::ModelFormat::MLProgram)
@@ -112,6 +110,234 @@ fn build_execution_providers(cache: &Path) -> Vec<ort::ep::ExecutionProviderDisp
 }
 
 // ---------------------------------------------------------------------------
+// Model loading (self-contained — benchmarks can't access pub(crate) items)
+// ---------------------------------------------------------------------------
+
+const REPO_ID: &str = "BAAI/bge-m3";
+const MAX_SEQ_LENGTH: usize = 512;
+const SPECIAL_TOKENS: [u32; 4] = [0, 1, 2, 3];
+
+struct BenchModels {
+    session: RefCell<ort::session::Session>,
+    tokenizer: tokenizers::Tokenizer,
+}
+
+fn load_bench_models(cache: &Path, eps: Vec<ort::ep::ExecutionProviderDispatch>) -> BenchModels {
+    let api = hf_hub::api::sync::ApiBuilder::new()
+        .with_cache_dir(cache.to_path_buf())
+        .with_progress(true)
+        .build()
+        .expect("Failed to build hf-hub API");
+
+    let repo = api.model(REPO_ID.to_string());
+
+    let onnx_path = repo
+        .get("onnx/model.onnx")
+        .expect("Failed to get model.onnx");
+    repo.get("onnx/model.onnx_data")
+        .expect("Failed to get model.onnx_data");
+    repo.get("onnx/Constant_7_attr__value")
+        .expect("Failed to get Constant_7");
+
+    let tokenizer_path = repo
+        .get("tokenizer.json")
+        .expect("Failed to get tokenizer.json");
+
+    let mut tokenizer =
+        tokenizers::Tokenizer::from_file(&tokenizer_path).expect("Failed to load tokenizer");
+    tokenizer
+        .with_truncation(Some(tokenizers::TruncationParams {
+            max_length: MAX_SEQ_LENGTH,
+            strategy: tokenizers::TruncationStrategy::LongestFirst,
+            ..Default::default()
+        }))
+        .expect("Failed to set truncation");
+    tokenizer.with_padding(Some(tokenizers::PaddingParams {
+        strategy: tokenizers::PaddingStrategy::BatchLongest,
+        pad_id: 1,
+        pad_token: "<pad>".to_string(),
+        ..Default::default()
+    }));
+
+    let mut builder = ort::session::Session::builder().expect("Failed to create session builder");
+    if !eps.is_empty() {
+        builder = builder
+            .with_execution_providers(eps)
+            .expect("Failed to set EPs");
+    }
+    let session = builder
+        .with_optimization_level(ort::session::builder::GraphOptimizationLevel::Level3)
+        .expect("Failed to set opt level")
+        .with_intra_threads(1)
+        .expect("Failed to set threads")
+        .commit_from_file(&onnx_path)
+        .expect("Failed to load ONNX model");
+
+    BenchModels {
+        session: RefCell::new(session),
+        tokenizer,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Sparse weights (bundled safetensors)
+// ---------------------------------------------------------------------------
+
+fn load_sparse_weights() -> (ndarray::Array1<f32>, f32) {
+    let data = include_bytes!("../src/weights/sparse_linear.safetensors");
+    let tensors = safetensors::SafeTensors::deserialize(data).expect("Invalid safetensors");
+    let weight_view = tensors.tensor("weight").expect("Missing weight tensor");
+    let bias_view = tensors.tensor("bias").expect("Missing bias tensor");
+    let weight: Vec<f32> = weight_view
+        .data()
+        .chunks_exact(4)
+        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        .collect();
+    let bias = f32::from_le_bytes([
+        bias_view.data()[0],
+        bias_view.data()[1],
+        bias_view.data()[2],
+        bias_view.data()[3],
+    ]);
+    (ndarray::Array1::from(weight), bias)
+}
+
+// ---------------------------------------------------------------------------
+// Embedding helpers
+// ---------------------------------------------------------------------------
+
+fn tokenize_batch(
+    tokenizer: &tokenizers::Tokenizer,
+    texts: &[impl AsRef<str>],
+) -> (
+    ndarray::Array2<i64>,
+    ndarray::Array2<i64>,
+    ndarray::Array2<i64>,
+) {
+    let str_refs: Vec<&str> = texts.iter().map(AsRef::as_ref).collect();
+    let encodings = tokenizer
+        .encode_batch(str_refs, true)
+        .expect("Tokenization failed");
+    let batch_len = encodings.len();
+    let seq_len = encodings[0].get_ids().len();
+    let mut ids_flat: Vec<i64> = Vec::with_capacity(batch_len * seq_len);
+    let mut mask_flat: Vec<i64> = Vec::with_capacity(batch_len * seq_len);
+    for enc in &encodings {
+        ids_flat.extend(enc.get_ids().iter().map(|&id| i64::from(id)));
+        mask_flat.extend(enc.get_attention_mask().iter().map(|&m| i64::from(m)));
+    }
+    let ids = ndarray::Array2::from_shape_vec((batch_len, seq_len), ids_flat).unwrap();
+    let mask = ndarray::Array2::from_shape_vec((batch_len, seq_len), mask_flat).unwrap();
+    let type_ids = ndarray::Array2::<i64>::zeros((batch_len, seq_len));
+    (ids, mask, type_ids)
+}
+
+fn bench_embed_dense(
+    session: &RefCell<ort::session::Session>,
+    tokenizer: &tokenizers::Tokenizer,
+    texts: &[impl AsRef<str>],
+    batch_size: usize,
+) -> Vec<Vec<f32>> {
+    let mut all = Vec::with_capacity(texts.len());
+    for chunk in texts.chunks(batch_size) {
+        let (ids, mask, type_ids) = tokenize_batch(tokenizer, chunk);
+        let ids_t = TensorRef::from_array_view(ids.view()).unwrap();
+        let mask_t = TensorRef::from_array_view(mask.view()).unwrap();
+        let type_t = TensorRef::from_array_view(type_ids.view()).unwrap();
+        let mut sess = session.borrow_mut();
+        let outputs = sess
+            .run(ort::inputs! {
+                "input_ids" => ids_t,
+                "attention_mask" => mask_t,
+                "token_type_ids" => type_t,
+            })
+            .expect("session.run failed");
+        let emb = outputs["sentence_embedding"]
+            .try_extract_array::<f32>()
+            .expect("Failed to extract sentence_embedding");
+        for i in 0..chunk.len() {
+            let row = emb.index_axis(ndarray::Axis(0), i);
+            let slice = row.as_slice().expect("contiguous");
+            let norm: f32 = slice.iter().map(|x| x * x).sum::<f32>().sqrt();
+            let normalized: Vec<f32> = if norm > 0.0 {
+                slice.iter().map(|x| x / norm).collect()
+            } else {
+                slice.to_vec()
+            };
+            all.push(normalized);
+        }
+    }
+    all
+}
+
+fn bench_embed_sparse(
+    session: &RefCell<ort::session::Session>,
+    tokenizer: &tokenizers::Tokenizer,
+    texts: &[impl AsRef<str>],
+    batch_size: usize,
+    weight: &ndarray::Array1<f32>,
+    bias: f32,
+) {
+    let weight_view = weight.view();
+    for chunk in texts.chunks(batch_size) {
+        let str_refs: Vec<&str> = chunk.iter().map(AsRef::as_ref).collect();
+        let encodings = tokenizer
+            .encode_batch(str_refs, true)
+            .expect("Tokenization failed");
+        let batch_len = encodings.len();
+        let seq_len = encodings[0].get_ids().len();
+        let mut ids_flat: Vec<i64> = Vec::with_capacity(batch_len * seq_len);
+        let mut mask_flat: Vec<i64> = Vec::with_capacity(batch_len * seq_len);
+        for enc in &encodings {
+            ids_flat.extend(enc.get_ids().iter().map(|&id| i64::from(id)));
+            mask_flat.extend(enc.get_attention_mask().iter().map(|&m| i64::from(m)));
+        }
+        let ids = ndarray::Array2::from_shape_vec((batch_len, seq_len), ids_flat).unwrap();
+        let mask = ndarray::Array2::from_shape_vec((batch_len, seq_len), mask_flat).unwrap();
+        let type_ids = ndarray::Array2::<i64>::zeros((batch_len, seq_len));
+        let ids_t = TensorRef::from_array_view(ids.view()).unwrap();
+        let mask_t = TensorRef::from_array_view(mask.view()).unwrap();
+        let type_t = TensorRef::from_array_view(type_ids.view()).unwrap();
+        let mut sess = session.borrow_mut();
+        let outputs = sess
+            .run(ort::inputs! {
+                "input_ids" => ids_t,
+                "attention_mask" => mask_t,
+                "token_type_ids" => type_t,
+            })
+            .expect("session.run failed");
+        let token_emb = outputs["token_embeddings"]
+            .try_extract_array::<f32>()
+            .expect("Failed to extract token_embeddings");
+        for (i, enc) in encodings.iter().enumerate() {
+            let ids = enc.get_ids();
+            let attn = enc.get_attention_mask();
+            let batch_hidden = token_emb.index_axis(ndarray::Axis(0), i);
+            let mut token_weights: HashMap<usize, f32> = HashMap::new();
+            for j in 0..ids.len() {
+                if attn[j] == 0 {
+                    continue;
+                }
+                let token_id = ids[j];
+                if SPECIAL_TOKENS.contains(&token_id) {
+                    continue;
+                }
+                let hidden = batch_hidden.index_axis(ndarray::Axis(0), j);
+                let hidden_slice = hidden.as_slice().expect("contiguous");
+                let hidden_view = ArrayView1::from(hidden_slice);
+                let score = (hidden_view.dot(&weight_view) + bias).max(0.0);
+                if score > 0.0 {
+                    token_weights
+                        .entry(token_id as usize)
+                        .and_modify(|w| *w = w.max(score))
+                        .or_insert(score);
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Dense embedding benchmarks
 // ---------------------------------------------------------------------------
 
@@ -120,30 +346,24 @@ fn bench_dense(c: &mut Criterion) {
     let cache = cache_dir();
     let eps = build_execution_providers(&cache);
     let label = ep_name();
-
-    eprintln!("[bench] Loading dense model with EP={label} ...");
     let onnx_bs = onnx_batch_size();
-    let mut model = TextEmbedding::try_new(
-        fastembed::TextInitOptions::new(EmbeddingModel::BGEM3)
-            .with_cache_dir(cache.clone())
-            .with_show_download_progress(false)
-            .with_execution_providers(eps),
-    )
-    .expect("Failed to load dense model");
+
+    eprintln!("[bench] Loading model with EP={label} ...");
+    let models = load_bench_models(&cache, eps);
 
     // Warmup — triggers CoreML model compilation on first run.
-    eprintln!("[bench] Dense warmup inference (onnx_batch_size={onnx_bs:?}) ...");
-    model
-        .embed(vec!["warmup text for CoreML compilation"], onnx_bs)
-        .expect("Dense warmup failed");
+    eprintln!("[bench] Dense warmup inference (onnx_batch_size={onnx_bs}) ...");
+    bench_embed_dense(
+        &models.session,
+        &models.tokenizer,
+        &["warmup text for CoreML compilation"],
+        onnx_bs,
+    );
     eprintln!("[bench] Dense model ready.");
 
-    // Sort scenario names for deterministic ordering across runs.
     let mut names: Vec<&String> = corpus.scenarios.keys().collect();
     names.sort();
 
-    // Use a fixed group name so Criterion can compare across EP configs
-    // via --save-baseline / --baseline. The EP label is logged to stderr.
     let mut group = c.benchmark_group("dense");
     group.warm_up_time(Duration::from_secs(2));
     group.measurement_time(Duration::from_secs(5));
@@ -152,18 +372,20 @@ fn bench_dense(c: &mut Criterion) {
     for name in &names {
         let scenario = &corpus.scenarios[*name];
 
-        // Single-text latency (first text from scenario).
         let single = &scenario.texts[0..1];
         group.bench_with_input(BenchmarkId::new("single", *name), &single, |b, texts| {
-            b.iter(|| model.embed(*texts, onnx_bs).expect("embed failed"));
+            b.iter(|| {
+                bench_embed_dense(&models.session, &models.tokenizer, texts, onnx_bs);
+            });
         });
 
-        // Full-batch throughput (all texts from scenario).
         group.bench_with_input(
             BenchmarkId::new("batch", *name),
             &scenario.texts,
             |b, texts| {
-                b.iter(|| model.embed(texts, onnx_bs).expect("embed failed"));
+                b.iter(|| {
+                    bench_embed_dense(&models.session, &models.tokenizer, texts, onnx_bs);
+                });
             },
         );
     }
@@ -180,21 +402,21 @@ fn bench_sparse(c: &mut Criterion) {
     let cache = cache_dir();
     let eps = build_execution_providers(&cache);
     let label = ep_name();
-
-    eprintln!("[bench] Loading sparse model with EP={label} ...");
     let onnx_bs = onnx_batch_size();
-    let mut model = SparseTextEmbedding::try_new(
-        fastembed::SparseInitOptions::new(SparseModel::BGEM3)
-            .with_cache_dir(cache.clone())
-            .with_show_download_progress(false)
-            .with_execution_providers(eps),
-    )
-    .expect("Failed to load sparse model");
 
-    eprintln!("[bench] Sparse warmup inference (onnx_batch_size={onnx_bs:?}) ...");
-    model
-        .embed(vec!["warmup text for CoreML compilation"], onnx_bs)
-        .expect("Sparse warmup failed");
+    eprintln!("[bench] Loading model with EP={label} (for sparse) ...");
+    let models = load_bench_models(&cache, eps);
+    let (weight, bias) = load_sparse_weights();
+
+    eprintln!("[bench] Sparse warmup inference (onnx_batch_size={onnx_bs}) ...");
+    bench_embed_sparse(
+        &models.session,
+        &models.tokenizer,
+        &["warmup text for CoreML compilation"],
+        onnx_bs,
+        &weight,
+        bias,
+    );
     eprintln!("[bench] Sparse model ready.");
 
     let mut names: Vec<&String> = corpus.scenarios.keys().collect();
@@ -210,14 +432,32 @@ fn bench_sparse(c: &mut Criterion) {
 
         let single = &scenario.texts[0..1];
         group.bench_with_input(BenchmarkId::new("single", *name), &single, |b, texts| {
-            b.iter(|| model.embed(*texts, onnx_bs).expect("embed failed"));
+            b.iter(|| {
+                bench_embed_sparse(
+                    &models.session,
+                    &models.tokenizer,
+                    texts,
+                    onnx_bs,
+                    &weight,
+                    bias,
+                );
+            });
         });
 
         group.bench_with_input(
             BenchmarkId::new("batch", *name),
             &scenario.texts,
             |b, texts| {
-                b.iter(|| model.embed(texts, onnx_bs).expect("embed failed"));
+                b.iter(|| {
+                    bench_embed_sparse(
+                        &models.session,
+                        &models.tokenizer,
+                        texts,
+                        onnx_bs,
+                        &weight,
+                        bias,
+                    );
+                });
             },
         );
     }

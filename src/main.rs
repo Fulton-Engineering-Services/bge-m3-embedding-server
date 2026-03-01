@@ -4,6 +4,7 @@ mod error;
 mod handler;
 mod models;
 mod state;
+mod weights;
 
 use axum::extract::DefaultBodyLimit;
 use axum::http::HeaderValue;

@@ -1,10 +1,8 @@
 use anyhow::Result;
-use fastembed::{
-    EmbeddingModel, SparseEmbedding, SparseInitOptions, SparseModel, SparseTextEmbedding,
-    TextEmbedding, TextInitOptions,
-};
-use std::path::Path;
-use std::path::PathBuf;
+use ndarray::ArrayView1;
+use ort::value::TensorRef;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -13,166 +11,279 @@ use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio::task::JoinHandle;
 use tracing::{info, info_span, Instrument};
 
+// ---------------------------------------------------------------------------
+// Public types
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone)]
+pub struct SparseEmbedding {
+    pub indices: Vec<usize>,
+    pub values: Vec<f32>,
+}
+
 pub enum EmbedRequest {
     Dense {
         texts: Vec<String>,
         reply: oneshot::Sender<Result<Vec<Vec<f32>>>>,
     },
-    // TODO(ARC-2): EmbedPool currently exposes fastembed::SparseEmbedding
-    // directly, coupling callers to fastembed internals. A future
-    // SparseResult newtype would decouple this.
     Sparse {
         texts: Vec<String>,
         reply: oneshot::Sender<Result<Vec<SparseEmbedding>>>,
     },
 }
 
-/// RAII guard that decrements the live-worker counter when dropped.
-/// Guarantees decrement fires on clean exit AND on panic unwind.
-struct WorkerGuard(Arc<AtomicUsize>);
+// ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
 
-impl Drop for WorkerGuard {
-    fn drop(&mut self) {
-        let remaining = self.0.fetch_sub(1, Ordering::AcqRel).saturating_sub(1);
-        if remaining == 0 {
-            tracing::error!("All embedding workers have exited — pool is degraded");
-        } else {
-            tracing::warn!(remaining, "Embedding worker exited");
-        }
-    }
+const REPO_ID: &str = "BAAI/bge-m3";
+const MAX_SEQ_LENGTH: usize = 512;
+
+/// CLS, PAD, SEP/EOS, UNK — excluded from sparse output.
+const SPECIAL_TOKENS: [u32; 4] = [0, 1, 2, 3];
+
+// ---------------------------------------------------------------------------
+// Model download and loading
+// ---------------------------------------------------------------------------
+
+struct ModelFiles {
+    onnx_path: PathBuf,
+    tokenizer_path: PathBuf,
 }
 
-/// Body of a single embedding worker thread.
+/// Downloads BGE-M3 model files from Hugging Face Hub (or returns cached paths).
+fn download_model_files(cache_dir: &Path, show_progress: bool) -> Result<ModelFiles> {
+    let api = hf_hub::api::sync::ApiBuilder::new()
+        .with_cache_dir(cache_dir.to_path_buf())
+        .with_progress(show_progress)
+        .build()
+        .map_err(|e| anyhow::anyhow!("Failed to build hf-hub API: {e}"))?;
+
+    let repo = api.model(REPO_ID.to_string());
+
+    let onnx_path = repo
+        .get("onnx/model.onnx")
+        .map_err(|e| anyhow::anyhow!("Failed to get onnx/model.onnx: {e}"))?;
+
+    // External initializer files must be co-located with model.onnx.
+    repo.get("onnx/model.onnx_data")
+        .map_err(|e| anyhow::anyhow!("Failed to get onnx/model.onnx_data: {e}"))?;
+    repo.get("onnx/Constant_7_attr__value")
+        .map_err(|e| anyhow::anyhow!("Failed to get onnx/Constant_7_attr__value: {e}"))?;
+
+    let tokenizer_path = repo
+        .get("tokenizer.json")
+        .map_err(|e| anyhow::anyhow!("Failed to get tokenizer.json: {e}"))?;
+
+    Ok(ModelFiles {
+        onnx_path,
+        tokenizer_path,
+    })
+}
+
+/// Loads and configures the tokenizer to match fastembed's BGE-M3 configuration.
 ///
-/// Called from a `spawn_blocking` task. Loads models, signals readiness, then
-/// processes requests from the shared channel until it closes.
-#[allow(clippy::needless_pass_by_value, clippy::too_many_arguments)]
-fn run_worker(
-    id: usize,
-    cache_dir: PathBuf,
-    rx: Arc<Mutex<mpsc::Receiver<EmbedRequest>>>,
-    ready_tx: mpsc::Sender<Result<()>>,
-    live_workers: Arc<AtomicUsize>,
-    loaded_workers: Arc<AtomicUsize>,
-    idle_timeout: Option<Duration>,
-    onnx_batch_size: usize,
-) -> Result<()> {
-    let _guard = WorkerGuard(Arc::clone(&live_workers));
-    let span = info_span!("worker", id = id);
-    let _span_guard = span.enter();
+/// Truncation: `LongestFirst` at `MAX_SEQ_LENGTH` (512).
+/// Padding: `BatchLongest` with `pad_id=1`, `pad_token=<pad>`.
+fn load_tokenizer(tokenizer_path: &Path) -> Result<tokenizers::Tokenizer> {
+    let mut tokenizer = tokenizers::Tokenizer::from_file(tokenizer_path)
+        .map_err(|e| anyhow::anyhow!("Failed to load tokenizer: {e}"))?;
 
-    info!("Loading models (worker {id})...");
-    let load_start = std::time::Instant::now();
-    let rt = Handle::current();
-    let (initial_dense, initial_sparse) = match load_models(&cache_dir, id == 0) {
-        Ok(models) => {
-            tracing::info!(
-                elapsed_ms = load_start.elapsed().as_millis(),
-                "Models loaded (worker {id})"
-            );
-            models
+    tokenizer
+        .with_truncation(Some(tokenizers::TruncationParams {
+            max_length: MAX_SEQ_LENGTH,
+            strategy: tokenizers::TruncationStrategy::LongestFirst,
+            ..Default::default()
+        }))
+        .map_err(|e| anyhow::anyhow!("Failed to set truncation: {e}"))?;
+
+    tokenizer.with_padding(Some(tokenizers::PaddingParams {
+        strategy: tokenizers::PaddingStrategy::BatchLongest,
+        pad_id: 1,
+        pad_token: "<pad>".to_string(),
+        ..Default::default()
+    }));
+
+    Ok(tokenizer)
+}
+
+/// Builds an ORT session from the ONNX model file with the given execution providers.
+fn load_session(
+    model_path: &Path,
+    eps: Vec<ort::ep::ExecutionProviderDispatch>,
+) -> Result<ort::session::Session> {
+    let mut builder = ort::session::Session::builder()?;
+    if !eps.is_empty() {
+        builder = builder.with_execution_providers(eps)?;
+    }
+    let session = builder
+        .with_optimization_level(ort::session::builder::GraphOptimizationLevel::Level3)?
+        .with_intra_threads(1)?
+        .commit_from_file(model_path)?;
+    Ok(session)
+}
+
+// ---------------------------------------------------------------------------
+// Embedding functions
+// ---------------------------------------------------------------------------
+
+/// Produces L2-normalized dense embeddings from the `sentence_embedding` output.
+///
+/// The BAAI/bge-m3 model outputs `sentence_embedding` with shape `[batch, 1024]`,
+/// already CLS-pooled. We only need to L2-normalize each vector.
+#[allow(clippy::cast_possible_truncation)]
+fn embed_dense(
+    session: &mut ort::session::Session,
+    tokenizer: &tokenizers::Tokenizer,
+    texts: &[String],
+    batch_size: usize,
+) -> Result<Vec<Vec<f32>>> {
+    let mut all_embeddings = Vec::with_capacity(texts.len());
+
+    for chunk in texts.chunks(batch_size) {
+        let str_refs: Vec<&str> = chunk.iter().map(String::as_str).collect();
+        let encodings = tokenizer
+            .encode_batch(str_refs, true)
+            .map_err(|e| anyhow::anyhow!("Tokenization failed: {e}"))?;
+
+        let batch_len = encodings.len();
+        let seq_len = encodings[0].get_ids().len();
+
+        let mut ids_flat: Vec<i64> = Vec::with_capacity(batch_len * seq_len);
+        let mut mask_flat: Vec<i64> = Vec::with_capacity(batch_len * seq_len);
+        for enc in &encodings {
+            ids_flat.extend(enc.get_ids().iter().map(|&id| i64::from(id)));
+            mask_flat.extend(enc.get_attention_mask().iter().map(|&m| i64::from(m)));
         }
-        Err(e) => {
-            let _ =
-                rt.block_on(ready_tx.send(Err(anyhow::anyhow!("Worker {id} failed to load: {e}"))));
-            return Err(e);
-        }
-    };
 
-    info!("Worker {id} models loaded — signaling ready");
-    let _ = rt.block_on(ready_tx.send(Ok(())));
+        let ids_array = ndarray::Array2::from_shape_vec((batch_len, seq_len), ids_flat)?;
+        let mask_array = ndarray::Array2::from_shape_vec((batch_len, seq_len), mask_flat)?;
+        let type_ids_array = ndarray::Array2::<i64>::zeros((batch_len, seq_len));
 
-    let mut dense_model: Option<TextEmbedding> = Some(initial_dense);
-    let mut sparse_model: Option<SparseTextEmbedding> = Some(initial_sparse);
+        let ids_tensor = TensorRef::from_array_view(ids_array.view())?;
+        let mask_tensor = TensorRef::from_array_view(mask_array.view())?;
+        let type_ids_tensor = TensorRef::from_array_view(type_ids_array.view())?;
 
-    // CONCURRENCY NOTE (COR-2): The shared-receiver pattern with Mutex
-    // serializes which worker is *waiting* for the next message — only one
-    // worker holds the lock on recv() at a time. The Mutex is released as
-    // soon as recv() returns a message, allowing the next idle worker to
-    // acquire it. Under normal load (ONNX inference takes 10-100ms per
-    // request), at most one request is queued behind the lock.
-    info!("Worker {id} entering request loop");
-    loop {
-        // Apply idle timeout only when models are loaded.
-        // Once unloaded, wait indefinitely — no timer wakeups needed.
-        let msg = if let Some(timeout) = idle_timeout.filter(|_| dense_model.is_some()) {
-            rt.block_on(async {
-                tokio::time::timeout(timeout, async { rx.lock().await.recv().await }).await
-            })
-        } else {
-            rt.block_on(async { Ok(rx.lock().await.recv().await) })
-        };
+        let outputs = session.run(ort::inputs! {
+            "input_ids" => ids_tensor,
+            "attention_mask" => mask_tensor,
+            "token_type_ids" => type_ids_tensor,
+        })?;
 
-        match msg {
-            Err(_elapsed) => {
-                // Idle timeout fired while models were loaded — unload them.
-                dense_model = None;
-                sparse_model = None;
-                loaded_workers.fetch_sub(1, Ordering::AcqRel);
-                tracing::info!("Worker {id} unloaded models after idle timeout");
-            }
-            Ok(None) => {
-                info!("Worker {id} channel closed, shutting down");
-                break;
-            }
-            Ok(Some(request)) => {
-                // Reload models if they were unloaded due to idle timeout.
-                // This blocks the current request until reload completes (~10-30 s).
-                if dense_model.is_none() {
-                    tracing::info!("Worker {id} reloading models after idle...");
-                    let reload_start = std::time::Instant::now();
-                    match load_models(&cache_dir, false) {
-                        Ok((d, s)) => {
-                            dense_model = Some(d);
-                            sparse_model = Some(s);
-                            loaded_workers.fetch_add(1, Ordering::AcqRel);
-                            tracing::info!(
-                                elapsed_ms = reload_start.elapsed().as_millis(),
-                                "Worker {id} reloaded models"
-                            );
-                        }
-                        Err(e) => {
-                            tracing::error!(error = %e, "Worker {id} failed to reload models");
-                            // Send the error back to this caller and retry on the next request.
-                            let err = anyhow::anyhow!("Model reload failed: {e}");
-                            match request {
-                                EmbedRequest::Dense { reply, .. } => {
-                                    let _ = reply.send(Err(err));
-                                }
-                                EmbedRequest::Sparse { reply, .. } => {
-                                    let _ = reply.send(Err(err));
-                                }
-                            }
-                            continue;
-                        }
-                    }
-                }
+        let emb = outputs["sentence_embedding"].try_extract_array::<f32>()?;
 
-                // Models are guaranteed loaded at this point.
-                match request {
-                    EmbedRequest::Dense { texts, reply } => {
-                        let result = dense_model
-                            .as_mut()
-                            .expect("dense model loaded after reload check")
-                            .embed(texts, Some(onnx_batch_size))
-                            .map_err(|e| anyhow::anyhow!("Dense embed error: {e}"));
-                        let _ = reply.send(result);
-                    }
-                    EmbedRequest::Sparse { texts, reply } => {
-                        let result = sparse_model
-                            .as_mut()
-                            .expect("sparse model loaded after reload check")
-                            .embed(texts, Some(onnx_batch_size))
-                            .map_err(|e| anyhow::anyhow!("Sparse embed error: {e}"));
-                        let _ = reply.send(result);
-                    }
-                }
-            }
+        for i in 0..batch_len {
+            let row = emb.index_axis(ndarray::Axis(0), i);
+            let slice = row.as_slice().expect("embedding should be contiguous");
+
+            let norm: f32 = slice.iter().map(|x| x * x).sum::<f32>().sqrt();
+            let normalized: Vec<f32> = if norm > 0.0 {
+                slice.iter().map(|x| x / norm).collect()
+            } else {
+                slice.to_vec()
+            };
+            all_embeddings.push(normalized);
         }
     }
 
-    Ok(())
+    Ok(all_embeddings)
 }
+
+/// Produces sparse embeddings via the BGE-M3 sparse-linear projection.
+///
+/// Reads `token_embeddings` output `[batch, seq, 1024]`, projects each token's
+/// hidden state through the `sparse_linear` weight vector, applies `ReLU`, and
+/// performs max-pooling across token positions sharing the same vocabulary ID.
+#[allow(clippy::cast_possible_truncation)]
+fn embed_sparse(
+    session: &mut ort::session::Session,
+    tokenizer: &tokenizers::Tokenizer,
+    texts: &[String],
+    batch_size: usize,
+) -> Result<Vec<SparseEmbedding>> {
+    let (weight, bias) = crate::weights::sparse_linear();
+    let weight_view = weight.view();
+
+    let mut all_sparse = Vec::with_capacity(texts.len());
+
+    for chunk in texts.chunks(batch_size) {
+        let str_refs: Vec<&str> = chunk.iter().map(String::as_str).collect();
+        let encodings = tokenizer
+            .encode_batch(str_refs, true)
+            .map_err(|e| anyhow::anyhow!("Tokenization failed: {e}"))?;
+
+        let batch_len = encodings.len();
+        let seq_len = encodings[0].get_ids().len();
+
+        let mut ids_flat: Vec<i64> = Vec::with_capacity(batch_len * seq_len);
+        let mut mask_flat: Vec<i64> = Vec::with_capacity(batch_len * seq_len);
+        for enc in &encodings {
+            ids_flat.extend(enc.get_ids().iter().map(|&id| i64::from(id)));
+            mask_flat.extend(enc.get_attention_mask().iter().map(|&m| i64::from(m)));
+        }
+
+        let ids_array = ndarray::Array2::from_shape_vec((batch_len, seq_len), ids_flat)?;
+        let mask_array = ndarray::Array2::from_shape_vec((batch_len, seq_len), mask_flat)?;
+        let type_ids_array = ndarray::Array2::<i64>::zeros((batch_len, seq_len));
+
+        let ids_tensor = TensorRef::from_array_view(ids_array.view())?;
+        let mask_tensor = TensorRef::from_array_view(mask_array.view())?;
+        let type_ids_tensor = TensorRef::from_array_view(type_ids_array.view())?;
+
+        let outputs = session.run(ort::inputs! {
+            "input_ids" => ids_tensor,
+            "attention_mask" => mask_tensor,
+            "token_type_ids" => type_ids_tensor,
+        })?;
+
+        let token_emb = outputs["token_embeddings"].try_extract_array::<f32>()?;
+
+        for (i, enc) in encodings.iter().enumerate() {
+            let ids = enc.get_ids();
+            let mask = enc.get_attention_mask();
+
+            let batch_hidden = token_emb.index_axis(ndarray::Axis(0), i);
+            let mut token_weights: HashMap<usize, f32> = HashMap::new();
+
+            for j in 0..ids.len() {
+                if mask[j] == 0 {
+                    continue;
+                }
+                let token_id = ids[j];
+                if SPECIAL_TOKENS.contains(&token_id) {
+                    continue;
+                }
+
+                let hidden = batch_hidden.index_axis(ndarray::Axis(0), j);
+                let hidden_slice = hidden
+                    .as_slice()
+                    .expect("hidden state should be contiguous");
+                let hidden_view = ArrayView1::from(hidden_slice);
+
+                let score = (hidden_view.dot(&weight_view) + bias).max(0.0);
+
+                if score > 0.0 {
+                    token_weights
+                        .entry(token_id as usize)
+                        .and_modify(|w| *w = w.max(score))
+                        .or_insert(score);
+                }
+            }
+
+            let mut indices: Vec<usize> = token_weights.keys().copied().collect();
+            indices.sort_unstable();
+            let values: Vec<f32> = indices.iter().map(|k| token_weights[k]).collect();
+
+            all_sparse.push(SparseEmbedding { indices, values });
+        }
+    }
+
+    Ok(all_sparse)
+}
+
+// ---------------------------------------------------------------------------
+// Execution provider configuration
+// ---------------------------------------------------------------------------
 
 /// Returns the execution providers to use for ONNX Runtime sessions.
 ///
@@ -215,34 +326,170 @@ fn execution_providers(cache_dir: &Path) -> Vec<ort::ep::ExecutionProviderDispat
     }
 }
 
-/// Loads both the dense and sparse BGE-M3 model instances from `cache_dir`.
+// ---------------------------------------------------------------------------
+// Worker infrastructure
+// ---------------------------------------------------------------------------
+
+/// Loads both the ORT session and tokenizer from `cache_dir`.
 ///
 /// Called at worker startup and again after an idle unload whenever a new
-/// request arrives. Both models are always loaded and unloaded as a pair.
+/// request arrives. Both session and tokenizer are always loaded and unloaded
+/// as a pair.
 fn load_models(
     cache_dir: &Path,
     show_download_progress: bool,
-) -> Result<(TextEmbedding, SparseTextEmbedding)> {
+) -> Result<(ort::session::Session, tokenizers::Tokenizer)> {
+    let files = download_model_files(cache_dir, show_download_progress)?;
+    let tokenizer = load_tokenizer(&files.tokenizer_path)?;
     let eps = execution_providers(cache_dir);
-
-    let dense = TextEmbedding::try_new(
-        TextInitOptions::new(EmbeddingModel::BGEM3)
-            .with_cache_dir(cache_dir.to_path_buf())
-            .with_show_download_progress(show_download_progress)
-            .with_execution_providers(eps.clone()),
-    )
-    .map_err(|e| anyhow::anyhow!("Failed to load dense model: {e}"))?;
-
-    let sparse = SparseTextEmbedding::try_new(
-        SparseInitOptions::new(SparseModel::BGEM3)
-            .with_cache_dir(cache_dir.to_path_buf())
-            .with_show_download_progress(false)
-            .with_execution_providers(eps),
-    )
-    .map_err(|e| anyhow::anyhow!("Failed to load sparse model: {e}"))?;
-
-    Ok((dense, sparse))
+    let session = load_session(&files.onnx_path, eps)?;
+    Ok((session, tokenizer))
 }
+
+/// RAII guard that decrements the live-worker counter when dropped.
+/// Guarantees decrement fires on clean exit AND on panic unwind.
+struct WorkerGuard(Arc<AtomicUsize>);
+
+impl Drop for WorkerGuard {
+    fn drop(&mut self) {
+        let remaining = self.0.fetch_sub(1, Ordering::AcqRel).saturating_sub(1);
+        if remaining == 0 {
+            tracing::error!("All embedding workers have exited — pool is degraded");
+        } else {
+            tracing::warn!(remaining, "Embedding worker exited");
+        }
+    }
+}
+
+/// Body of a single embedding worker thread.
+///
+/// Called from a `spawn_blocking` task. Loads models, signals readiness, then
+/// processes requests from the shared channel until it closes.
+#[allow(clippy::needless_pass_by_value, clippy::too_many_arguments)]
+fn run_worker(
+    id: usize,
+    cache_dir: PathBuf,
+    rx: Arc<Mutex<mpsc::Receiver<EmbedRequest>>>,
+    ready_tx: mpsc::Sender<Result<()>>,
+    live_workers: Arc<AtomicUsize>,
+    loaded_workers: Arc<AtomicUsize>,
+    idle_timeout: Option<Duration>,
+    onnx_batch_size: usize,
+) -> Result<()> {
+    let _guard = WorkerGuard(Arc::clone(&live_workers));
+    let span = info_span!("worker", id = id);
+    let _span_guard = span.enter();
+
+    info!("Loading models (worker {id})...");
+    let load_start = std::time::Instant::now();
+    let rt = Handle::current();
+    let initial_models = match load_models(&cache_dir, id == 0) {
+        Ok(models) => {
+            tracing::info!(
+                elapsed_ms = load_start.elapsed().as_millis(),
+                "Models loaded (worker {id})"
+            );
+            models
+        }
+        Err(e) => {
+            let _ =
+                rt.block_on(ready_tx.send(Err(anyhow::anyhow!("Worker {id} failed to load: {e}"))));
+            return Err(e);
+        }
+    };
+
+    info!("Worker {id} models loaded — signaling ready");
+    let _ = rt.block_on(ready_tx.send(Ok(())));
+
+    let mut models: Option<(ort::session::Session, tokenizers::Tokenizer)> = Some(initial_models);
+
+    // CONCURRENCY NOTE (COR-2): The shared-receiver pattern with Mutex
+    // serializes which worker is *waiting* for the next message — only one
+    // worker holds the lock on recv() at a time. The Mutex is released as
+    // soon as recv() returns a message, allowing the next idle worker to
+    // acquire it. Under normal load (ONNX inference takes 10-100ms per
+    // request), at most one request is queued behind the lock.
+    info!("Worker {id} entering request loop");
+    loop {
+        // Apply idle timeout only when models are loaded.
+        // Once unloaded, wait indefinitely — no timer wakeups needed.
+        let msg = if let Some(timeout) = idle_timeout.filter(|_| models.is_some()) {
+            rt.block_on(async {
+                tokio::time::timeout(timeout, async { rx.lock().await.recv().await }).await
+            })
+        } else {
+            rt.block_on(async { Ok(rx.lock().await.recv().await) })
+        };
+
+        match msg {
+            Err(_elapsed) => {
+                // Idle timeout fired while models were loaded — unload them.
+                models = None;
+                loaded_workers.fetch_sub(1, Ordering::AcqRel);
+                tracing::info!("Worker {id} unloaded models after idle timeout");
+            }
+            Ok(None) => {
+                info!("Worker {id} channel closed, shutting down");
+                break;
+            }
+            Ok(Some(request)) => {
+                // Reload models if they were unloaded due to idle timeout.
+                // This blocks the current request until reload completes (~10-30 s).
+                if models.is_none() {
+                    tracing::info!("Worker {id} reloading models after idle...");
+                    let reload_start = std::time::Instant::now();
+                    match load_models(&cache_dir, false) {
+                        Ok(m) => {
+                            models = Some(m);
+                            loaded_workers.fetch_add(1, Ordering::AcqRel);
+                            tracing::info!(
+                                elapsed_ms = reload_start.elapsed().as_millis(),
+                                "Worker {id} reloaded models"
+                            );
+                        }
+                        Err(e) => {
+                            tracing::error!(error = %e, "Worker {id} failed to reload models");
+                            // Send the error back to this caller and retry on the next request.
+                            let err = anyhow::anyhow!("Model reload failed: {e}");
+                            match request {
+                                EmbedRequest::Dense { reply, .. } => {
+                                    let _ = reply.send(Err(err));
+                                }
+                                EmbedRequest::Sparse { reply, .. } => {
+                                    let _ = reply.send(Err(err));
+                                }
+                            }
+                            continue;
+                        }
+                    }
+                }
+
+                // Models are guaranteed loaded at this point.
+                let (session, tokenizer) =
+                    models.as_mut().expect("models loaded after reload check");
+
+                match request {
+                    EmbedRequest::Dense { texts, reply } => {
+                        let result = embed_dense(session, tokenizer, &texts, onnx_batch_size)
+                            .map_err(|e| anyhow::anyhow!("Dense embed error: {e}"));
+                        let _ = reply.send(result);
+                    }
+                    EmbedRequest::Sparse { texts, reply } => {
+                        let result = embed_sparse(session, tokenizer, &texts, onnx_batch_size)
+                            .map_err(|e| anyhow::anyhow!("Sparse embed error: {e}"));
+                        let _ = reply.send(result);
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// EmbedPool
+// ---------------------------------------------------------------------------
 
 #[derive(Clone)]
 pub struct EmbedPool {
@@ -438,6 +685,10 @@ impl EmbedPool {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Test helpers
+// ---------------------------------------------------------------------------
+
 #[cfg(test)]
 impl EmbedPool {
     /// Creates an [`EmbedPool`] with an already-closed channel for testing error paths.
@@ -456,17 +707,13 @@ impl EmbedPool {
     /// The pool has `live_workers = 1` and `loaded_workers = 1` so `check_ready` passes.
     /// Responds to every dense request with `dense_fixture` and every sparse request
     /// with `sparse_fixture`, regardless of input text.
-    ///
-    /// Note: `fastembed::SparseEmbedding` does not implement `Clone`, so the sparse
-    /// fixture is consumed on the first sparse call (via `drain`). Tests that call
-    /// sparse should use the fixture for a single request.
     pub(crate) fn with_fixed_responses(
         dense_fixture: Vec<Vec<f32>>,
-        sparse_fixture: Vec<fastembed::SparseEmbedding>,
+        sparse_fixture: Vec<SparseEmbedding>,
     ) -> Self {
         let (tx, mut rx) = mpsc::channel::<EmbedRequest>(8);
         let dense = Arc::new(dense_fixture);
-        let sparse = Arc::new(std::sync::Mutex::new(sparse_fixture));
+        let sparse = Arc::new(sparse_fixture);
         tokio::spawn(async move {
             while let Some(req) = rx.recv().await {
                 match req {
@@ -474,11 +721,7 @@ impl EmbedPool {
                         let _ = reply.send(Ok((*dense).clone()));
                     }
                     EmbedRequest::Sparse { reply, .. } => {
-                        // SparseEmbedding doesn't implement Clone — drain the fixture
-                        // vec on each call. Tests that call sparse should use the
-                        // fixture for a single request.
-                        let result = sparse.lock().unwrap().drain(..).collect();
-                        let _ = reply.send(Ok(result));
+                        let _ = reply.send(Ok((*sparse).clone()));
                     }
                 }
             }
@@ -504,6 +747,10 @@ impl EmbedPool {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -571,9 +818,7 @@ mod tests {
     async fn sparse_returns_error_when_channel_closed() {
         let pool = EmbedPool::closed_for_test();
         let result = pool.sparse(vec!["hello".into()]).await;
-        // SparseEmbedding doesn't implement Debug, so use .err().unwrap()
-        // instead of .unwrap_err().
-        let err = result.err().expect("expected an error");
+        let err = result.expect_err("expected an error");
         assert!(
             err.to_string().contains("channel closed"),
             "expected channel closed error"

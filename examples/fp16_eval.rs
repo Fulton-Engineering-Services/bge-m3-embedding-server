@@ -8,7 +8,7 @@
 //! Phase A — FP16 vs FP32 embedding fidelity evaluation.
 //!
 //! Generates embeddings for every text in the production benchmark corpus using
-//! both the FP32 (fastembed default) and FP16 (Xenova/bge-m3) ONNX models, then
+//! both the FP32 (BAAI/bge-m3) and FP16 (Xenova/bge-m3) ONNX models, then
 //! computes precision metrics:
 //!
 //! **Dense**: per-text cosine similarity, max absolute element difference.
@@ -34,10 +34,6 @@ use std::path::{Path, PathBuf};
 use std::{env, fs};
 
 use anyhow::{Context, Result};
-use fastembed::{
-    EmbeddingModel, InitOptionsUserDefined, Pooling, SparseModel, SparseTextEmbedding,
-    TextEmbedding, TokenizerFiles, UserDefinedEmbeddingModel,
-};
 use ndarray::ArrayView1;
 use ort::value::TensorRef;
 use serde::Deserialize;
@@ -62,42 +58,24 @@ fn load_corpus() -> Result<Corpus> {
     serde_json::from_str(&raw).context("Failed to parse corpus.json")
 }
 
-// ── Sparse weight loading ───────────────────────────────────────────────
+// ── Constants ───────────────────────────────────────────────────────────
+
+const REPO_ID: &str = "BAAI/bge-m3";
+const MAX_SEQ_LENGTH: usize = 512;
+const SPECIAL_TOKENS: [u32; 4] = [0, 1, 2, 3];
+
+// ── Sparse weight loading (bundled safetensors) ─────────────────────────
 
 struct SparseLinearWeights {
     weight: Vec<f32>, // [1024]
     bias: f32,
 }
 
-fn load_sparse_weights() -> Result<SparseLinearWeights> {
-    // The sparse_linear.safetensors file is embedded in fastembed's source tree.
-    // We locate it in the cargo registry by scanning for the fastembed crate.
-    let home = env::var("HOME").unwrap_or_else(|_| "/Users/j.patrickfulton".into());
-    let registry_src = PathBuf::from(&home).join(".cargo/registry/src");
-
-    let path = fs::read_dir(&registry_src)
-        .into_iter()
-        .flatten()
-        .filter_map(|e| e.ok())
-        .flat_map(|index_dir| fs::read_dir(index_dir.path()).into_iter().flatten())
-        .filter_map(|e| e.ok())
-        .find(|e| {
-            e.file_name()
-                .to_str()
-                .is_some_and(|n| n.starts_with("fastembed-"))
-        })
-        .map(|e| {
-            e.path()
-                .join("src/sparse_text_embedding/weights/sparse_linear.safetensors")
-        })
-        .ok_or_else(|| anyhow::anyhow!("Cannot find fastembed crate in cargo registry"))?;
-
-    let data = fs::read(&path).with_context(|| format!("Failed to read {}", path.display()))?;
-    let tensors = safetensors::SafeTensors::deserialize(&data)?;
-
-    let weight_view = tensors.tensor("weight")?;
-    let bias_view = tensors.tensor("bias")?;
-
+fn load_sparse_weights() -> SparseLinearWeights {
+    let data = include_bytes!("../src/weights/sparse_linear.safetensors");
+    let tensors = safetensors::SafeTensors::deserialize(data).expect("Invalid safetensors");
+    let weight_view = tensors.tensor("weight").expect("Missing weight tensor");
+    let bias_view = tensors.tensor("bias").expect("Missing bias tensor");
     let weight: Vec<f32> = weight_view
         .data()
         .chunks_exact(4)
@@ -109,35 +87,119 @@ fn load_sparse_weights() -> Result<SparseLinearWeights> {
         bias_view.data()[2],
         bias_view.data()[3],
     ]);
-
     assert_eq!(weight.len(), 1024, "sparse_linear weight must be [1024]");
-    Ok(SparseLinearWeights { weight, bias })
+    SparseLinearWeights { weight, bias }
 }
 
-// ── FP16 sparse via raw ORT ─────────────────────────────────────────────
+// ── Model loading ───────────────────────────────────────────────────────
+
+fn download_model_files(cache_dir: &Path) -> Result<(PathBuf, PathBuf)> {
+    let api = hf_hub::api::sync::ApiBuilder::new()
+        .with_cache_dir(cache_dir.to_path_buf())
+        .with_progress(true)
+        .build()
+        .map_err(|e| anyhow::anyhow!("Failed to build hf-hub API: {e}"))?;
+    let repo = api.model(REPO_ID.to_string());
+    let onnx_path = repo.get("onnx/model.onnx").context("model.onnx")?;
+    repo.get("onnx/model.onnx_data")
+        .context("model.onnx_data")?;
+    repo.get("onnx/Constant_7_attr__value")
+        .context("Constant_7")?;
+    let tokenizer_path = repo.get("tokenizer.json").context("tokenizer.json")?;
+    Ok((onnx_path, tokenizer_path))
+}
+
+fn load_tokenizer(path: &Path) -> Result<tokenizers::Tokenizer> {
+    let mut tokenizer = tokenizers::Tokenizer::from_file(path)
+        .map_err(|e| anyhow::anyhow!("Failed to load tokenizer: {e}"))?;
+    tokenizer
+        .with_truncation(Some(tokenizers::TruncationParams {
+            max_length: MAX_SEQ_LENGTH,
+            strategy: tokenizers::TruncationStrategy::LongestFirst,
+            ..Default::default()
+        }))
+        .map_err(|e| anyhow::anyhow!("Truncation: {e}"))?;
+    tokenizer.with_padding(Some(tokenizers::PaddingParams {
+        strategy: tokenizers::PaddingStrategy::BatchLongest,
+        pad_id: 1,
+        pad_token: "<pad>".to_string(),
+        ..Default::default()
+    }));
+    Ok(tokenizer)
+}
+
+fn load_session(model_path: &Path) -> Result<ort::session::Session> {
+    let session = ort::session::Session::builder()?
+        .with_optimization_level(ort::session::builder::GraphOptimizationLevel::Level3)?
+        .with_intra_threads(1)?
+        .commit_from_file(model_path)?;
+    Ok(session)
+}
+
+// ── Embedding functions ─────────────────────────────────────────────────
 
 struct SparseFp16 {
     indices: Vec<usize>,
     values: Vec<f32>,
 }
 
-fn embed_sparse_fp16(
+fn embed_dense(
+    session: &mut ort::session::Session,
+    tokenizer: &tokenizers::Tokenizer,
+    texts: &[String],
+) -> Result<Vec<Vec<f32>>> {
+    let str_refs: Vec<&str> = texts.iter().map(String::as_str).collect();
+    let encodings = tokenizer
+        .encode_batch(str_refs, true)
+        .map_err(|e| anyhow::anyhow!("Tokenization failed: {e}"))?;
+    let batch_len = encodings.len();
+    let seq_len = encodings[0].get_ids().len();
+    let mut ids_flat: Vec<i64> = Vec::with_capacity(batch_len * seq_len);
+    let mut mask_flat: Vec<i64> = Vec::with_capacity(batch_len * seq_len);
+    for enc in &encodings {
+        ids_flat.extend(enc.get_ids().iter().map(|&id| i64::from(id)));
+        mask_flat.extend(enc.get_attention_mask().iter().map(|&m| i64::from(m)));
+    }
+    let ids_array = ndarray::Array2::from_shape_vec((batch_len, seq_len), ids_flat)?;
+    let mask_array = ndarray::Array2::from_shape_vec((batch_len, seq_len), mask_flat)?;
+    let type_ids_array = ndarray::Array2::<i64>::zeros((batch_len, seq_len));
+    let ids_t = TensorRef::from_array_view(ids_array.view())?;
+    let mask_t = TensorRef::from_array_view(mask_array.view())?;
+    let type_t = TensorRef::from_array_view(type_ids_array.view())?;
+    let outputs = session.run(ort::inputs! {
+        "input_ids" => ids_t,
+        "attention_mask" => mask_t,
+        "token_type_ids" => type_t,
+    })?;
+    let emb = outputs["sentence_embedding"].try_extract_array::<f32>()?;
+    let mut result = Vec::with_capacity(batch_len);
+    for i in 0..batch_len {
+        let row = emb.index_axis(ndarray::Axis(0), i);
+        let slice = row.as_slice().expect("contiguous");
+        let norm: f32 = slice.iter().map(|x| x * x).sum::<f32>().sqrt();
+        let normalized: Vec<f32> = if norm > 0.0 {
+            slice.iter().map(|x| x / norm).collect()
+        } else {
+            slice.to_vec()
+        };
+        result.push(normalized);
+    }
+    Ok(result)
+}
+
+fn embed_sparse(
     session: &mut ort::session::Session,
     tokenizer: &tokenizers::Tokenizer,
     weights: &SparseLinearWeights,
     texts: &[String],
 ) -> Result<Vec<SparseFp16>> {
-    const SPECIAL_TOKENS: [u32; 4] = [0, 1, 2, 3]; // CLS, PAD, EOS, UNK
     let weight_arr = ArrayView1::from(&weights.weight);
-
     let mut results = Vec::with_capacity(texts.len());
 
-    // Process one text at a time to avoid batching/padding complexity.
     for text in texts {
         let encoding = tokenizer
             .encode(text.as_str(), true)
             .map_err(|e| anyhow::anyhow!("Tokenization failed: {e}"))?;
-
         let input_ids: Vec<i64> = encoding.get_ids().iter().map(|&id| i64::from(id)).collect();
         let attention_mask: Vec<i64> = encoding
             .get_attention_mask()
@@ -145,24 +207,28 @@ fn embed_sparse_fp16(
             .map(|&m| i64::from(m))
             .collect();
         let seq_len = input_ids.len();
-
         let ids_array = ndarray::Array2::from_shape_vec((1, seq_len), input_ids.clone())?;
         let mask_array = ndarray::Array2::from_shape_vec((1, seq_len), attention_mask.clone())?;
-
-        let ids_tensor = TensorRef::from_array_view(ids_array.view())?;
-        let mask_tensor = TensorRef::from_array_view(mask_array.view())?;
-
+        let type_ids_array = ndarray::Array2::<i64>::zeros((1, seq_len));
+        let ids_t = TensorRef::from_array_view(ids_array.view())?;
+        let mask_t = TensorRef::from_array_view(mask_array.view())?;
+        let type_t = TensorRef::from_array_view(type_ids_array.view())?;
         let outputs = session.run(ort::inputs! {
-            "input_ids" => ids_tensor,
-            "attention_mask" => mask_tensor,
+            "input_ids" => ids_t,
+            "attention_mask" => mask_t,
+            "token_type_ids" => type_t,
         })?;
 
-        // Extract hidden states: [1, seq_len, 1024]
-        // Xenova FP16 model uses "last_hidden_state" (BAAI FP32 uses "token_embeddings")
-        let token_emb = outputs["last_hidden_state"].try_extract_array::<f32>()?;
+        // The output name depends on the model variant:
+        // - BAAI/bge-m3: "token_embeddings"
+        // - Xenova/bge-m3 FP16: "last_hidden_state"
+        let token_emb = if let Ok(t) = outputs["token_embeddings"].try_extract_array::<f32>() {
+            t
+        } else {
+            outputs["last_hidden_state"].try_extract_array::<f32>()?
+        };
 
         let mut token_weights: HashMap<usize, f32> = HashMap::new();
-
         for seq_idx in 0..seq_len {
             if attention_mask[seq_idx] == 0 {
                 continue;
@@ -171,20 +237,13 @@ fn embed_sparse_fp16(
             if SPECIAL_TOKENS.contains(&token_id) {
                 continue;
             }
-
-            // hidden: [1024] — slice from [1, seq_len, 1024]
-            // Note: we avoid ndarray::s![] because the macro emits
-            // #[allow(unsafe_code)] which conflicts with crate-level forbid.
             let batch0 = token_emb.index_axis(ndarray::Axis(0), 0);
             let hidden = batch0.index_axis(ndarray::Axis(0), seq_idx);
             let hidden_slice = hidden
                 .as_slice()
                 .expect("hidden state should be contiguous");
             let hidden_view = ArrayView1::from(hidden_slice);
-
-            // Project → scalar, add bias, ReLU
             let score = (hidden_view.dot(&weight_arr) + weights.bias).max(0.0);
-
             if score > 0.0 {
                 token_weights
                     .entry(token_id as usize)
@@ -196,7 +255,6 @@ fn embed_sparse_fp16(
         let mut indices: Vec<usize> = token_weights.keys().copied().collect();
         indices.sort_unstable();
         let values: Vec<f32> = indices.iter().map(|i| token_weights[i]).collect();
-
         results.push(SparseFp16 { indices, values });
     }
 
@@ -304,18 +362,6 @@ fn stats(vals: &[f64]) -> (f64, f64, f64) {
     (min, mean, max)
 }
 
-// ── Snapshot discovery ──────────────────────────────────────────────────
-
-fn find_snapshot_dir(cache_dir: &Path) -> Result<PathBuf> {
-    let snapshots_dir = cache_dir.join("models--BAAI--bge-m3/snapshots");
-    let entry = fs::read_dir(&snapshots_dir)
-        .with_context(|| format!("Cannot read {}", snapshots_dir.display()))?
-        .next()
-        .ok_or_else(|| anyhow::anyhow!("No snapshots in {}", snapshots_dir.display()))?
-        .context("Error reading snapshot entry")?;
-    Ok(entry.path())
-}
-
 // ── Main ────────────────────────────────────────────────────────────────
 
 fn main() -> Result<()> {
@@ -338,65 +384,37 @@ fn main() -> Result<()> {
         total_texts
     );
 
-    // ── Load FP32 models via fastembed ──
-    println!("[1/5] Loading FP32 dense model (fastembed)...");
-    let mut fp32_dense = TextEmbedding::try_new(
-        fastembed::TextInitOptions::new(EmbeddingModel::BGEM3)
-            .with_cache_dir(cache_dir.clone())
-            .with_show_download_progress(false),
-    )?;
-    println!("       FP32 dense ready.");
+    // ── Load FP32 models via direct ORT ──
+    println!("[1/5] Loading FP32 model (BAAI/bge-m3 via hf-hub)...");
+    let (onnx_path, tokenizer_path) = download_model_files(&cache_dir)?;
+    let fp32_tokenizer = load_tokenizer(&tokenizer_path)?;
+    let mut fp32_session = load_session(&onnx_path)?;
+    println!("       FP32 model ready.");
 
-    println!("[2/5] Loading FP32 sparse model (fastembed)...");
-    let mut fp32_sparse = SparseTextEmbedding::try_new(
-        fastembed::SparseInitOptions::new(SparseModel::BGEM3)
-            .with_cache_dir(cache_dir.clone())
-            .with_show_download_progress(false),
-    )?;
-    println!("       FP32 sparse ready.");
-
-    // ── Load FP16 dense via UserDefinedEmbeddingModel ──
-    println!("[3/5] Loading FP16 dense model (fastembed user-defined)...");
-    let snapshot_dir = find_snapshot_dir(&cache_dir)?;
-    let tokenizer_files = TokenizerFiles {
-        tokenizer_file: fs::read(snapshot_dir.join("tokenizer.json"))?,
-        config_file: fs::read(snapshot_dir.join("config.json"))?,
-        special_tokens_map_file: fs::read(snapshot_dir.join("special_tokens_map.json"))?,
-        tokenizer_config_file: fs::read(snapshot_dir.join("tokenizer_config.json"))?,
-    };
-
+    // ── Load FP16 model ──
+    println!("[2/5] Loading FP16 model (Xenova/bge-m3)...");
     let fp16_onnx_bytes = fs::read(&fp16_model_path)
         .with_context(|| format!("Read {}", fp16_model_path.display()))?;
     println!(
         "       FP16 model: {:.1} MB",
         fp16_onnx_bytes.len() as f64 / 1_048_576.0
     );
+    let mut fp16_session = load_session(&fp16_model_path)?;
+    // Reuse the same tokenizer — both BAAI and Xenova models use XLM-RoBERTa tokenizer.
+    let fp16_tokenizer = load_tokenizer(&tokenizer_path)?;
+    println!("       FP16 model ready.");
 
-    let fp16_model_def = UserDefinedEmbeddingModel::new(fp16_onnx_bytes, tokenizer_files.clone())
-        .with_pooling(Pooling::Cls);
-    let mut fp16_dense =
-        TextEmbedding::try_new_from_user_defined(fp16_model_def, InitOptionsUserDefined::new())?;
-    println!("       FP16 dense ready.");
-
-    // ── Load FP16 sparse via raw ORT ──
-    println!("[4/5] Loading FP16 sparse model (raw ORT session)...");
-    let mut fp16_sparse_session = ort::session::Session::builder()?
-        .with_optimization_level(ort::session::builder::GraphOptimizationLevel::Level3)?
-        .commit_from_file(&fp16_model_path)?;
-    let sparse_tokenizer = tokenizers::Tokenizer::from_file(snapshot_dir.join("tokenizer.json"))
-        .map_err(|e| anyhow::anyhow!("Failed to load tokenizer: {e}"))?;
-
-    println!("[5/5] Loading sparse weights from safetensors...");
-    let sparse_weights = load_sparse_weights()?;
+    // ── Load sparse weights ──
+    println!("[3/5] Loading sparse weights from bundled safetensors...");
+    let sparse_weights = load_sparse_weights();
     println!(
         "       weight: [{}], bias: {:.6}",
         sparse_weights.weight.len(),
         sparse_weights.bias
     );
-    println!("       FP16 sparse ready.\n");
+    println!("       Sparse weights ready.\n");
 
     // ── Run comparisons ──
-    // Sort scenarios for deterministic output order
     let mut scenario_names: Vec<&String> = corpus.scenarios.keys().collect();
     scenario_names.sort();
 
@@ -415,8 +433,8 @@ fn main() -> Result<()> {
         );
 
         // Dense comparison
-        let fp32_embs = fp32_dense.embed(texts.clone(), None)?;
-        let fp16_embs = fp16_dense.embed(texts.clone(), None)?;
+        let fp32_embs = embed_dense(&mut fp32_session, &fp32_tokenizer, texts)?;
+        let fp16_embs = embed_dense(&mut fp16_session, &fp16_tokenizer, texts)?;
 
         let mut cosines = Vec::with_capacity(texts.len());
         let mut diffs = Vec::with_capacity(texts.len());
@@ -435,13 +453,8 @@ fn main() -> Result<()> {
         all_dense_diffs.extend_from_slice(&diffs);
 
         // Sparse comparison
-        let fp32_sp = fp32_sparse.embed(texts.clone(), None)?;
-        let fp16_sp = embed_sparse_fp16(
-            &mut fp16_sparse_session,
-            &sparse_tokenizer,
-            &sparse_weights,
-            texts,
-        )?;
+        let fp32_sp = embed_sparse(&mut fp32_session, &fp32_tokenizer, &sparse_weights, texts)?;
+        let fp16_sp = embed_sparse(&mut fp16_session, &fp16_tokenizer, &sparse_weights, texts)?;
 
         let mut jaccards = Vec::with_capacity(texts.len());
         let mut correlations = Vec::with_capacity(texts.len());

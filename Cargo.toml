@@ -3,10 +3,10 @@ name = "bge-m3-axum-fastembed-rs"
 version = "0.8.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
-description = "Axum HTTP server wrapping fastembed-rs to serve BGE-M3 dense and sparse embeddings"
+description = "Axum HTTP server serving BGE-M3 dense and sparse embeddings via ONNX Runtime"
 repository = "https://github.com/fultonengineeringservices/bge-m3-axum-fastembed-rs"
 readme = "README.md"
-keywords = ["embeddings", "bge-m3", "axum", "nlp", "fastembed"]
+keywords = ["embeddings", "bge-m3", "axum", "nlp", "onnxruntime"]
 categories = ["web-programming::http-server"]
 rust-version = "1.88"
 
@@ -15,8 +15,11 @@ axum = "0.8"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "time"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-fastembed = "5"
-ort = { version = "=2.0.0-rc.11", features = ["coreml"], default-features = false }
+ort = { version = "=2.0.0-rc.11", features = ["coreml", "ndarray", "std"], default-features = false }
+hf-hub = "0.4"
+tokenizers = { version = "0.22", default-features = false, features = ["onig"] }
+safetensors = "0.4"
+ndarray = "0.17"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 anyhow = "1"
@@ -34,9 +37,6 @@ tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 proptest = "1"
 criterion = { version = "0.5", features = ["html_reports"] }
-tokenizers = { version = "0.22", default-features = false, features = ["onig"] }
-safetensors = "0.4"
-ndarray = "0.17"
 
 [[bench]]
 name = "embeddings"

@@ -506,10 +506,7 @@ mod tests {
     #[tokio::test]
     async fn sparse_embeddings_returns_correct_shape() {
         use crate::models::TextInput;
-        // Construct SparseEmbedding using struct literal syntax.
-        // fastembed::SparseEmbedding has public fields: indices: Vec<usize>, values: Vec<f32>.
-        // It does not implement Clone or Debug.
-        let sparse_fixture = vec![fastembed::SparseEmbedding {
+        let sparse_fixture = vec![crate::embedder::SparseEmbedding {
             indices: vec![42usize],
             values: vec![0.5f32],
         }];
