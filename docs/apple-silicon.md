@@ -1150,3 +1150,99 @@ on a non-latency-sensitive background path — real but low-impact.
 **Bottom line:** CoreML's value proposition for this service is single-text latency,
 not batch throughput. The `onnx_batch_size=8` default is correct, and the batch
 regression is an acceptable trade-off for the interactive speedup.
+
+### Memory Footprint Analysis
+
+#### MLAS Baseline — Measured
+
+Production service on MacBook Pro M3 Max (128 GB), PID 65442.
+`BGE_M3_WORKERS=2`, `BGE_M3_IDLE_TIMEOUT_SECS=0`, MLAS-only (no CoreML EP registered).
+Measured with `footprint(1)` — the canonical macOS physical memory accounting tool.
+
+| Category | Size | Contents |
+|----------|------|----------|
+| `MALLOC_LARGE` | 13 GB | ORT model weights + session state (4 sessions) |
+| `MALLOC_SMALL` | 1.2 GB | Tokenizer data, ORT buffers, small allocations |
+| `IOKit` | 12 MB | Device I/O framework overhead |
+| `graphics` | 2 MB | Metal framework init (linked, idle) |
+| `neural` | 6.4 MB (peak 14 MB) | CoreML framework init (linked, idle) |
+| **Total footprint** | **14 GB** | |
+
+The BGE-M3 ONNX model is **2.1 GB on disk** (single blob shared by dense and sparse
+via hf-hub symlinks). ORT loads weights independently per session:
+
+```
+2 workers × 2 sessions/worker (dense + sparse) × 2.1 GB = 8.4 GB model weights
++ ORT overhead (graph, execution plan, intermediate buffers) ≈ 5.6 GB
+= ~14 GB total
+```
+
+Note: `ps aux` RSS showed only 40 MB for this process — macOS aggressively pages
+inactive memory on Apple Silicon. `footprint` reflects the actual physical memory
+the OS accounts against the process, including compressed and wired pages.
+
+#### Projected CoreML Memory Impact
+
+With CoreML EP enabled, each ORT `InferenceSession` additionally:
+
+1. **Compiles ONNX → CoreML `.mlmodelc` format** — creates a second copy of the
+   model weights in CoreML's internal representation (~2 GB per model). ORT keeps
+   its ONNX-format copy for CPU-fallback ops; CoreML keeps its own for dispatched
+   subgraphs. These are separate allocations — no shared pages despite unified memory.
+
+2. **Pre-allocates `FastPrediction` workspace** — the full intermediate-tensor graph
+   for each unique `(batch_size, seq_len)` input shape. At `onnx_batch_size=8`,
+   `seq_len=512`: ~5.6 GB per model per shape. In production, each worker sees
+   a handful of distinct shapes (single-text queries at varying token counts).
+
+Projected total for `BGE_M3_WORKERS=2`:
+
+| Component | MLAS (measured) | + CoreML (projected) | Notes |
+|-----------|-----------------|----------------------|-------|
+| ORT model weights | 8.4 GB | 8.4 GB | unchanged — ORT still loads ONNX weights |
+| ORT session overhead | 5.6 GB | 5.6 GB | graph, execution plan, buffers |
+| CoreML compiled weights | — | ~8 GB | 4 sessions × ~2 GB compiled model |
+| `FastPrediction` workspace | — | 3–22 GB | depends on shapes seen; peak at `[8, 512]` |
+| GPU/Metal allocations | — | unknown | Metal command buffers, shader cache |
+| **Total** | **14 GB** | **25–44 GB** | 2–3× increase |
+
+On 128 GB hardware this is workable (20–34% of RAM). On 96 GB (`jpfulton-imac.lan`
+production server) the upper range could cause memory pressure alongside other
+services (LiteLLM, Langfuse, coordinator, STT, Homebridge).
+
+#### Worker Count Trade-Off
+
+The memory projection raises a key architectural question: **does CoreML make the
+second worker unnecessary?**
+
+The second worker exists for two reasons:
+
+1. **Concurrent request handling** — while worker A processes a request, worker B
+   can accept the next one without queueing. At MLAS single-text latency of
+   30–153 ms, a burst of 2 concurrent requests would see P99 ~300 ms without
+   the second worker.
+
+2. **Resilience** — if one worker panics, the other continues serving.
+
+With CoreML single-text latency of 22–60 ms (20–61% faster), the queuing calculus
+changes:
+
+| Config | Workers | Memory | Single-text P50 | 2-concurrent P99 (est.) |
+|--------|---------|--------|-----------------|-------------------------|
+| MLAS | 2 | 14 GB | 30–153 ms | ~153 ms (parallel) |
+| CoreML | 2 | 25–44 GB | 22–60 ms | ~60 ms (parallel) |
+| CoreML | 1 | 12–22 GB | 22–60 ms | ~120 ms (queued) |
+
+A single CoreML worker at P99 ~120 ms (two requests queued) is still faster than
+the current MLAS 2-worker deployment at P50 for document-length text (153 ms). And
+the memory saving (12–22 GB vs 25–44 GB) is significant — potentially halving the
+CoreML overhead.
+
+The resilience argument for 2 workers is weaker for this service: `launchd`
+`KeepAlive=true` restarts the entire process on crash within 10 seconds, and the
+`/health` endpoint returns `503` during restart so upstream load balancers can
+handle the gap.
+
+This trade-off is deferred to deployment configuration, not baked into the code.
+The `BGE_M3_WORKERS` env var already supports `1`. The decision depends on the
+deployment target's available RAM and concurrent request patterns.
