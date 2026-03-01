@@ -413,11 +413,12 @@ struct WorkerGuard(Arc<AtomicUsize>);
 
 impl Drop for WorkerGuard {
     fn drop(&mut self) {
-        let remaining = self.0.fetch_sub(1, Ordering::AcqRel).saturating_sub(1);
-        if remaining == 0 {
+        let prev = self.0.fetch_sub(1, Ordering::AcqRel);
+        let live_after_drop = prev.saturating_sub(1);
+        if live_after_drop == 0 {
             tracing::error!("All embedding workers have exited — pool is degraded");
         } else {
-            tracing::warn!(remaining, "Embedding worker exited");
+            tracing::warn!(live_after_drop, "Embedding worker exited");
         }
     }
 }
@@ -1063,7 +1064,7 @@ mod tests {
         let mask = [1, 1, 1];
         let scores = [0.3, 0.5, 0.7];
         let (indices, values) = sparse_maxpool(&ids, &mask, &scores);
-        assert_eq!(indices, vec![10, 20]);
+        assert_eq!(indices, vec![10, 20]); // sorted by ID
         assert!((values[0] - 0.7).abs() < 1e-6); // max(0.3, 0.7)
         assert!((values[1] - 0.5).abs() < 1e-6);
     }

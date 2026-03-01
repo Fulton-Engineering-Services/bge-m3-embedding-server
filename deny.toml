@@ -2,7 +2,7 @@
 # https://embarkstudios.github.io/cargo-deny/
 
 [advisories]
-unmaintained = "workspace"
+unmaintained = "deny"
 yanked = "deny"
 ignore = []
 

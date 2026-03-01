@@ -355,7 +355,10 @@ fn weight_correlation(
         .collect();
 
     if shared.len() < 2 {
-        return if shared.len() == 1 { 1.0 } else { f64::NAN };
+        // With 0 shared indices correlation is undefined (NaN).
+        // With exactly 1 shared index variance is zero, so Pearson correlation
+        // is also undefined — return NaN rather than a misleading 1.0.
+        return f64::NAN;
     }
 
     let a_vals: Vec<f64> = shared.iter().map(|k| f64::from(a_map[k])).collect();

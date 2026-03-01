@@ -168,20 +168,20 @@
 
 | ID | Reviewer | Title | File | Status |
 |----|----------|-------|------|--------|
-| SEC-6 | Security | `hf-hub` revision pinned but hash not verified by cargo supply chain | `src/embedder.rs:43` | Open |
-| SEC-7 | Security | `coreml-profile` feature emits per-op dispatch data to stderr | `src/embedder.rs:372-373` | Open |
-| SEC-8 | Security | `deny.toml` uses `unmaintained = "workspace"` not `"deny"` | `deny.toml:5` | Open |
-| COR-5 | Correctness | `WorkerGuard::drop` remaining count variable name slightly misleading | `src/embedder.rs:409` | Open |
-| COR-6 | Correctness | `weight_correlation` returns `1.0` for single shared index | `examples/fp16_eval.rs` | Open |
-| COR-7 | Correctness | `benches/coreml.rs` `tokenize_batch` same `encodings[0]` panic pattern | `benches/coreml.rs` | Open |
-| ARC-7 | Architecture | `tokenize_to_arrays` returns `Vec<Encoding>` unused by dense path | `src/embedder.rs:228-260` | Open |
-| ARC-8 | Architecture | Sparse weight loading re-implemented in bench | `benches/coreml.rs:195-215` | Open |
-| ARC-9 | Architecture | `deny.toml` retains `CDLA-Permissive-2.0` possibly no longer needed | `deny.toml:22` | Open |
-| ARC-10 | Architecture | `BGE_M3_ONNX_BATCH_SIZE` documented in 4 places with varying descriptions | Multiple files | Open |
-| TST-L1 | Tests | `sparse_maxpool_basic` value assertion order could mislead on failure | `src/embedder.rs` tests | Open |
-| TST-L2 | Tests | Handler validation tests duplicate 5-line AppState boilerplate 4x | `src/handler.rs` tests | Open |
-| TST-L3 | Tests | `sparse_linear_is_idempotent` couples to `OnceLock` pointer repr | `src/weights/mod.rs` tests | Open |
-| TST-L4 | Tests | `onnx_batch_size_uses_platform_default` redundant with defaults test | `src/config.rs` tests | Open |
+| SEC-6 | Security | `hf-hub` revision pinned but hash not verified by cargo supply chain | `src/embedder.rs:43` | Accepted — cargo lacks per-crate download hash pinning; REPO_REVISION is the mitigation |
+| SEC-7 | Security | `coreml-profile` feature emits per-op dispatch data to stderr | `src/embedder.rs:372-373` | Accepted — intentionally diagnostic, gated behind feature flag |
+| SEC-8 | Security | `deny.toml` uses `unmaintained = "workspace"` not `"deny"` | `deny.toml:5` | Fixed — tightened to `"deny"` |
+| COR-5 | Correctness | `WorkerGuard::drop` remaining count variable name slightly misleading | `src/embedder.rs:409` | Fixed — renamed to `prev`/`live_after_drop` |
+| COR-6 | Correctness | `weight_correlation` returns `1.0` for single shared index | `examples/fp16_eval.rs` | Fixed — single shared index now returns NaN |
+| COR-7 | Correctness | `benches/coreml.rs` `tokenize_batch` same `encodings[0]` panic pattern | `benches/coreml.rs` | Fixed — added `assert!(!texts.is_empty())` guard |
+| ARC-7 | Architecture | `tokenize_to_arrays` returns `Vec<Encoding>` unused by dense path | `src/embedder.rs:228-260` | Accepted — sparse path requires it; dense ignores cheaply |
+| ARC-8 | Architecture | Sparse weight loading re-implemented in bench | `benches/coreml.rs:195-215` | Accepted — binary crate constraint (ARC-2) |
+| ARC-9 | Architecture | `deny.toml` retains `CDLA-Permissive-2.0` possibly no longer needed | `deny.toml:22` | Verified — still needed by `webpki-roots` v0.26/v1.0 |
+| ARC-10 | Architecture | `BGE_M3_ONNX_BATCH_SIZE` documented in 4 places with varying descriptions | Multiple files | Accepted — each doc site serves different audience |
+| TST-L1 | Tests | `sparse_maxpool_basic` value assertion order could mislead on failure | `src/embedder.rs` tests | Fixed — added clarifying comment |
+| TST-L2 | Tests | Handler validation tests duplicate 5-line AppState boilerplate 4x | `src/handler.rs` tests | Accepted — `make_test_state()` covers most cases; low maintenance cost |
+| TST-L3 | Tests | `sparse_linear_is_idempotent` couples to `OnceLock` pointer repr | `src/weights/mod.rs` tests | Accepted — `OnceLock` guarantees pointer identity |
+| TST-L4 | Tests | `onnx_batch_size_uses_platform_default` redundant with defaults test | `src/config.rs` tests | Accepted — test redundancy is low-cost |
 
 ---
 

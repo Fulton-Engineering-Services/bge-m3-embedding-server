@@ -235,6 +235,7 @@ fn tokenize_batch(
     ndarray::Array2<i64>,
     ndarray::Array2<i64>,
 ) {
+    assert!(!texts.is_empty(), "tokenize_batch requires non-empty input");
     let str_refs: Vec<&str> = texts.iter().map(AsRef::as_ref).collect();
     let encodings = tokenizer
         .encode_batch(str_refs, true)
