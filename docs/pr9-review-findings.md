@@ -128,17 +128,17 @@
 
 ## Low Priority
 
-| ID | Reviewer | Title | File |
-|----|----------|-------|------|
-| SEC-4 | Security | `target-cpu=native` non-reproducible binaries | `.cargo/config.toml:5` |
-| SEC-6 | Security | deny.toml stale fastembed comment | `deny.toml:22` |
-| COR-6 | Correctness | Unused `fp16_onnx_bytes` memory waste | `examples/fp16_eval.rs:396-401` |
-| COR-7 | Correctness | Bench `.unwrap()` without message | `benches/coreml.rs:229-230` |
-| ARC-6 | Architecture | Benchmark loads models twice | `benches/coreml.rs:344-465` |
-| ARC-7 | Architecture | coreml-profile underdocumented for bench use case | `Cargo.toml:31-33` |
-| ARC-8 | Architecture | target-cpu=native applies to all dev builds | `.cargo/config.toml:4-5` |
-| TST-7 | Tests | bench_embed_sparse discards output (no black_box) | `benches/coreml.rs:273-338` |
-| TST-9 | Tests | fp16_eval exits 0 on Phase A failure | `examples/fp16_eval.rs:533-543` |
+| ID | Reviewer | Title | File | Status |
+|----|----------|-------|------|--------|
+| SEC-4 | Security | `target-cpu=native` non-reproducible binaries | `.cargo/config.toml:5` | Fixed — added reproducibility trade-off comment |
+| SEC-6 | Security | deny.toml stale fastembed comment | `deny.toml:22` | Fixed — updated dep chains, removed unused NCSA license |
+| COR-6 | Correctness | Unused `fp16_onnx_bytes` memory waste | `examples/fp16_eval.rs:396-401` | Fixed — replaced `fs::read` with `fs::metadata().len()` |
+| COR-7 | Correctness | Bench `.unwrap()` without message | `benches/coreml.rs:229-230` | Fixed — replaced all bare `.unwrap()` with `.expect()` messages |
+| ARC-6 | Architecture | Benchmark loads models twice | `benches/coreml.rs:344-465` | Documented — intentional per Criterion group isolation (NOTE comment) |
+| ARC-7 | Architecture | coreml-profile underdocumented for bench use case | `Cargo.toml:31-33` | Fixed — added bench and server usage examples |
+| ARC-8 | Architecture | target-cpu=native applies to all dev builds | `.cargo/config.toml:4-5` | Fixed — merged with SEC-4 comment |
+| TST-7 | Tests | bench_embed_sparse discards output (no black_box) | `benches/coreml.rs:273-338` | Fixed — function now returns `Vec<HashMap>` for Criterion to black_box |
+| TST-9 | Tests | fp16_eval exits 0 on Phase A failure | `examples/fp16_eval.rs:533-543` | Fixed — returns `Err` (exit code 1) when targets not met |
 
 ---
 

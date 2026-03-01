@@ -19,8 +19,7 @@ allow = [
     "Zlib",
     "CC0-1.0",
     "Unlicense",
-    "MPL-2.0",                # option-ext (dirs-sys → hf-hub → fastembed)
-    "NCSA",                   # libfuzzer-sys (rav1e → image → fastembed)
+    "MPL-2.0",                # option-ext (dirs-sys → dirs → hf-hub)
     "CDLA-Permissive-2.0",   # webpki-roots, webpki-root-certs (ureq → ort-sys)
 ]
 

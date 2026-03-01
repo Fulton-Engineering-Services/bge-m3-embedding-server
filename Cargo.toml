@@ -29,7 +29,11 @@ uuid = { version = "1", features = ["v4"] }
 [features]
 ## Emit per-op CoreML hardware dispatch decisions to stderr at model load time.
 ## Diagnostic only — enable when profiling which ops run on GPU vs CPU.
-## Usage: cargo bench --bench coreml --features coreml-profile
+##
+## Usage with benchmarks:
+##   BGE_M3_BENCH_EP=coreml_all cargo bench --bench coreml --features coreml-profile
+## Usage with the server:
+##   cargo run --features coreml-profile
 coreml-profile = []
 
 [dev-dependencies]

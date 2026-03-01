@@ -411,11 +411,12 @@ fn main() -> Result<()> {
 
     // ── Load FP16 model ──
     println!("[2/5] Loading FP16 model (Xenova/bge-m3)...");
-    let fp16_onnx_bytes = fs::read(&fp16_model_path)
-        .with_context(|| format!("Read {}", fp16_model_path.display()))?;
+    let fp16_size = fs::metadata(&fp16_model_path)
+        .with_context(|| format!("stat {}", fp16_model_path.display()))?
+        .len();
     println!(
         "       FP16 model: {:.1} MB",
-        fp16_onnx_bytes.len() as f64 / 1_048_576.0
+        fp16_size as f64 / 1_048_576.0
     );
     let mut fp16_session = load_session(&fp16_model_path)?;
     // Reuse the same tokenizer — both BAAI and Xenova models use XLM-RoBERTa tokenizer.
@@ -558,5 +559,9 @@ fn main() -> Result<()> {
         }
     );
 
-    Ok(())
+    if all_pass {
+        Ok(())
+    } else {
+        Err(anyhow::anyhow!("Phase A fidelity targets not met"))
+    }
 }

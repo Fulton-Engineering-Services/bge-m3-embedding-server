@@ -247,8 +247,10 @@ fn tokenize_batch(
         ids_flat.extend(enc.get_ids().iter().map(|&id| i64::from(id)));
         mask_flat.extend(enc.get_attention_mask().iter().map(|&m| i64::from(m)));
     }
-    let ids = ndarray::Array2::from_shape_vec((batch_len, seq_len), ids_flat).unwrap();
-    let mask = ndarray::Array2::from_shape_vec((batch_len, seq_len), mask_flat).unwrap();
+    let ids = ndarray::Array2::from_shape_vec((batch_len, seq_len), ids_flat)
+        .expect("input_ids shape mismatch");
+    let mask = ndarray::Array2::from_shape_vec((batch_len, seq_len), mask_flat)
+        .expect("attention_mask shape mismatch");
     let type_ids = ndarray::Array2::<i64>::zeros((batch_len, seq_len));
     (ids, mask, type_ids)
 }
@@ -262,9 +264,9 @@ fn bench_embed_dense(
     let mut all = Vec::with_capacity(texts.len());
     for chunk in texts.chunks(batch_size) {
         let (ids, mask, type_ids) = tokenize_batch(tokenizer, chunk);
-        let ids_t = TensorRef::from_array_view(ids.view()).unwrap();
-        let mask_t = TensorRef::from_array_view(mask.view()).unwrap();
-        let type_t = TensorRef::from_array_view(type_ids.view()).unwrap();
+        let ids_t = TensorRef::from_array_view(ids.view()).expect("ids tensor");
+        let mask_t = TensorRef::from_array_view(mask.view()).expect("mask tensor");
+        let type_t = TensorRef::from_array_view(type_ids.view()).expect("type_ids tensor");
         let mut sess = session.borrow_mut();
         let outputs = sess
             .run(ort::inputs! {
@@ -298,8 +300,9 @@ fn bench_embed_sparse(
     batch_size: usize,
     weight: &ndarray::Array1<f32>,
     bias: f32,
-) {
+) -> Vec<HashMap<usize, f32>> {
     let weight_view = weight.view();
+    let mut all = Vec::with_capacity(texts.len());
     for chunk in texts.chunks(batch_size) {
         let str_refs: Vec<&str> = chunk.iter().map(AsRef::as_ref).collect();
         let encodings = tokenizer
@@ -313,12 +316,14 @@ fn bench_embed_sparse(
             ids_flat.extend(enc.get_ids().iter().map(|&id| i64::from(id)));
             mask_flat.extend(enc.get_attention_mask().iter().map(|&m| i64::from(m)));
         }
-        let ids = ndarray::Array2::from_shape_vec((batch_len, seq_len), ids_flat).unwrap();
-        let mask = ndarray::Array2::from_shape_vec((batch_len, seq_len), mask_flat).unwrap();
+        let ids = ndarray::Array2::from_shape_vec((batch_len, seq_len), ids_flat)
+            .expect("input_ids shape mismatch");
+        let mask = ndarray::Array2::from_shape_vec((batch_len, seq_len), mask_flat)
+            .expect("attention_mask shape mismatch");
         let type_ids = ndarray::Array2::<i64>::zeros((batch_len, seq_len));
-        let ids_t = TensorRef::from_array_view(ids.view()).unwrap();
-        let mask_t = TensorRef::from_array_view(mask.view()).unwrap();
-        let type_t = TensorRef::from_array_view(type_ids.view()).unwrap();
+        let ids_t = TensorRef::from_array_view(ids.view()).expect("ids tensor");
+        let mask_t = TensorRef::from_array_view(mask.view()).expect("mask tensor");
+        let type_t = TensorRef::from_array_view(type_ids.view()).expect("type_ids tensor");
         let mut sess = session.borrow_mut();
         let outputs = sess
             .run(ort::inputs! {
@@ -354,14 +359,20 @@ fn bench_embed_sparse(
                         .or_insert(score);
                 }
             }
+            all.push(token_weights);
         }
     }
+    all
 }
 
 // ---------------------------------------------------------------------------
 // Dense embedding benchmarks
 // ---------------------------------------------------------------------------
 
+// NOTE(ARC-6): bench_dense and bench_sparse each load their own model instance.
+// Criterion calls group functions independently and closures borrow &models, so
+// each group needs its own owned session. The ~10s load cost is acceptable for
+// benchmark setup and avoids Rc<RefCell<>> coupling between groups.
 fn bench_dense(c: &mut Criterion) {
     let corpus = load_corpus();
     let cache = cache_dir();
