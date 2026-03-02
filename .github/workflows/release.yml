@@ -203,7 +203,7 @@ jobs:
             "$IMAGE:latest"
 
       - name: Generate SBOM
-        uses: anchore/sbom-action@f325610c9f50a54015d37c8d16cb3b0e2c8f4de0  # v0.18.0
+        uses: anchore/sbom-action@17ae1740179002c89186b61233e0f892c3118b11  # v0.23.0
         with:
           image: ${{ env.REGISTRY }}/${{ needs.version.outputs.repo }}:${{ needs.version.outputs.version }}
           artifact-name: sbom-${{ needs.version.outputs.version }}.spdx.json
