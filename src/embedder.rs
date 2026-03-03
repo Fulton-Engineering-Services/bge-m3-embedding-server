@@ -246,17 +246,13 @@ fn embed_dense(
     for chunk in texts.chunks(batch_size) {
         let (ids_array, mask_array, _encodings) = tokenize_to_arrays(tokenizer, chunk)?;
         let batch_len = ids_array.nrows();
-        let seq_len = ids_array.ncols();
-        let type_ids_array = ndarray::Array2::<i64>::zeros((batch_len, seq_len));
 
         let ids_tensor = TensorRef::from_array_view(ids_array.view())?;
         let mask_tensor = TensorRef::from_array_view(mask_array.view())?;
-        let type_ids_tensor = TensorRef::from_array_view(type_ids_array.view())?;
 
         let outputs = session.run(ort::inputs! {
             "input_ids" => ids_tensor,
             "attention_mask" => mask_tensor,
-            "token_type_ids" => type_ids_tensor,
         })?;
 
         let emb = outputs["sentence_embedding"].try_extract_array::<f32>()?;
@@ -294,18 +290,13 @@ fn embed_sparse(
 
     for chunk in texts.chunks(batch_size) {
         let (ids_array, mask_array, encodings) = tokenize_to_arrays(tokenizer, chunk)?;
-        let batch_len = ids_array.nrows();
-        let seq_len = ids_array.ncols();
-        let type_ids_array = ndarray::Array2::<i64>::zeros((batch_len, seq_len));
 
         let ids_tensor = TensorRef::from_array_view(ids_array.view())?;
         let mask_tensor = TensorRef::from_array_view(mask_array.view())?;
-        let type_ids_tensor = TensorRef::from_array_view(type_ids_array.view())?;
 
         let outputs = session.run(ort::inputs! {
             "input_ids" => ids_tensor,
             "attention_mask" => mask_tensor,
-            "token_type_ids" => type_ids_tensor,
         })?;
 
         let token_emb = outputs["token_embeddings"].try_extract_array::<f32>()?;
