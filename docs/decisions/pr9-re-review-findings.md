@@ -170,7 +170,7 @@
 |----|----------|-------|------|--------|
 | SEC-6 | Security | `hf-hub` revision pinned but hash not verified by cargo supply chain | `src/embedder.rs:43` | Accepted — cargo lacks per-crate download hash pinning; REPO_REVISION is the mitigation |
 | SEC-7 | Security | `coreml-profile` feature emits per-op dispatch data to stderr | `src/embedder.rs:372-373` | Accepted — intentionally diagnostic, gated behind feature flag |
-| SEC-8 | Security | `deny.toml` uses `unmaintained = "workspace"` not `"deny"` | `deny.toml:5` | Fixed — tightened to `"deny"` |
+| SEC-8 | Security | `deny.toml` uses `unmaintained = "workspace"` not `"deny"` | `deny.toml:5` | Fixed — tightened to `"all"` (strictest valid v2 scope: checks workspace + transitive deps) |
 | COR-5 | Correctness | `WorkerGuard::drop` remaining count variable name slightly misleading | `src/embedder.rs:409` | Fixed — renamed to `prev`/`live_after_drop` |
 | COR-6 | Correctness | `weight_correlation` returns `1.0` for single shared index | `examples/fp16_eval.rs` | Fixed — single shared index now returns NaN |
 | COR-7 | Correctness | `benches/coreml.rs` `tokenize_batch` same `encodings[0]` panic pattern | `benches/coreml.rs` | Fixed — added `assert!(!texts.is_empty())` guard |
