@@ -34,7 +34,7 @@ jobs:
         run: cargo fmt --all --check
 
       - name: Clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
+        run: cargo clippy --all-targets --features download-ort -- -D warnings
 
   test:
     name: Test (${{ matrix.toolchain }})
@@ -53,7 +53,7 @@ jobs:
       - uses: taiki-e/install-action@554bdce7edf79d43854a6b7c1e392e7da7eb97a9  # cargo-nextest
 
       - name: Run tests
-        run: cargo nextest run --all-features --no-tests=warn
+        run: cargo nextest run --features download-ort --no-tests=warn
 
   msrv:
     name: MSRV (1.88)
@@ -65,7 +65,7 @@ jobs:
           toolchain: "1.88"
       - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5  # v2
       - name: Check (MSRV)
-        run: cargo check --all-features
+        run: cargo check --features download-ort
 
   coverage:
     name: Code Coverage
@@ -80,7 +80,7 @@ jobs:
         with:
           tool: cargo-llvm-cov,cargo-nextest
       - name: Generate coverage
-        run: cargo llvm-cov nextest --all-features --lcov --output-path lcov.info
+        run: cargo llvm-cov nextest --features download-ort --lcov --output-path lcov.info
       - name: Upload to Codecov
         uses: codecov/codecov-action@ad3126e916f78f00edff4ed0317cf185271ccc2d  # v5
         with:
