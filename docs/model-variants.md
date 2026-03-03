@@ -39,7 +39,7 @@ On Apple Silicon LaunchAgent deployments, `scripts/ai.bge-m3.server.plist` sets 
 
 `mcp-local-knowledge-base` stores dense embeddings as PostgreSQL `halfvec` (FP16):
 
-```
+```text
 FP32 model:  FP32 model → FP32 embedding → halfvec cast (FP16) → cosine search
 FP16 model:  FP16 model → FP16 embedding → halfvec storage     → cosine search
 ```
@@ -116,7 +116,7 @@ The Apple Neural Engine (ANE) operates natively in FP16. With an FP32 model, Cor
 - More ops may be eligible for ANE dispatch (the `coreml-profile` feature flag reveals per-op dispatch decisions at model load).
 - The compiled CoreML model cache file is smaller because the weights are stored in FP16.
 
-However, BGE-M3's dynamic sequence length prevents full ANE eligibility regardless of model precision — the ANE requires statically-shaped inputs. See `coreml-ep.md` for the dynamic shape analysis. The potential latency improvement from expanded ANE coverage is a future investigation, not current behavior.
+However, BGE-M3's dynamic sequence length prevents full ANE eligibility regardless of model precision — the ANE requires statically-shaped inputs. See [coreml-ep.md](coreml-ep.md) for the dynamic shape analysis. The potential latency improvement from expanded ANE coverage is a future investigation, not current behavior.
 
 ## 6. Sparse Embedding Stability
 
@@ -131,16 +131,16 @@ Outliers in these metrics occur at the ReLU boundary where tokens with near-zero
 
 ## 7. Memory Projections by Configuration
 
-The table below shows estimated total memory for common configurations. All estimates assume CoreML EP. See `performance.md` for full RAM reduction options.
+The table below shows estimated total memory for common configurations. All estimates assume CoreML EP. See [performance.md](performance.md) for full RAM reduction options.
 
-| Configuration | Sessions | Per-session weights | Workspace (FastPrediction) | Total (est.) |
-|---------------|----------|--------------------|-----------------------------|-------------|
-| FP32 × 2 workers | 4 | 2.16 GB × 4 = 8.6 GB | 3–22 GB × 4 | 25–44 GB |
-| FP32 × 1 worker | 2 | 2.16 GB × 2 = 4.3 GB | 3–22 GB × 2 | 12–22 GB |
-| FP16 × 1 worker | 2 | 1.08 GB × 2 = 2.2 GB | 3–22 GB × 2 | 10–18 GB |
-| FP16 × 1 worker, no FastPrediction | 2 | 1.08 GB × 2 = 2.2 GB | ~0 | 6–8 GB |
+| Configuration | Workers | Sessions | Model size/session | Total (projected) |
+|--------------|---------|----------|-------------------|------------------|
+| FP32 + CoreML | 2 | 2 | ~2.16 GB | ~25–44 GB |
+| FP32 + CoreML | 1 | 1 | ~2.16 GB | ~12–22 GB |
+| FP16 + CoreML | 1 | 1 | ~1.08 GB | ~10–18 GB |
+| FP16 + CoreML, no FastPrediction | 1 | 1 | ~1.08 GB | ~8–12 GB |
 
-Each ONNX session count is doubled because the server loads two ORT sessions per worker (dense and sparse outputs are produced by a single session, but ORT allocates separate execution contexts). See `performance.md` for configuration guidance on reducing FastPrediction workspace overhead.
+Projected totals include ORT session overhead, CoreML compiled model cache, and (where applicable) MLProgram FastPrediction workspace pre-allocation. See [performance.md](performance.md) for full breakdown.
 
 ## 8. Migration Notes
 
