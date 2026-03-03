@@ -675,7 +675,7 @@ fn bench_quality(c: &mut Criterion) {
         .fold(f32::INFINITY, f32::min);
     let mut dense_sorted = dense_sims.clone();
     dense_sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let p5_idx = (dense_sorted.len() / 20).max(1) - 1; // 5th percentile index
+    let p5_idx = dense_sorted.len() / 20; // 5th percentile index: floor(n * 0.05)
     let dense_p5 = dense_sorted[p5_idx];
     eprintln!(
         "[quality] Dense  {variant} vs fp32 — n={}, mean={:.6}, p5={:.6}, min={:.6}",
@@ -710,7 +710,7 @@ fn bench_quality(c: &mut Criterion) {
         .fold(f32::INFINITY, f32::min);
     let mut sparse_sorted = sparse_sims.clone();
     sparse_sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let sparse_p5_idx = (sparse_sorted.len() / 20).max(1) - 1;
+    let sparse_p5_idx = sparse_sorted.len() / 20; // 5th percentile index: floor(n * 0.05)
     let sparse_p5 = sparse_sorted[sparse_p5_idx];
     eprintln!(
         "[quality] Sparse {variant} vs fp32 — n={}, mean={:.6}, p5={:.6}, min={:.6}",
