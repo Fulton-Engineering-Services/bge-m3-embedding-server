@@ -196,7 +196,7 @@ All configuration is via environment variables.
 | `BGE_M3_MAX_BATCH` | `256` | Maximum texts per request (min 1) |
 | `BGE_M3_IDLE_TIMEOUT_SECS` | `300` | Seconds of inactivity before models are unloaded from memory; `0` disables idle unloading |
 | `BGE_M3_ONNX_BATCH_SIZE` | `8` (macOS) / `256` (other) | Texts per `session.run()` call. Defaults to `8` on macOS to avoid CoreML OOM kills |
-| `BGE_M3_MODEL` | `fp32` | Model variant: `fp32` loads `BAAI/bge-m3` (~2.16 GB/session); `fp16` loads `Xenova/bge-m3` (~1.08 GB/session, recommended for Apple Silicon) |
+| `BGE_M3_MODEL` | `fp32` | Model variant: `fp32` loads `BAAI/bge-m3` (~2.16 GB/session); `fp16` loads `Xenova/bge-m3` (~1.08 GB/session). FP16 recommended for Apple Silicon — see [docs/model-variants.md](docs/model-variants.md). |
 | `BGE_M3_LOG_FORMAT` | (text) | Set to `json` for structured JSON log output |
 
 ## Docker
@@ -273,8 +273,11 @@ tail -f ~/Library/Logs/bge-m3-apple/stderr.log
 ```
 
 The LaunchAgent uses `BGE_M3_MODEL=fp16` (Xenova/bge-m3, ~1.08 GB/session) and
-`BGE_M3_IDLE_TIMEOUT_SECS=0` (models stay resident). CoreML `FastPrediction` is
-enabled by default for lowest latency on Apple Neural Engine.
+`BGE_M3_IDLE_TIMEOUT_SECS=0` (models stay resident). CoreML EP dispatches the bulk of transformer ops to the GPU (Metal), delivering
+20–61% lower single-text latency compared to the MLAS NEON baseline. The Neural
+Engine handles boundary cast operations (`ios18.cast`, confirmed by
+`ProfileComputePlan`); shape-dependent compute ops (MatMul, attention) route to
+the GPU. See [docs/coreml-ep.md](docs/coreml-ep.md) for details.
 
 ## Architecture
 
