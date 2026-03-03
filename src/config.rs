@@ -24,6 +24,21 @@ pub struct Config {
     ///
     /// Set with `BGE_M3_MAX_BATCH`. Defaults to `256`. Minimum effective value is `1`.
     pub max_batch: usize,
+    /// Maximum number of texts submitted per ONNX `session.run()` call.
+    ///
+    /// Set with `BGE_M3_ONNX_BATCH_SIZE`. On macOS the `CoreML` execution provider
+    /// uses `MLProgram` with `FastPrediction` specialisation, which pre-allocates
+    /// the full intermediate-tensor workspace at model-compilation time. BGE-M3
+    /// (24 transformer layers, 16 attention heads, 1 024 hidden) produces a
+    /// peak workspace of roughly `batch × 720 MB` per layer for a 512-token
+    /// sequence; submitting 50 texts at once can require 35 GB, triggering
+    /// Jetsam OOM kills. Chunking to 8 texts per call caps the peak at ~5.6 GB.
+    ///
+    /// On other platforms (MLAS/CPU EP) no pre-allocation occurs, so larger
+    /// values improve throughput with no stability risk.
+    ///
+    /// Defaults to `8` on macOS, `256` elsewhere. Minimum effective value is `1`.
+    pub onnx_batch_size: usize,
     /// Duration of inactivity after which workers unload their model instances from memory.
     ///
     /// Set with `BGE_M3_IDLE_TIMEOUT_SECS`. Defaults to `300` (5 minutes).
@@ -53,6 +68,14 @@ impl Config {
             .unwrap_or(256)
             .max(1);
 
+        // Platform-specific default: CoreML on macOS pre-allocates the full
+        // intermediate-tensor workspace, so a small default avoids OOM kills.
+        let onnx_batch_size_default: usize = if cfg!(target_os = "macos") { 8 } else { 256 };
+        let onnx_batch_size = lookup("BGE_M3_ONNX_BATCH_SIZE")
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(onnx_batch_size_default)
+            .max(1);
+
         let idle_timeout_secs = lookup("BGE_M3_IDLE_TIMEOUT_SECS")
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(300);
@@ -63,6 +86,7 @@ impl Config {
             bind_addr: lookup("BGE_M3_BIND").unwrap_or_else(|| "0.0.0.0:8081".to_string()),
             workers,
             max_batch,
+            onnx_batch_size,
             idle_timeout,
         }
     }
@@ -87,6 +111,9 @@ mod tests {
         assert_eq!(cfg.workers, 2);
         assert_eq!(cfg.max_batch, 256);
         assert_eq!(cfg.idle_timeout, Some(Duration::from_secs(300)));
+        // Platform-specific: macOS=8 (CoreML OOM guard), other=256
+        let expected_onnx: usize = if cfg!(target_os = "macos") { 8 } else { 256 };
+        assert_eq!(cfg.onnx_batch_size, expected_onnx);
     }
 
     #[test]
@@ -145,5 +172,32 @@ mod tests {
         let cfg = Config::from_lookup(lookup_from(&map));
 
         assert_eq!(cfg.idle_timeout, Some(Duration::from_secs(60)));
+    }
+
+    #[test]
+    fn onnx_batch_size_uses_platform_default() {
+        let map = HashMap::new();
+        let cfg = Config::from_lookup(lookup_from(&map));
+
+        // macOS defaults to 8 (CoreML FastPrediction OOM guard).
+        // All other platforms default to 256.
+        let expected: usize = if cfg!(target_os = "macos") { 8 } else { 256 };
+        assert_eq!(cfg.onnx_batch_size, expected);
+    }
+
+    #[test]
+    fn onnx_batch_size_custom_value() {
+        let map = HashMap::from([("BGE_M3_ONNX_BATCH_SIZE", "16")]);
+        let cfg = Config::from_lookup(lookup_from(&map));
+
+        assert_eq!(cfg.onnx_batch_size, 16);
+    }
+
+    #[test]
+    fn onnx_batch_size_clamps_to_minimum_1() {
+        let map = HashMap::from([("BGE_M3_ONNX_BATCH_SIZE", "0")]);
+        let cfg = Config::from_lookup(lookup_from(&map));
+
+        assert_eq!(cfg.onnx_batch_size, 1);
     }
 }
