@@ -276,7 +276,7 @@ Inputs:
 
 Outputs:
   token_embeddings:    FLOAT [batch_size, sequence_length, 1024]
-  sentence_embedding:  FLOAT [batch_size, Divsentence_embedding_dim_1]
+  sentence_embedding:  FLOAT [batch_size, 1024]
 
 IR version:  6
 Opset:       ai.onnx v11
