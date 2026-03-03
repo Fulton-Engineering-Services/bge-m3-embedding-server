@@ -2,7 +2,7 @@
 name = "bge-m3-embedding-server"
 version = "0.9.1"
 edition = "2021"
-license = "MIT OR Apache-2.0"
+license = "Apache-2.0"
 description = "Axum HTTP server serving BGE-M3 dense and sparse embeddings via ONNX Runtime"
 repository = "https://github.com/Fulton-Engineering-Services/bge-m3-embedding-server"
 readme = "README.md"
