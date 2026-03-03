@@ -1,0 +1,56 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+    "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- LaunchAgent plist for the BGE-M3 embedding server on Apple Silicon.
+     Install via: scripts/install-bge-m3-apple.sh
+     __HOME__ is substituted by the install script.
+     Port 8089 avoids conflict with llama-server (8088).
+     BGE_M3_IDLE_TIMEOUT_SECS=0 keeps models resident permanently — fleet hosts
+     are dedicated embedding servers, not shared-use machines with memory pressure.
+     BGE_M3_MODEL=fp16 halves per-session memory (~1.08 GB vs ~2.16 GB) by loading
+     the Xenova/bge-m3 FP16 model. Recommended for all Apple Silicon deployments. -->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>ai.bge-m3.server</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>__HOME__/.local/bin/bge-m3-apple</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>BGE_M3_BIND</key>
+        <string>0.0.0.0:8089</string>
+        <key>BGE_M3_WORKERS</key>
+        <string>2</string>
+        <key>BGE_M3_MAX_BATCH</key>
+        <string>256</string>
+        <key>BGE_M3_IDLE_TIMEOUT_SECS</key>
+        <string>0</string>
+        <!-- CoreML MLProgram FastPrediction pre-allocates full tensor workspace per batch slot.
+             BGE-M3 at batch=50×seq=512 can peak at ~35 GB; batch=8 caps peak under 6 GB.
+             Explicitly pinned here so intent is clear regardless of compiled-in platform defaults. -->
+        <key>BGE_M3_ONNX_BATCH_SIZE</key>
+        <string>8</string>
+        <!-- fp16: Xenova/bge-m3 (~1.08 GB/session) — halves peak memory vs fp32. -->
+        <key>BGE_M3_MODEL</key>
+        <string>fp16</string>
+        <key>BGE_M3_CACHE_DIR</key>
+        <string>__HOME__/.cache/bge-m3</string>
+        <key>BGE_M3_LOG_FORMAT</key>
+        <string>json</string>
+        <key>RUST_LOG</key>
+        <string>info</string>
+    </dict>
+    <key>StandardOutPath</key>
+    <string>__HOME__/Library/Logs/bge-m3-apple/stdout.log</string>
+    <key>StandardErrorPath</key>
+    <string>__HOME__/Library/Logs/bge-m3-apple/stderr.log</string>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+</dict>
+</plist>

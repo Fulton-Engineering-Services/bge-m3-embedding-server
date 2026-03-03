@@ -196,6 +196,7 @@ All configuration is via environment variables.
 | `BGE_M3_MAX_BATCH` | `256` | Maximum texts per request (min 1) |
 | `BGE_M3_IDLE_TIMEOUT_SECS` | `300` | Seconds of inactivity before models are unloaded from memory; `0` disables idle unloading |
 | `BGE_M3_ONNX_BATCH_SIZE` | `8` (macOS) / `256` (other) | Texts per `session.run()` call. Defaults to `8` on macOS to avoid CoreML OOM kills |
+| `BGE_M3_MODEL` | `fp32` | Model variant: `fp32` loads `BAAI/bge-m3` (~2.16 GB/session); `fp16` loads `Xenova/bge-m3` (~1.08 GB/session, recommended for Apple Silicon) |
 | `BGE_M3_LOG_FORMAT` | (text) | Set to `json` for structured JSON log output |
 
 ## Docker
@@ -231,6 +232,49 @@ docker run --rm \
 The container includes a built-in `HEALTHCHECK` that polls `GET /health` every 10 seconds.
 The start period is 120 seconds to allow time for model download and ONNX initialization on
 first run.
+
+## Apple Silicon (macOS)
+
+The `scripts/` directory contains scripts for deploying the server as a persistent macOS LaunchAgent
+on Apple Silicon Macs (M1/M2/M3/M4).
+
+### Install
+
+```bash
+# Build ONNX Runtime from source with CoreML EP, then build and install the server.
+# Requires: Rust, CMake, Python 3, Xcode Command Line Tools.
+# First run takes 15–30 minutes to build ORT.
+./scripts/install-bge-m3-apple.sh
+
+# Or, install a pre-built binary:
+./scripts/install-bge-m3-apple.sh /path/to/bge-m3-apple
+```
+
+The script:
+1. Builds ONNX Runtime from the [FES fork](https://github.com/Fulton-Engineering-Services/onnxruntime) with the CoreML external-data-path fix.
+2. Compiles `bge-m3-embedding-server` with `target-cpu=native` and the CoreML-enabled ORT.
+3. Installs the binary to `~/.local/bin/bge-m3-apple`.
+4. Registers `ai.bge-m3.server` as a LaunchAgent on port **8089**.
+
+### Service management
+
+```bash
+# Status
+launchctl list ai.bge-m3.server
+
+# Stop
+launchctl bootout gui/$(id -u)/ai.bge-m3.server
+
+# Restart
+launchctl kickstart -k gui/$(id -u)/ai.bge-m3.server
+
+# Logs
+tail -f ~/Library/Logs/bge-m3-apple/stderr.log
+```
+
+The LaunchAgent uses `BGE_M3_MODEL=fp16` (Xenova/bge-m3, ~1.08 GB/session) and
+`BGE_M3_IDLE_TIMEOUT_SECS=0` (models stay resident). CoreML `FastPrediction` is
+enabled by default for lowest latency on Apple Neural Engine.
 
 ## Architecture
 

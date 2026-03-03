@@ -98,6 +98,7 @@ async fn main() -> anyhow::Result<()> {
         max_batch = cfg.max_batch,
         cache_dir = %cfg.cache_dir,
         idle_timeout_secs = cfg.idle_timeout.map(|d| d.as_secs()),
+        model_variant = ?cfg.model_variant,
         "Starting bge-m3-embedding-server"
     );
 
@@ -107,6 +108,7 @@ async fn main() -> anyhow::Result<()> {
         WorkerConfig {
             onnx_batch_size: cfg.onnx_batch_size,
             idle_timeout: cfg.idle_timeout,
+            model_variant: cfg.model_variant,
         },
     );
 

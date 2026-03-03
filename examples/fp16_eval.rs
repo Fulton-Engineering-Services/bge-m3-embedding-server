@@ -179,16 +179,20 @@ fn embed_dense(
     }
     let ids_array = ndarray::Array2::from_shape_vec((batch_len, seq_len), ids_flat)?;
     let mask_array = ndarray::Array2::from_shape_vec((batch_len, seq_len), mask_flat)?;
-    let type_ids_array = ndarray::Array2::<i64>::zeros((batch_len, seq_len));
+
     let ids_t = TensorRef::from_array_view(ids_array.view())?;
     let mask_t = TensorRef::from_array_view(mask_array.view())?;
-    let type_t = TensorRef::from_array_view(type_ids_array.view())?;
+
     let outputs = session.run(ort::inputs! {
         "input_ids" => ids_t,
         "attention_mask" => mask_t,
-        "token_type_ids" => type_t,
     })?;
-    let emb = outputs["sentence_embedding"].try_extract_array::<f32>()?;
+
+    // Xenova/bge-m3 FP16 exports last_hidden_state [batch, seq, 1024].
+    // CLS-pool by selecting position 0 along the sequence axis.
+    let lhs = outputs["last_hidden_state"].try_extract_array::<f32>()?;
+    let emb = lhs.index_axis(ndarray::Axis(1), 0);
+
     let mut result = Vec::with_capacity(batch_len);
     for i in 0..batch_len {
         let row = emb.index_axis(ndarray::Axis(0), i);
@@ -230,14 +234,13 @@ fn embed_sparse(
         let seq_len = input_ids.len();
         let ids_array = ndarray::Array2::from_shape_vec((1, seq_len), input_ids.clone())?;
         let mask_array = ndarray::Array2::from_shape_vec((1, seq_len), attention_mask.clone())?;
-        let type_ids_array = ndarray::Array2::<i64>::zeros((1, seq_len));
+
         let ids_t = TensorRef::from_array_view(ids_array.view())?;
         let mask_t = TensorRef::from_array_view(mask_array.view())?;
-        let type_t = TensorRef::from_array_view(type_ids_array.view())?;
+
         let outputs = session.run(ort::inputs! {
             "input_ids" => ids_t,
             "attention_mask" => mask_t,
-            "token_type_ids" => type_t,
         })?;
 
         // The output name depends on the model variant:

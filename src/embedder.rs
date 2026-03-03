@@ -1,3 +1,4 @@
+use crate::config::ModelVariant;
 use anyhow::Result;
 use ndarray::ArrayView1;
 use ort::value::TensorRef;
@@ -41,6 +42,12 @@ const REPO_ID: &str = "BAAI/bge-m3";
 /// integrity for the ONNX weights and tokenizer. Update this hash intentionally
 /// after verifying a new revision produces equivalent embeddings.
 const REPO_REVISION: &str = "5617a9f61b028005a4858fdac845db406aefb181";
+
+const XENOVA_REPO_ID: &str = "Xenova/bge-m3";
+/// Pinned HF commit for the Xenova/bge-m3 FP16 model (~1.08 GB, single file).
+/// Update intentionally after verifying equivalent embedding quality vs FP32.
+const XENOVA_REPO_REVISION: &str = "4de13258303883538bd53b696b452bf8099f0858";
+
 const MAX_SEQ_LENGTH: usize = 512;
 
 /// CLS, PAD, SEP/EOS, UNK — excluded from sparse output.
@@ -57,8 +64,23 @@ struct ModelFiles {
 
 /// Downloads BGE-M3 model files from Hugging Face Hub (or returns cached paths).
 ///
-/// Files are pinned to [`REPO_REVISION`] for supply-chain integrity.
-fn download_model_files(cache_dir: &Path, show_progress: bool) -> Result<ModelFiles> {
+/// For `ModelVariant::Fp32`, downloads from `BAAI/bge-m3` (FP32, ~2.16 GB) pinned
+/// to [`REPO_REVISION`]. The FP32 model uses external initializer files that must
+/// be co-located with `model.onnx`.
+///
+/// For `ModelVariant::Fp16`, downloads from `Xenova/bge-m3` (FP16, ~1.08 GB) pinned
+/// to [`XENOVA_REPO_REVISION`]. The FP16 model is a single self-contained ONNX file
+/// with no external data.
+fn download_model_files(
+    cache_dir: &Path,
+    show_progress: bool,
+    variant: ModelVariant,
+) -> Result<ModelFiles> {
+    let (repo_id, repo_revision) = match variant {
+        ModelVariant::Fp32 => (REPO_ID, REPO_REVISION),
+        ModelVariant::Fp16 => (XENOVA_REPO_ID, XENOVA_REPO_REVISION),
+    };
+
     let api = hf_hub::api::sync::ApiBuilder::new()
         .with_cache_dir(cache_dir.to_path_buf())
         .with_progress(show_progress)
@@ -66,20 +88,27 @@ fn download_model_files(cache_dir: &Path, show_progress: bool) -> Result<ModelFi
         .map_err(|e| anyhow::anyhow!("Failed to build hf-hub API: {e}"))?;
 
     let repo = api.repo(hf_hub::Repo::with_revision(
-        REPO_ID.to_string(),
+        repo_id.to_string(),
         hf_hub::RepoType::Model,
-        REPO_REVISION.to_string(),
+        repo_revision.to_string(),
     ));
 
-    let onnx_path = repo
-        .get("onnx/model.onnx")
-        .map_err(|e| anyhow::anyhow!("Failed to get onnx/model.onnx: {e}"))?;
-
-    // External initializer files must be co-located with model.onnx.
-    repo.get("onnx/model.onnx_data")
-        .map_err(|e| anyhow::anyhow!("Failed to get onnx/model.onnx_data: {e}"))?;
-    repo.get("onnx/Constant_7_attr__value")
-        .map_err(|e| anyhow::anyhow!("Failed to get onnx/Constant_7_attr__value: {e}"))?;
+    let onnx_path = match variant {
+        ModelVariant::Fp32 => {
+            let path = repo
+                .get("onnx/model.onnx")
+                .map_err(|e| anyhow::anyhow!("Failed to get onnx/model.onnx: {e}"))?;
+            // External initializer files must be co-located with model.onnx.
+            repo.get("onnx/model.onnx_data")
+                .map_err(|e| anyhow::anyhow!("Failed to get onnx/model.onnx_data: {e}"))?;
+            repo.get("onnx/Constant_7_attr__value")
+                .map_err(|e| anyhow::anyhow!("Failed to get onnx/Constant_7_attr__value: {e}"))?;
+            path
+        }
+        ModelVariant::Fp16 => repo
+            .get("onnx/model_fp16.onnx")
+            .map_err(|e| anyhow::anyhow!("Failed to get onnx/model_fp16.onnx: {e}"))?,
+    };
 
     let tokenizer_path = repo
         .get("tokenizer.json")
@@ -230,16 +259,19 @@ fn tokenize_to_arrays(
 // Embedding functions
 // ---------------------------------------------------------------------------
 
-/// Produces L2-normalized dense embeddings from the `sentence_embedding` output.
+/// Produces L2-normalized dense embeddings.
 ///
-/// The BAAI/bge-m3 model outputs `sentence_embedding` with shape `[batch, 1024]`,
-/// already CLS-pooled. We only need to L2-normalize each vector.
+/// For `ModelVariant::Fp32`, reads `sentence_embedding` [batch, 1024] — already
+/// CLS-pooled by the BAAI/bge-m3 export. For `ModelVariant::Fp16`, reads
+/// `last_hidden_state` [batch, seq, 1024] and CLS-pools by selecting position 0.
+/// ORT promotes FP16 tensor values to f32 during `try_extract_array::<f32>()`.
 #[allow(clippy::cast_possible_truncation)]
 fn embed_dense(
     session: &mut ort::session::Session,
     tokenizer: &tokenizers::Tokenizer,
     texts: &[String],
     batch_size: usize,
+    model_variant: ModelVariant,
 ) -> Result<Vec<Vec<f32>>> {
     let mut all_embeddings = Vec::with_capacity(texts.len());
 
@@ -255,7 +287,18 @@ fn embed_dense(
             "attention_mask" => mask_tensor,
         })?;
 
-        let emb = outputs["sentence_embedding"].try_extract_array::<f32>()?;
+        // FP32: sentence_embedding [batch, 1024] — pre-pooled CLS output.
+        // FP16: last_hidden_state [batch, seq, 1024] — CLS token at position 0.
+        // Both branches produce an owned ArrayD<f32> with shape [batch, 1024].
+        let emb: ndarray::ArrayD<f32> = match model_variant {
+            ModelVariant::Fp32 => outputs["sentence_embedding"]
+                .try_extract_array::<f32>()?
+                .to_owned(),
+            ModelVariant::Fp16 => {
+                let lhs = outputs["last_hidden_state"].try_extract_array::<f32>()?;
+                lhs.index_axis(ndarray::Axis(1), 0).to_owned()
+            }
+        };
 
         for i in 0..batch_len {
             let row = emb.index_axis(ndarray::Axis(0), i);
@@ -273,15 +316,17 @@ fn embed_dense(
 
 /// Produces sparse embeddings via the BGE-M3 sparse-linear projection.
 ///
-/// Reads `token_embeddings` output `[batch, seq, 1024]`, projects each token's
-/// hidden state through the `sparse_linear` weight vector, applies `ReLU`, and
-/// performs max-pooling across token positions sharing the same vocabulary ID.
+/// Reads per-token hidden states [batch, seq, 1024] — `token_embeddings` for
+/// `ModelVariant::Fp32`, `last_hidden_state` for `ModelVariant::Fp16` — and
+/// projects each token through the sparse-linear weight vector, applies `ReLU`,
+/// and max-pools across token positions sharing the same vocabulary ID.
 #[allow(clippy::cast_possible_truncation)]
 fn embed_sparse(
     session: &mut ort::session::Session,
     tokenizer: &tokenizers::Tokenizer,
     texts: &[String],
     batch_size: usize,
+    model_variant: ModelVariant,
 ) -> Result<Vec<SparseEmbedding>> {
     let (weight, bias) = crate::weights::sparse_linear();
     let weight_view = weight.view();
@@ -299,7 +344,12 @@ fn embed_sparse(
             "attention_mask" => mask_tensor,
         })?;
 
-        let token_emb = outputs["token_embeddings"].try_extract_array::<f32>()?;
+        // FP32: token_embeddings [batch, seq, 1024].
+        // FP16: last_hidden_state [batch, seq, 1024] — same shape, different key.
+        let token_emb = match model_variant {
+            ModelVariant::Fp32 => outputs["token_embeddings"].try_extract_array::<f32>()?,
+            ModelVariant::Fp16 => outputs["last_hidden_state"].try_extract_array::<f32>()?,
+        };
 
         for (i, enc) in encodings.iter().enumerate() {
             let ids = enc.get_ids();
@@ -390,8 +440,9 @@ fn execution_providers(cache_dir: &Path) -> Vec<ort::ep::ExecutionProviderDispat
 fn load_models(
     cache_dir: &Path,
     show_download_progress: bool,
+    model_variant: ModelVariant,
 ) -> Result<(ort::session::Session, tokenizers::Tokenizer)> {
-    let files = download_model_files(cache_dir, show_download_progress)?;
+    let files = download_model_files(cache_dir, show_download_progress, model_variant)?;
     let tokenizer = load_tokenizer(&files.tokenizer_path)?;
     let eps = execution_providers(cache_dir);
     let session = load_session(&files.onnx_path, eps)?;
@@ -425,13 +476,15 @@ pub(crate) struct WorkerConfig {
     pub onnx_batch_size: usize,
     /// Duration of inactivity before workers unload their model instances.
     pub idle_timeout: Option<Duration>,
+    /// ONNX model variant to load (FP32 or FP16).
+    pub model_variant: ModelVariant,
 }
 
 /// Body of a single embedding worker thread.
 ///
 /// Called from a `spawn_blocking` task. Loads models, signals readiness, then
 /// processes requests from the shared channel until it closes.
-#[allow(clippy::needless_pass_by_value)]
+#[allow(clippy::needless_pass_by_value, clippy::too_many_lines)]
 fn run_worker(
     id: usize,
     cache_dir: PathBuf,
@@ -448,7 +501,7 @@ fn run_worker(
     info!("Loading models (worker {id})...");
     let load_start = std::time::Instant::now();
     let rt = Handle::current();
-    let initial_models = match load_models(&cache_dir, id == 0) {
+    let initial_models = match load_models(&cache_dir, id == 0, config.model_variant) {
         Ok(models) => {
             tracing::info!(
                 elapsed_ms = load_start.elapsed().as_millis(),
@@ -506,7 +559,7 @@ fn run_worker(
                 if models.is_none() {
                     tracing::info!("Worker {id} reloading models after idle...");
                     let reload_start = std::time::Instant::now();
-                    match load_models(&cache_dir, false) {
+                    match load_models(&cache_dir, false, config.model_variant) {
                         Ok(m) => {
                             models = Some(m);
                             loaded_workers.fetch_add(1, Ordering::AcqRel);
@@ -538,15 +591,25 @@ fn run_worker(
 
                 match request {
                     EmbedRequest::Dense { texts, reply } => {
-                        let result =
-                            embed_dense(session, tokenizer, &texts, config.onnx_batch_size)
-                                .map_err(|e| anyhow::anyhow!("Dense embed error: {e}"));
+                        let result = embed_dense(
+                            session,
+                            tokenizer,
+                            &texts,
+                            config.onnx_batch_size,
+                            config.model_variant,
+                        )
+                        .map_err(|e| anyhow::anyhow!("Dense embed error: {e}"));
                         let _ = reply.send(result);
                     }
                     EmbedRequest::Sparse { texts, reply } => {
-                        let result =
-                            embed_sparse(session, tokenizer, &texts, config.onnx_batch_size)
-                                .map_err(|e| anyhow::anyhow!("Sparse embed error: {e}"));
+                        let result = embed_sparse(
+                            session,
+                            tokenizer,
+                            &texts,
+                            config.onnx_batch_size,
+                            config.model_variant,
+                        )
+                        .map_err(|e| anyhow::anyhow!("Sparse embed error: {e}"));
                         let _ = reply.send(result);
                     }
                 }
@@ -837,6 +900,7 @@ mod tests {
             WorkerConfig {
                 onnx_batch_size: 8,
                 idle_timeout: None,
+                model_variant: crate::config::ModelVariant::Fp32,
             },
         );
 
@@ -867,6 +931,7 @@ mod tests {
             WorkerConfig {
                 onnx_batch_size: 8,
                 idle_timeout: None,
+                model_variant: crate::config::ModelVariant::Fp32,
             },
         );
 
