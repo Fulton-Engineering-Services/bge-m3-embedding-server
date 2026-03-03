@@ -44,7 +44,7 @@ The script is idempotent — safe to re-run to update the binary or plist.
 
 ## LaunchAgent Configuration
 
-Source: [`scripts/ai.bge-m3.server.plist`](../scripts/ai.bge-m3.server.plist)
+Source: [`../scripts/ai.bge-m3.server.plist`](../scripts/ai.bge-m3.server.plist)
 
 | Setting | Value | Rationale |
 |---------|-------|-----------|
@@ -54,7 +54,7 @@ Source: [`scripts/ai.bge-m3.server.plist`](../scripts/ai.bge-m3.server.plist)
 | `BGE_M3_IDLE_TIMEOUT_SECS` | `0` | Models stay resident permanently — dedicated server |
 | `BGE_M3_ONNX_BATCH_SIZE` | `8` | Limits CoreML FastPrediction tensor workspace; prevents OOM on all text lengths. See [performance.md](performance.md) |
 | `BGE_M3_MODEL` | `fp16` | Xenova/bge-m3 FP16 (~1.08 GB/session); halves peak memory vs fp32. See [model-variants.md](model-variants.md) |
-| `BGE_M3_CACHE_DIR` | `~/.cache/bge-m3` | Model cache location |
+| `BGE_M3_CACHE_DIR` | `~/.cache/bge-m3` | Model cache location (resolved from `__HOME__` by the install script; `launchd` does not expand `~`) |
 | `BGE_M3_LOG_FORMAT` | `json` | Structured logging |
 | `RUST_LOG` | `info` | Log level |
 | `KeepAlive` | `true` | Restart on crash |
@@ -70,7 +70,10 @@ launchctl list ai.bge-m3.server
 # Stop
 launchctl bootout gui/$(id -u)/ai.bge-m3.server
 
-# Restart
+# Start (after a bootout, or on a machine where RunAtLoad has not yet triggered)
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/ai.bge-m3.server.plist
+
+# Force restart (kill and relaunch)
 launchctl kickstart -k gui/$(id -u)/ai.bge-m3.server
 
 # Logs (live tail)
