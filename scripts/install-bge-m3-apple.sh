@@ -138,6 +138,15 @@ else
             ORT_BUILD_PATH="$(echo "$ORT_BUILD_PATH" | tr ':' '\n' | grep -Fxv "$PROTOC_DIR" | tr '\n' ':' | sed 's/:$//')"
         fi
 
+        # Remove any incomplete build output from previous failed runs. Stale
+        # generated files (e.g. coreml_proto/*.pb.h produced by a prior mismatched
+        # protoc) cause compilation failures on retry. CMake does not regenerate
+        # these automatically because the source .proto files are unchanged.
+        if [[ -d "$ORT_OUTPUT_DIR" ]]; then
+            info "Removing incomplete ORT build output to ensure a clean build..."
+            rm -rf "$ORT_OUTPUT_DIR"
+        fi
+
         info "Running ORT build (this takes 15-30 minutes on first run)..."
         # Run inside a subshell so all environment changes are automatically
         # discarded on exit.
@@ -146,6 +155,11 @@ else
         #     headers even when protoc is not on PATH. Unsetting it forces CMake to
         #     use only ORT's bundled protobuf v21.12.
         #   - PKG_CONFIG_PATH: cleared for the same reason.
+        #   - CMAKE_SYSTEM_PREFIX_PATH (passed as cmake define): CMake auto-populates
+        #     this with /opt/homebrew on Apple Silicon regardless of env vars, which
+        #     lets find_package(Protobuf) find the Homebrew install even when
+        #     CMAKE_PREFIX_PATH is empty. Clearing it at the cmake level closes that
+        #     last search path.
         (
             unset CMAKE_PREFIX_PATH PKG_CONFIG_PATH
             cd "$ORT_SOURCE_DIR"
@@ -162,7 +176,8 @@ else
                 --cmake_extra_defines \
                     CMAKE_OSX_ARCHITECTURES=arm64 \
                     onnxruntime_BUILD_UNIT_TESTS=OFF \
-                    onnxruntime_BUILD_SHARED_LIB=OFF
+                    onnxruntime_BUILD_SHARED_LIB=OFF \
+                    CMAKE_SYSTEM_PREFIX_PATH=
         )
 
         [[ -f "$ORT_OUTPUT_DIR/Release/libonnxruntime_common.a" ]] || \
