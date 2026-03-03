@@ -185,8 +185,10 @@ documents score better.
 
 The sparse output is a **learned lexical representation** where each
 dimension corresponds to a token in the 250,002-entry vocabulary. For each
-token position in the input, a linear projection followed by ReLU produces
-a non-negative importance weight:
+token position in the input, a linear projection followed by
+[ReLU](https://en.wikipedia.org/wiki/Rectifier_(neural_networks))
+(Rectified Linear Unit — `max(0, x)`, which passes positive values through
+unchanged and zeroes out negatives) produces a non-negative importance weight:
 
 ```
 w_t = ReLU(W_lex^T · h_t + b)
