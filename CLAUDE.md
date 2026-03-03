@@ -30,6 +30,9 @@ cargo fmt --check
 
 # Supply chain audit (requires cargo-deny)
 cargo deny check
+
+# Build with CoreML dispatch profiling (emits per-op GPU/CPU/ANE decisions to stderr at model load)
+cargo build --features coreml-profile
 ```
 
 ## Run Locally
@@ -118,3 +121,6 @@ To release: bump version in `Cargo.toml`, commit, push to `main`. The workflow h
 - Always run `cargo fmt --all` before pushing — CI fails `cargo fmt --all --check` even when all tests pass
 - `gh pr merge` requires `--admin` to bypass branch protection, or `--auto` to queue for merge after CI passes
 - After a squash-merged PR, reset local main with `git reset --hard origin/main` to avoid divergent merge commits
+- `sudo cmd > /tmp/file` silently fails on macOS (sudo password prompt is swallowed by redirect) — use `sudo sh -c 'cmd > /tmp/file'` instead
+- CoreML compiled MIL lives at `{BGE_M3_CACHE_DIR}/coreml/{hash}/N_dynamic_mlprogram/model/compiled_model.mlmodelc/model.mil` — useful for dispatch analysis and op tallying
+- `BGE_M3_MODEL=fp16` loads a smaller ONNX file into ORT, but CoreML compiles it to a FP32 compute graph internally; the memory saving (~1.08 GB vs ~2.16 GB) reflects ORT session weight loading only, not CoreML runtime precision
