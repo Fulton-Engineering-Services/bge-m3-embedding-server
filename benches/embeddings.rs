@@ -5,7 +5,9 @@
 // deserialization of the JSON shapes those types consume, which covers the
 // same JSON-parsing overhead without needing access to internal modules.
 
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
+use std::hint::black_box;
+
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 
 // ---------------------------------------------------------------------------
 // bench_text_input_deser
