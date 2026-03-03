@@ -124,6 +124,10 @@ else
         ORT_CMAKE="$ORT_VENV/bin/cmake"
         info "Using CMake: $ORT_CMAKE ($("$ORT_CMAKE" --version | head -1))"
 
+        # Detect Homebrew prefix (Apple Silicon: /opt/homebrew; Intel: /usr/local).
+        # Used both for PATH sanitisation and for CMAKE_IGNORE_PREFIX_PATH below.
+        HOMEBREW_PREFIX="$(brew --prefix 2>/dev/null || echo /opt/homebrew)"
+
         # Build a sanitized PATH for the ORT build subprocess:
         #   - Prepend $ORT_VENV/bin so cmake, ctest, and cpack from the venv are
         #     found by build.py even on machines with no system CMake installed.
@@ -160,6 +164,15 @@ else
         #     lets find_package(Protobuf) find the Homebrew install even when
         #     CMAKE_PREFIX_PATH is empty. Clearing it at the cmake level closes that
         #     last search path.
+        #   - CMAKE_IGNORE_PREFIX_PATH (CMake 3.23+, passed as cmake define): The
+        #     nuclear option — explicitly excludes the Homebrew prefix from ALL CMake
+        #     find operations (find_package, find_library, find_path, find_program).
+        #     This closes any remaining Homebrew protobuf discovery path regardless of
+        #     which mechanism CMake uses (config files, module mode, package registry,
+        #     etc.). Required because even with CMAKE_SYSTEM_PREFIX_PATH cleared,
+        #     cmake can still find Homebrew's protobuf v33 headers via include paths
+        #     set from a prior find_package(Protobuf) result, causing coreml_proto
+        #     compilation to fail with 'unknown type name PROTOBUF_NAMESPACE_OPEN'.
         (
             unset CMAKE_PREFIX_PATH PKG_CONFIG_PATH
             cd "$ORT_SOURCE_DIR"
@@ -177,7 +190,8 @@ else
                     CMAKE_OSX_ARCHITECTURES=arm64 \
                     onnxruntime_BUILD_UNIT_TESTS=OFF \
                     onnxruntime_BUILD_SHARED_LIB=OFF \
-                    CMAKE_SYSTEM_PREFIX_PATH=
+                    CMAKE_SYSTEM_PREFIX_PATH= \
+                    "CMAKE_IGNORE_PREFIX_PATH=$HOMEBREW_PREFIX"
         )
 
         [[ -f "$ORT_OUTPUT_DIR/Release/libonnxruntime_common.a" ]] || \
