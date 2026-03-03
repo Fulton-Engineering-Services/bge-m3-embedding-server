@@ -269,11 +269,7 @@ fn load_sparse_weights() -> (ndarray::Array1<f32>, f32) {
 fn tokenize_batch(
     tokenizer: &tokenizers::Tokenizer,
     texts: &[impl AsRef<str>],
-) -> (
-    ndarray::Array2<i64>,
-    ndarray::Array2<i64>,
-    ndarray::Array2<i64>,
-) {
+) -> (ndarray::Array2<i64>, ndarray::Array2<i64>) {
     assert!(!texts.is_empty(), "tokenize_batch requires non-empty input");
     let str_refs: Vec<&str> = texts.iter().map(AsRef::as_ref).collect();
     let encodings = tokenizer
@@ -291,8 +287,7 @@ fn tokenize_batch(
         .expect("input_ids shape mismatch");
     let mask = ndarray::Array2::from_shape_vec((batch_len, seq_len), mask_flat)
         .expect("attention_mask shape mismatch");
-    let type_ids = ndarray::Array2::<i64>::zeros((batch_len, seq_len));
-    (ids, mask, type_ids)
+    (ids, mask)
 }
 
 fn bench_embed_dense(
@@ -304,16 +299,14 @@ fn bench_embed_dense(
 ) -> Vec<Vec<f32>> {
     let mut all = Vec::with_capacity(texts.len());
     for chunk in texts.chunks(batch_size) {
-        let (ids, mask, type_ids) = tokenize_batch(tokenizer, chunk);
+        let (ids, mask) = tokenize_batch(tokenizer, chunk);
         let ids_t = TensorRef::from_array_view(ids.view()).expect("ids tensor");
         let mask_t = TensorRef::from_array_view(mask.view()).expect("mask tensor");
-        let type_t = TensorRef::from_array_view(type_ids.view()).expect("type_ids tensor");
         let mut sess = session.borrow_mut();
         let outputs = sess
             .run(ort::inputs! {
                 "input_ids" => ids_t,
                 "attention_mask" => mask_t,
-                "token_type_ids" => type_t,
             })
             .expect("session.run failed");
 
@@ -386,16 +379,13 @@ fn bench_embed_sparse(
             .expect("input_ids shape mismatch");
         let mask = ndarray::Array2::from_shape_vec((batch_len, seq_len), mask_flat)
             .expect("attention_mask shape mismatch");
-        let type_ids = ndarray::Array2::<i64>::zeros((batch_len, seq_len));
         let ids_t = TensorRef::from_array_view(ids.view()).expect("ids tensor");
         let mask_t = TensorRef::from_array_view(mask.view()).expect("mask tensor");
-        let type_t = TensorRef::from_array_view(type_ids.view()).expect("type_ids tensor");
         let mut sess = session.borrow_mut();
         let outputs = sess
             .run(ort::inputs! {
                 "input_ids" => ids_t,
                 "attention_mask" => mask_t,
-                "token_type_ids" => type_t,
             })
             .expect("session.run failed");
         // FP32: token_embeddings [batch, seq, 1024].
