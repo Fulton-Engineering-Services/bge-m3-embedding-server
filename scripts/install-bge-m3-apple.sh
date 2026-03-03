@@ -139,22 +139,31 @@ else
         fi
 
         info "Running ORT build (this takes 15-30 minutes on first run)..."
-        cd "$ORT_SOURCE_DIR"
-        PATH="$ORT_BUILD_PATH" python3 tools/ci_build/build.py \
-            --cmake_path "$ORT_CMAKE" \
-            --build_dir "$ORT_OUTPUT_DIR" \
-            --config Release \
-            --parallel \
-            --compile_no_warning_as_error \
-            --skip_tests \
-            --osx_arch arm64 \
-            --apple_deploy_target 13.0 \
-            --use_coreml \
-            --cmake_extra_defines \
-                CMAKE_OSX_ARCHITECTURES=arm64 \
-                onnxruntime_BUILD_UNIT_TESTS=OFF \
-                onnxruntime_BUILD_SHARED_LIB=OFF
-        cd "$BGE_M3_REPO"
+        # Run inside a subshell so all environment changes are automatically
+        # discarded on exit.
+        #   - CMAKE_PREFIX_PATH: Homebrew injects this (e.g. /opt/homebrew), causing
+        #     CMake's find_package(Protobuf) to discover Homebrew's protobuf v33/v4
+        #     headers even when protoc is not on PATH. Unsetting it forces CMake to
+        #     use only ORT's bundled protobuf v21.12.
+        #   - PKG_CONFIG_PATH: cleared for the same reason.
+        (
+            unset CMAKE_PREFIX_PATH PKG_CONFIG_PATH
+            cd "$ORT_SOURCE_DIR"
+            PATH="$ORT_BUILD_PATH" python3 tools/ci_build/build.py \
+                --cmake_path "$ORT_CMAKE" \
+                --build_dir "$ORT_OUTPUT_DIR" \
+                --config Release \
+                --parallel \
+                --compile_no_warning_as_error \
+                --skip_tests \
+                --osx_arch arm64 \
+                --apple_deploy_target 13.0 \
+                --use_coreml \
+                --cmake_extra_defines \
+                    CMAKE_OSX_ARCHITECTURES=arm64 \
+                    onnxruntime_BUILD_UNIT_TESTS=OFF \
+                    onnxruntime_BUILD_SHARED_LIB=OFF
+        )
 
         [[ -f "$ORT_OUTPUT_DIR/Release/libonnxruntime_common.a" ]] || \
             error "ORT build completed but libonnxruntime_common.a not found at $ORT_OUTPUT_DIR/Release/"
