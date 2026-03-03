@@ -1,6 +1,6 @@
 # Performance
 
-MLAS vs CoreML benchmark results, the `BGE_M3_ONNX_BATCH_SIZE` OOM fix, and memory footprint analysis for the BGE-M3 embedding server on Apple Silicon.
+This document covers MLAS vs CoreML benchmark results, the `BGE_M3_ONNX_BATCH_SIZE` OOM fix, and memory footprint analysis for the BGE-M3 embedding server on Apple Silicon.
 
 ## Overview
 
@@ -256,11 +256,11 @@ Production service on MacBook Pro M3 Max (128 GB), `BGE_M3_WORKERS=2`, `BGE_M3_I
 | `neural` | 6.4 MB (peak 14 MB) | CoreML framework init (linked, idle) |
 | **Total footprint** | **14 GB** | |
 
-**Weight accounting:** The BGE-M3 ONNX model is 2.1 GB on disk. ORT loads weights independently per session:
+**Weight accounting:** The BGE-M3 ONNX model is 2.16 GB on disk. ORT loads weights independently per session:
 
 ```
-2 workers × 2 sessions/worker (dense + sparse) × 2.1 GB = 8.4 GB model weights
-+ ORT overhead (graph, execution plan, intermediate buffers) ≈ 5.6 GB
+2 workers × 2 sessions/worker (dense + sparse) × 2.16 GB = 8.6 GB model weights
++ ORT overhead (graph, execution plan, intermediate buffers) ≈ 5.4 GB
 = ~14 GB total
 ```
 
