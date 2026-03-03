@@ -185,3 +185,9 @@ All configuration is read once at startup from environment variables via
 | `BGE_M3_MAX_BATCH` | `256` | Max texts per request (min 1) |
 | `BGE_M3_IDLE_TIMEOUT_SECS` | `300` | Idle unload timeout; `0` disables |
 | `BGE_M3_ONNX_BATCH_SIZE` | `8` (macOS) / `256` (other) | Max texts per `session.run()` call; chunked to avoid CoreML OOM |
+| `BGE_M3_MODEL` | `fp32` | Model variant: `fp32` = BAAI/bge-m3 (~2.16 GB/session); `fp16` = Xenova/bge-m3 (~1.08 GB/session). FP16 recommended for Apple Silicon. See [docs/model-variants.md](model-variants.md). |
+
+> **Apple Silicon:** A `.cargo/config.toml` with `rustflags = ["-C", "target-cpu=native"]`
+> for `aarch64-apple-darwin` is committed in the repo. This enables M2+ instruction set
+> extensions (i8mm, bf16) beyond the M1 baseline. CI and Docker builds are unaffected
+> (they target `x86_64-unknown-linux-gnu` or `aarch64-unknown-linux-gnu`).
