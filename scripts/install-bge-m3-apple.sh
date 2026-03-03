@@ -124,15 +124,18 @@ else
         ORT_CMAKE="$ORT_VENV/bin/cmake"
         info "Using CMake: $ORT_CMAKE ($("$ORT_CMAKE" --version | head -1))"
 
-        # ORT v1.23.2 builds its own protobuf v21.12 from source. A system protoc on
-        # PATH (e.g. from 'brew install protobuf') causes CMake's FindProtobuf to find
-        # it, mixing headers/libraries from different protobuf versions. Strip any
-        # directory containing a system protoc from PATH for this build only.
-        ORT_BUILD_PATH="$PATH"
+        # Build a sanitized PATH for the ORT build subprocess:
+        #   - Prepend $ORT_VENV/bin so cmake, ctest, and cpack from the venv are
+        #     found by build.py even on machines with no system CMake installed.
+        #   - Strip any directory containing a system protoc: ORT v1.23.2 builds its
+        #     own protobuf v21.12 from source, and a system protoc (e.g. from
+        #     'brew install protobuf') causes CMake's FindProtobuf to pick it up,
+        #     mixing incompatible headers/libraries during ONNX proto compilation.
+        ORT_BUILD_PATH="$ORT_VENV/bin:$PATH"
         if command -v protoc >/dev/null 2>&1; then
             PROTOC_DIR="$(dirname "$(command -v protoc)")"
             warn "System protoc found at $PROTOC_DIR/protoc — excluding from ORT build PATH to prevent protobuf version conflict"
-            ORT_BUILD_PATH="$(echo "$PATH" | tr ':' '\n' | grep -Fxv "$PROTOC_DIR" | tr '\n' ':' | sed 's/:$//')"
+            ORT_BUILD_PATH="$(echo "$ORT_BUILD_PATH" | tr ':' '\n' | grep -Fxv "$PROTOC_DIR" | tr '\n' ':' | sed 's/:$//')"
         fi
 
         info "Running ORT build (this takes 15-30 minutes on first run)..."
