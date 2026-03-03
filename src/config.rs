@@ -1,6 +1,20 @@
 use std::env;
 use std::time::Duration;
 
+/// ONNX model variant to load.
+///
+/// Controlled by `BGE_M3_MODEL`. Defaults to [`ModelVariant::Fp32`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelVariant {
+    /// BAAI/bge-m3 FP32 model (~2.16 GB per session).
+    /// Default for Docker and Linux deployments.
+    Fp32,
+    /// Xenova/bge-m3 FP16 model (~1.08 GB per session).
+    /// Recommended for Apple Silicon; ANE-native format.
+    /// Reduces peak memory by ~50% per worker vs FP32.
+    Fp16,
+}
+
 /// Runtime configuration loaded from environment variables.
 ///
 /// All fields are read once at startup via [`Config::from_env`]. Changes to
@@ -47,6 +61,10 @@ pub struct Config {
     /// When unloaded, models are automatically reloaded on the next incoming request.
     /// The reload blocks the request until complete (~10–30 s from cache).
     pub idle_timeout: Option<Duration>,
+    /// ONNX model variant to load.
+    ///
+    /// Set with `BGE_M3_MODEL`. Accepts `"fp16"` or `"fp32"`. Defaults to `"fp32"`.
+    pub model_variant: ModelVariant,
 }
 
 impl Config {
@@ -81,6 +99,11 @@ impl Config {
             .unwrap_or(300);
         let idle_timeout = (idle_timeout_secs > 0).then(|| Duration::from_secs(idle_timeout_secs));
 
+        let model_variant = match lookup("BGE_M3_MODEL").as_deref() {
+            Some("fp16") => ModelVariant::Fp16,
+            _ => ModelVariant::Fp32,
+        };
+
         Self {
             cache_dir: lookup("BGE_M3_CACHE_DIR").unwrap_or_else(|| "/cache".to_string()),
             bind_addr: lookup("BGE_M3_BIND").unwrap_or_else(|| "0.0.0.0:8081".to_string()),
@@ -88,6 +111,7 @@ impl Config {
             max_batch,
             onnx_batch_size,
             idle_timeout,
+            model_variant,
         }
     }
 }
@@ -111,6 +135,7 @@ mod tests {
         assert_eq!(cfg.workers, 2);
         assert_eq!(cfg.max_batch, 256);
         assert_eq!(cfg.idle_timeout, Some(Duration::from_secs(300)));
+        assert_eq!(cfg.model_variant, ModelVariant::Fp32);
         // Platform-specific: macOS=8 (CoreML OOM guard), other=256
         let expected_onnx: usize = if cfg!(target_os = "macos") { 8 } else { 256 };
         assert_eq!(cfg.onnx_batch_size, expected_onnx);
@@ -199,5 +224,29 @@ mod tests {
         let cfg = Config::from_lookup(lookup_from(&map));
 
         assert_eq!(cfg.onnx_batch_size, 1);
+    }
+
+    #[test]
+    fn model_variant_defaults_to_fp32() {
+        let map = HashMap::new();
+        let cfg = Config::from_lookup(lookup_from(&map));
+
+        assert_eq!(cfg.model_variant, ModelVariant::Fp32);
+    }
+
+    #[test]
+    fn model_variant_fp16_when_set() {
+        let map = HashMap::from([("BGE_M3_MODEL", "fp16")]);
+        let cfg = Config::from_lookup(lookup_from(&map));
+
+        assert_eq!(cfg.model_variant, ModelVariant::Fp16);
+    }
+
+    #[test]
+    fn model_variant_unknown_value_falls_back_to_fp32() {
+        let map = HashMap::from([("BGE_M3_MODEL", "invalid")]);
+        let cfg = Config::from_lookup(lookup_from(&map));
+
+        assert_eq!(cfg.model_variant, ModelVariant::Fp32);
     }
 }
