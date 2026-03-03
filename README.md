@@ -2,9 +2,10 @@
 
 # bge-m3-embedding-server
 
-An Axum HTTP server that wraps [fastembed-rs](https://github.com/Anush008/fastembed-rs) to serve
-BGE-M3 dense and sparse embeddings. It exposes an OpenAI-compatible `/v1/embeddings` endpoint for
-dense vectors and a `/v1/sparse-embeddings` endpoint for SPLADE-style sparse vectors.
+An Axum HTTP server serving BGE-M3 dense and sparse embeddings via direct
+[ONNX Runtime](https://onnxruntime.ai/) integration. It exposes an OpenAI-compatible
+`/v1/embeddings` endpoint for dense vectors and a `/v1/sparse-embeddings` endpoint for
+SPLADE-style sparse token weights.
 
 ## Quick Start
 
@@ -49,27 +50,35 @@ Full OpenAPI 3.1 specification: [`openapi.yaml`](./openapi.yaml)
 |----------|--------|-------------|
 | `/v1/embeddings` | `POST` | Dense embeddings — OpenAI-compatible |
 | `/v1/sparse-embeddings` | `POST` | Sparse embeddings — BGE-M3 SPLADE-style |
+| `/v1/models` | `GET` | Fleet discovery — returns the `bge-m3` model entry |
 | `/health` | `GET` | Readiness probe with worker pool status |
 
 ### `GET /health`
 
-Returns `200 OK` once the worker pool is fully initialized. Returns `503 Service Unavailable`
-while the models are loading.
+Returns the worker pool status as JSON. Five possible states:
+
+| HTTP | `status` | Meaning |
+|------|----------|---------|
+| `200` | `ok` | All workers healthy, models loaded |
+| `200` | `warn` | Some workers exited; remaining workers are operational |
+| `200` | `idle` | Models unloaded after idle timeout; will auto-reload on next request |
+| `503` | `loading` | Models still initializing at startup |
+| `503` | `fail` | All worker threads have exited (fatal) |
 
 ```bash
 curl http://localhost:8081/health
 ```
 
-**Response (ready)**
+**Response (`ok`)**
 
-```
-200 OK
+```json
+{"status":"ok","workers":{"live":2,"total":2}}
 ```
 
-**Response (loading)**
+**Response (`loading`)**
 
-```
-503 Service Unavailable
+```json
+{"status":"loading"}
 ```
 
 ---
@@ -185,6 +194,9 @@ All configuration is via environment variables.
 | `BGE_M3_BIND` | `0.0.0.0:8081` | TCP bind address |
 | `BGE_M3_WORKERS` | `2` | Worker thread count (each loads its own model; min 1) |
 | `BGE_M3_MAX_BATCH` | `256` | Maximum texts per request (min 1) |
+| `BGE_M3_IDLE_TIMEOUT_SECS` | `300` | Seconds of inactivity before models are unloaded from memory; `0` disables idle unloading |
+| `BGE_M3_ONNX_BATCH_SIZE` | `8` (macOS) / `256` (other) | Texts per `session.run()` call. Defaults to `8` on macOS to avoid CoreML OOM kills |
+| `BGE_M3_LOG_FORMAT` | (text) | Set to `json` for structured JSON log output |
 
 ## Docker
 
@@ -230,9 +242,9 @@ graph TD
     Sparse["POST /v1/sparse-embeddings"]
     Health["GET /health"]
     Channel["Bounded mpsc Channel<br/>(Arc&lt;Mutex&lt;Receiver&gt;&gt;)"]
-    W0["Worker 0<br/>(spawn_blocking)<br/>TextEmbedding +<br/>SparseTextEmbedding"]
-    W1["Worker 1<br/>(spawn_blocking)<br/>TextEmbedding +<br/>SparseTextEmbedding"]
-    Wn["Worker N<br/>(spawn_blocking)<br/>TextEmbedding +<br/>SparseTextEmbedding"]
+    W0["Worker 0<br/>(spawn_blocking)<br/>ORT Session"]
+    W1["Worker 1<br/>(spawn_blocking)<br/>ORT Session"]
+    Wn["Worker N<br/>(spawn_blocking)<br/>ORT Session"]
     Reply["oneshot reply channel"]
     Response["JSON Response"]
 
@@ -253,13 +265,18 @@ graph TD
 
 **Key design decisions:**
 
-- Each worker loads its own model instance inside `spawn_blocking` to avoid blocking the async
-  runtime during ONNX inference.
+- Each worker loads a single ORT session inside `spawn_blocking` that produces both dense and
+  sparse outputs from one ONNX model, avoiding async runtime blocking during inference.
 - The shared `Arc<tokio::sync::Mutex<Receiver>>` lets all workers compete for work from a single
   channel, providing natural load balancing without a separate dispatcher.
-- An `AtomicBool` readiness flag is set after every worker finishes loading. The `/health`
-  endpoint returns `503` until all workers are ready.
-- `tower-http::TraceLayer` provides per-request tracing spans at the HTTP layer.
+- An `AtomicBool` readiness flag is set only after all workers have loaded **and** a warm-up probe
+  runs both dense and sparse inference end-to-end. The `/health` endpoint returns `503 loading`
+  until this completes.
+- After `BGE_M3_IDLE_TIMEOUT_SECS` of inactivity, workers drop their model instances to free
+  memory. Models reload transparently on the next request (~10–30 s from cache). Workers themselves
+  never exit — only the model instances are unloaded.
+- `tower-http::TraceLayer` + `SetRequestIdLayer` provide per-request tracing and `X-Request-ID`
+  header propagation.
 
 ## License
 
