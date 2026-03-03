@@ -61,16 +61,23 @@ and GPU. CoreML dispatches to the GPU via Metal Performance Shaders (MPS).
 This is the active dispatch path for BGE-M3: 99.5% of compute ops run on the
 GPU through CoreML.
 
-### Neural Engine (ANE) — blocked by dynamic shapes
+### Neural Engine (ANE) — partial dispatch with FP16 MLProgram
 
 The ANE is a discrete NPU on the SoC targeting fixed-precision inference
 (INT8, FP16). The M4 ANE delivers 38 TOPS across 16 cores — roughly 3× faster
 than the GPU for compatible models.
 
 BGE-M3 has two dynamic input dimensions: both `batch_size` and `sequence_length`
-are variable. The ANE requires fully static tensor shapes to compile its model
-representation. Because neither input dimension is static, the ANE is ineligible
-for BGE-M3 inference. CoreML routes all subgraphs to the GPU instead.
+are variable. Shape-dependent compute ops (MatMul, attention) require static
+tensor shapes for ANE compilation and route to the GPU instead. However,
+shape-independent ops such as dtype casts remain eligible for ANE dispatch
+regardless of dynamic inputs. With the FP16 model compiled to `MLProgram` format,
+`ProfileComputePlan` confirms an `ios18.cast` op dispatches to
+`MLNeuralEngineComputeDevice`. The bulk transformer compute (MatMul, attention,
+FFN) remains on the GPU, consistent with Activity Monitor GPU utilization during
+inference. The `ios18.cast` op name is specific to the macOS 15 / iOS 18
+`MLProgram` runtime; it represents a dtype conversion at compute-unit handoff
+boundaries and carries zero estimated cost.
 
 ## Dependency Chain
 
@@ -283,8 +290,9 @@ Opset:       ai.onnx v11
 Producer:    PyTorch 2.1.2
 ```
 
-Both input dimensions are dynamic. This is the primary reason the ANE is
-ineligible — it requires fully static shapes.
+Both input dimensions are dynamic. Shape-dependent ops (MatMul, attention)
+require fully static shapes for ANE compilation and route to the GPU. The ANE
+handles boundary cast ops (`ios18.cast`) regardless of dynamic inputs.
 
 ### Op Census (2,495 total, 28 unique types)
 
@@ -352,8 +360,8 @@ Unsqueeze
 
 | Compute Unit | Requires Static Shapes? | Accessible for BGE-M3? |
 |-------------|------------------------|----------------------|
-| Neural Engine (ANE) | Yes — hard requirement | **No** — both input dims are dynamic |
-| GPU (Metal) | No | Yes — active dispatch path |
+| Neural Engine (ANE) | For shape-dependent ops | **Partial** — boundary cast ops (`ios18.cast`) confirmed by `ProfileComputePlan`; bulk compute (MatMul, attention) stays on GPU |
+| GPU (Metal) | No | Yes — primary dispatch path for transformer compute |
 | CPU (Accelerate → AMX) | No | Yes — via CoreML `CPUOnly` mode |
 | CPU (MLAS NEON) | No | Yes — CPU EP fallback for 9 unsupported ops |
 
@@ -363,8 +371,8 @@ Unsqueeze
 |---------|--------------|---------------------|
 | `All` (default) | CoreML decides GPU vs CPU per-subgraph | **Recommended** — routes to GPU via Metal |
 | `CPUOnly` | All CoreML ops → Accelerate → AMX | **Slower than MLAS** — CoreML `CPUOnly` adds EP overhead without GPU benefit; see `docs/performance.md` for benchmarks |
-| `CPUAndGPU` | GPU + CPU (ANE excluded by dynamic shapes) | Equivalent to `All` for BGE-M3 — ANE already excluded |
-| `CPUAndNeuralEngine` | Falls back entirely to CPU (ANE blocked by dynamic shapes) | No benefit over `CPUOnly`; no ANE dispatch occurs |
+| `CPUAndGPU` | GPU + CPU (ANE excluded) | Effectively equivalent to `All` for BGE-M3 — the ANE only handles zero-cost cast boundary ops |
+| `CPUAndNeuralEngine` | ANE + CPU (GPU excluded) | Not recommended — without GPU, all MatMul/attention ops fall to CPU; throughput regresses despite ANE cast dispatch |
 
 The recommended setting is `All` (the default). `CPUOnly` through CoreML is
 measurably slower than the CPU EP using MLAS NEON kernels directly — the

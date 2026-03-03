@@ -116,7 +116,11 @@ The Apple Neural Engine (ANE) operates natively in FP16. With an FP32 model, Cor
 - More ops may be eligible for ANE dispatch (the `coreml-profile` feature flag reveals per-op dispatch decisions at model load).
 - The compiled CoreML model cache file is smaller because the weights are stored in FP16.
 
-However, BGE-M3's dynamic sequence length prevents full ANE eligibility regardless of model precision — the ANE requires statically-shaped inputs. See [coreml-ep.md](coreml-ep.md) for the dynamic shape analysis. The potential latency improvement from expanded ANE coverage is a future investigation, not current behavior.
+With the FP16 model, `ProfileComputePlan` confirms that an `ios18.cast` op
+dispatches to `MLNeuralEngineComputeDevice` — boundary cast operations are
+ANE-eligible even with dynamic inputs. Shape-dependent compute ops (MatMul,
+attention) require fully static shapes for ANE compilation and remain on the
+GPU. See [coreml-ep.md](coreml-ep.md) for the full dispatch analysis.
 
 ## 6. Sparse Embedding Stability
 
