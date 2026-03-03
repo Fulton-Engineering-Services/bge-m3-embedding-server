@@ -11,8 +11,8 @@ with optional CoreML EP acceleration on Apple Silicon.
 ```mermaid
 graph TB
     subgraph Clients
-        KnowledgeBase["mcp-local-knowledge-base"]
-        Coordinator["dpos-coordinator"]
+        KnowledgeBase["knowledge-base-server"]
+        Coordinator["distributed-fleet-coordinator"]
     end
 
     subgraph "bge-m3-embedding-server"
