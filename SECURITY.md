@@ -13,7 +13,7 @@ Older versions receive no security updates. Please upgrade to the latest release
 
 **Please do not report security vulnerabilities through public GitHub issues.**
 
-Report vulnerabilities privately via GitHub's [Security Advisories](https://github.com/fultonengineeringservices/bge-m3-axum-fastembed-rs/security/advisories/new).
+Report vulnerabilities privately via GitHub's [Security Advisories](https://github.com/Fulton-Engineering-Services/bge-m3-embedding-server/security/advisories/new).
 
 You can expect:
 - Acknowledgement within 48 hours

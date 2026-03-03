@@ -1,6 +1,6 @@
 # Apple Silicon Build Target
 
-This document describes how `bge-m3-axum-fastembed-rs` builds, links, and
+This document describes how `bge-m3-embedding-server` builds, links, and
 executes on Apple Silicon (aarch64-apple-darwin). It covers the hardware
 compute units available on M-series chips, what the current build chain
 actually uses (and what it leaves on the table), the Rust release profile,
@@ -85,7 +85,7 @@ reaching the prebuilt static library:
 
 ```mermaid
 graph TD
-    App["bge-m3-axum-fastembed-rs<br/><code>Cargo.toml</code>"]
+    App["bge-m3-embedding-server<br/><code>Cargo.toml</code>"]
     FE["fastembed = &quot;5&quot;<br/>features: default"]
     ORT["ort = &quot;=2.0.0-rc.11&quot;<br/>features: ndarray, std"]
     SYS["ort-sys = &quot;2.0.0-rc.9&quot;<br/>build.rs downloads binary"]
@@ -320,7 +320,7 @@ The script:
 2. Builds from source if no binary is provided:
    ```bash
    cargo build --release --target aarch64-apple-darwin \
-       --manifest-path ../bge-m3-axum-fastembed-rs/Cargo.toml
+       --manifest-path ../bge-m3-embedding-server/Cargo.toml
    ```
 3. Installs the binary to `~/.local/bin/bge-m3-apple`
 4. Creates the model cache directory at `~/.cache/bge-m3`

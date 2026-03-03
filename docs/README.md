@@ -1,6 +1,6 @@
 # Documentation
 
-Design documentation for `bge-m3-axum-fastembed-rs`.
+Design documentation for `bge-m3-embedding-server`.
 
 | Document | Description |
 |----------|-------------|

@@ -141,7 +141,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2af50177e190e07a26ab74f8b1efbfe2ef87da2116221318cb1c2e82baf7de06"
 
 [[package]]
-name = "bge-m3-axum-fastembed-rs"
+name = "bge-m3-embedding-server"
 version = "0.8.0"
 dependencies = [
  "anyhow",

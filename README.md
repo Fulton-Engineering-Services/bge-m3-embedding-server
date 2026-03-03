@@ -1,6 +1,6 @@
-[![CI](https://github.com/Fulton-Engineering-Services/bge-m3-axum-fastembed-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/Fulton-Engineering-Services/bge-m3-axum-fastembed-rs/actions/workflows/ci.yml) [![Release](https://github.com/Fulton-Engineering-Services/bge-m3-axum-fastembed-rs/actions/workflows/release.yml/badge.svg)](https://github.com/Fulton-Engineering-Services/bge-m3-axum-fastembed-rs/actions/workflows/release.yml) [![codecov](https://codecov.io/gh/Fulton-Engineering-Services/bge-m3-axum-fastembed-rs/graph/badge.svg?token=CODECOV_TOKEN)](https://codecov.io/gh/Fulton-Engineering-Services/bge-m3-axum-fastembed-rs) [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](LICENSE-MIT) [![Docker Image](https://img.shields.io/badge/docker-ghcr.io-blue)](https://github.com/Fulton-Engineering-Services/bge-m3-axum-fastembed-rs/pkgs/container/bge-m3-axum-fastembed-rs)
+[![CI](https://github.com/Fulton-Engineering-Services/bge-m3-embedding-server/actions/workflows/ci.yml/badge.svg)](https://github.com/Fulton-Engineering-Services/bge-m3-embedding-server/actions/workflows/ci.yml) [![Release](https://github.com/Fulton-Engineering-Services/bge-m3-embedding-server/actions/workflows/release.yml/badge.svg)](https://github.com/Fulton-Engineering-Services/bge-m3-embedding-server/actions/workflows/release.yml) [![codecov](https://codecov.io/gh/Fulton-Engineering-Services/bge-m3-embedding-server/graph/badge.svg?token=CODECOV_TOKEN)](https://codecov.io/gh/Fulton-Engineering-Services/bge-m3-embedding-server) [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](LICENSE-MIT) [![Docker Image](https://img.shields.io/badge/docker-ghcr.io-blue)](https://github.com/Fulton-Engineering-Services/bge-m3-embedding-server/pkgs/container/bge-m3-embedding-server)
 
-# bge-m3-axum-fastembed-rs
+# bge-m3-embedding-server
 
 An Axum HTTP server that wraps [fastembed-rs](https://github.com/Anush008/fastembed-rs) to serve
 BGE-M3 dense and sparse embeddings. It exposes an OpenAI-compatible `/v1/embeddings` endpoint for
@@ -191,7 +191,7 @@ All configuration is via environment variables.
 ### Build
 
 ```bash
-docker build -t bge-m3-axum-fastembed-rs .
+docker build -t bge-m3-embedding-server .
 ```
 
 ### Run
@@ -202,7 +202,7 @@ Mount a host directory as `/cache` so the model files persist across container r
 docker run --rm \
   -p 8081:8081 \
   -v /path/to/model-cache:/cache \
-  bge-m3-axum-fastembed-rs
+  bge-m3-embedding-server
 ```
 
 Override workers and batch size at runtime:
@@ -213,7 +213,7 @@ docker run --rm \
   -v /path/to/model-cache:/cache \
   -e BGE_M3_WORKERS=4 \
   -e BGE_M3_MAX_BATCH=128 \
-  bge-m3-axum-fastembed-rs
+  bge-m3-embedding-server
 ```
 
 The container includes a built-in `HEALTHCHECK` that polls `GET /health` every 10 seconds.

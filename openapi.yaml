@@ -1,6 +1,6 @@
 openapi: "3.1.0"
 info:
-  title: bge-m3-axum-fastembed-rs
+  title: bge-m3-embedding-server
   description: |
     HTTP server serving BGE-M3 dense and sparse embeddings via fastembed-rs.
 
@@ -11,7 +11,7 @@ info:
   license:
     name: MIT OR Apache-2.0
   contact:
-    url: https://github.com/fultonengineeringservices/bge-m3-axum-fastembed-rs
+    url: https://github.com/Fulton-Engineering-Services/bge-m3-embedding-server
 
 servers:
   - url: http://localhost:8081

@@ -31,7 +31,7 @@ When a coding task is complete, run the following in order:
 6. **Push** (uses multi-account pattern — see suggested_commands.md):
    ```bash
    TOKEN=$(gh auth token --user jpfulton-fultonengineeringservices)
-   git push "https://jpfulton-fultonengineeringservices:${TOKEN}@github.com/Fulton-Engineering-Services/bge-m3-axum-fastembed-rs.git"
+   git push "https://jpfulton-fultonengineeringservices:${TOKEN}@github.com/Fulton-Engineering-Services/bge-m3-embedding-server.git"
    ```
 
 ## For Releases

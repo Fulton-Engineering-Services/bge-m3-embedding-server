@@ -1,6 +1,6 @@
 # Architecture Overview
 
-`bge-m3-axum-fastembed-rs` is an Axum HTTP server that serves **BGE-M3
+`bge-m3-embedding-server` is an Axum HTTP server that serves **BGE-M3
 dense and sparse embeddings** over an OpenAI-compatible REST API via direct
 [ONNX Runtime](https://onnxruntime.ai/) integration. It is designed for
 low-latency, concurrent inference in Docker-based and native deployments,
@@ -15,7 +15,7 @@ graph TB
         Coordinator["dpos-coordinator"]
     end
 
-    subgraph "bge-m3-axum-fastembed-rs"
+    subgraph "bge-m3-embedding-server"
         Router["Axum Router<br/>(tower middleware)"]
         Handlers["Request Handlers<br/>(dense / sparse / health / models)"]
         AppState["AppState<br/>(pool, ready flag, config)"]

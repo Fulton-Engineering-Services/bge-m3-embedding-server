@@ -30,11 +30,11 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 RUN useradd --system --no-create-home --shell /sbin/nologin bge
 
-COPY --from=builder /app/target/release/bge-m3-axum-fastembed-rs /usr/local/bin/
+COPY --from=builder /app/target/release/bge-m3-embedding-server /usr/local/bin/
 USER bge
 
 HEALTHCHECK --interval=10s --timeout=3s --start-period=120s --retries=3 \
     CMD /bin/bash -c 'echo > /dev/tcp/localhost/8081' 2>/dev/null || exit 1
 
 EXPOSE 8081
-CMD ["bge-m3-axum-fastembed-rs"]
+CMD ["bge-m3-embedding-server"]
