@@ -39,7 +39,7 @@ coreml-profile = []
 ## Let ort-sys download a prebuilt ONNX Runtime binary during build.
 ## Used in CI where ORT_LIB_LOCATION is unavailable. Never enable in
 ## production builds — use ORT_LIB_LOCATION with a locally built ORT instead.
-download-ort = ["ort/download-binaries"]
+download-ort = ["ort/download-binaries", "ort/tls-native"]
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
