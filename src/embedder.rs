@@ -1240,7 +1240,11 @@ mod tests {
             "XENOVA_REPO_REVISION mismatch: \
              src/embedder.rs ({embedder}) != benches/coreml.rs ({bench})"
         );
-        assert_eq!(embedder.len(), 40, "XENOVA_REPO_REVISION should be a 40-char SHA");
+        assert_eq!(
+            embedder.len(),
+            40,
+            "XENOVA_REPO_REVISION should be a 40-char SHA"
+        );
         assert!(
             embedder.chars().all(|c| c.is_ascii_hexdigit()),
             "XENOVA_REPO_REVISION should be hexadecimal"

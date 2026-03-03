@@ -592,7 +592,11 @@ fn bench_sparse(c: &mut Criterion) {
 ///
 ///   `BGE_M3_MODEL=fp16` cargo bench --bench coreml -- quality
 ///   `BGE_M3_MODEL=int8` cargo bench --bench coreml -- quality
-#[allow(clippy::too_many_lines, clippy::cast_precision_loss, clippy::cast_sign_loss)]
+#[allow(
+    clippy::too_many_lines,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss
+)]
 fn bench_quality(c: &mut Criterion) {
     let variant = bench_model_variant();
     if variant == "fp32" {
@@ -669,10 +673,7 @@ fn bench_quality(c: &mut Criterion) {
         .map(|(a, b)| a.iter().zip(b.iter()).map(|(x, y)| x * y).sum())
         .collect();
     let dense_mean: f32 = dense_sims.iter().sum::<f32>() / dense_sims.len() as f32;
-    let dense_min: f32 = dense_sims
-        .iter()
-        .copied()
-        .fold(f32::INFINITY, f32::min);
+    let dense_min: f32 = dense_sims.iter().copied().fold(f32::INFINITY, f32::min);
     let mut dense_sorted = dense_sims.clone();
     dense_sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let p5_idx = dense_sorted.len() / 20; // 5th percentile index: floor(n * 0.05)
@@ -704,10 +705,7 @@ fn bench_quality(c: &mut Criterion) {
         })
         .collect();
     let sparse_mean: f32 = sparse_sims.iter().sum::<f32>() / sparse_sims.len() as f32;
-    let sparse_min: f32 = sparse_sims
-        .iter()
-        .copied()
-        .fold(f32::INFINITY, f32::min);
+    let sparse_min: f32 = sparse_sims.iter().copied().fold(f32::INFINITY, f32::min);
     let mut sparse_sorted = sparse_sims.clone();
     sparse_sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let sparse_p5_idx = sparse_sorted.len() / 20; // 5th percentile index: floor(n * 0.05)
@@ -723,18 +721,15 @@ fn bench_quality(c: &mut Criterion) {
     // Benchmark the similarity computation itself (pure dot-product cost).
     let mut group = c.benchmark_group("quality");
     group.sample_size(10);
-    group.bench_function(
-        format!("dense_cosine_sim_{variant}_vs_fp32"),
-        |b| {
-            b.iter(|| {
-                let _: Vec<f32> = std::hint::black_box(&fp32_dense)
-                    .iter()
-                    .zip(std::hint::black_box(&variant_dense).iter())
-                    .map(|(a, bv)| a.iter().zip(bv.iter()).map(|(x, y)| x * y).sum::<f32>())
-                    .collect();
-            });
-        },
-    );
+    group.bench_function(format!("dense_cosine_sim_{variant}_vs_fp32"), |b| {
+        b.iter(|| {
+            let _: Vec<f32> = std::hint::black_box(&fp32_dense)
+                .iter()
+                .zip(std::hint::black_box(&variant_dense).iter())
+                .map(|(a, bv)| a.iter().zip(bv.iter()).map(|(x, y)| x * y).sum::<f32>())
+                .collect();
+        });
+    });
     group.finish();
 }
 
