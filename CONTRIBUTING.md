@@ -1,13 +1,13 @@
 # Contributing
 
-Thank you for your interest in contributing to bge-m3-axum-fastembed-rs!
+Thank you for your interest in contributing to bge-m3-embedding-server!
 
 ## Quick Start
 
 ```bash
 # Clone and build
-git clone https://github.com/fultonengineeringservices/bge-m3-axum-fastembed-rs
-cd bge-m3-axum-fastembed-rs
+git clone https://github.com/Fulton-Engineering-Services/bge-m3-embedding-server
+cd bge-m3-embedding-server
 cargo build
 
 # Run the full test suite (does not require model download)

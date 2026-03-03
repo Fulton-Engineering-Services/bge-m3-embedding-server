@@ -98,7 +98,7 @@ async fn main() -> anyhow::Result<()> {
         max_batch = cfg.max_batch,
         cache_dir = %cfg.cache_dir,
         idle_timeout_secs = cfg.idle_timeout.map(|d| d.as_secs()),
-        "Starting bge-m3-axum-fastembed-rs"
+        "Starting bge-m3-embedding-server"
     );
 
     let (pool, init_handle) = EmbedPool::spawn(

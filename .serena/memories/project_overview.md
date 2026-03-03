@@ -1,4 +1,4 @@
-# bge-m3-axum-fastembed-rs — Project Overview
+# bge-m3-embedding-server — Project Overview
 
 ## Purpose
 Axum HTTP server wrapping `fastembed-rs` to serve BGE-M3 dense and sparse (SPLADE-style) embeddings over HTTP. Provides an OpenAI-compatible `/v1/embeddings` endpoint plus a custom `/v1/sparse-embeddings` endpoint.
@@ -29,4 +29,4 @@ Axum HTTP server wrapping `fastembed-rs` to serve BGE-M3 dense and sparse (SPLAD
 Current: 0.8.0 (Cargo.toml)
 
 ## Repository
-GitHub: Fulton-Engineering-Services/bge-m3-axum-fastembed-rs
+GitHub: Fulton-Engineering-Services/bge-m3-embedding-server

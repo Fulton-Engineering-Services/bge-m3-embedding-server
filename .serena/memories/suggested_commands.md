@@ -36,8 +36,8 @@ First run downloads ~2GB of BGE-M3 ONNX models. Server ready when logs show "rea
 
 ## Docker
 ```bash
-docker build -t bge-m3-axum-fastembed-rs .
-docker run --rm -p 8081:8081 -v /path/to/model-cache:/cache bge-m3-axum-fastembed-rs
+docker build -t bge-m3-embedding-server .
+docker run --rm -p 8081:8081 -v /path/to/model-cache:/cache bge-m3-embedding-server
 ```
 
 ## Benchmarks
@@ -48,7 +48,7 @@ cargo bench --bench embeddings   # requires running model instance
 ## Git Push (multi-account — FES repos require jpfulton-fultonengineeringservices)
 ```bash
 TOKEN=$(gh auth token --user jpfulton-fultonengineeringservices)
-git push "https://jpfulton-fultonengineeringservices:${TOKEN}@github.com/Fulton-Engineering-Services/bge-m3-axum-fastembed-rs.git"
+git push "https://jpfulton-fultonengineeringservices:${TOKEN}@github.com/Fulton-Engineering-Services/bge-m3-embedding-server.git"
 ```
 
 ## Release

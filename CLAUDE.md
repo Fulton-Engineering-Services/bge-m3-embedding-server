@@ -1,4 +1,4 @@
-# CLAUDE.md — bge-m3-axum-fastembed-rs
+# CLAUDE.md — bge-m3-embedding-server
 
 Axum HTTP server serving BGE-M3 dense and sparse embeddings via direct ONNX Runtime integration.
 
@@ -87,13 +87,13 @@ The server uses a **worker pool** pattern to handle concurrent embedding request
 
 ```bash
 # Build
-docker build -t bge-m3-axum-fastembed-rs .
+docker build -t bge-m3-embedding-server .
 
 # Run (mount a host directory to persist the model cache across restarts)
 docker run --rm \
   -p 8081:8081 \
   -v /path/to/model-cache:/cache \
-  bge-m3-axum-fastembed-rs
+  bge-m3-embedding-server
 ```
 
 The container exposes port `8081`. The built-in `HEALTHCHECK` polls `/health` every 10 seconds
