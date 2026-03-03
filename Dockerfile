@@ -12,11 +12,11 @@ ENV PATH="/root/.cargo/bin:${PATH}"
 WORKDIR /app
 
 # Cache dependency compilation by building a dummy binary first.
-# benches/ stub is required because [[bench]] targets must exist for manifest parse,
-# even though cargo build --release does not compile bench targets.
+# benches/ stubs are required for all [[bench]] targets because Cargo validates source
+# paths at manifest parse time, even though cargo build --release skips bench compilation.
 COPY Cargo.toml Cargo.lock ./
 RUN mkdir src && echo "fn main(){}" > src/main.rs \
-    && mkdir benches && touch benches/embeddings.rs \
+    && mkdir benches && touch benches/embeddings.rs benches/coreml.rs \
     && cargo build --release \
     && rm -rf src benches
 
