@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-03-03
+
+### Changed
+- Repository renamed from `bge-m3-axum-fastembed-rs` to `bge-m3-embedding-server`
+
 ## [0.6.0] - 2026-02-23
 
 ### Added
@@ -83,7 +88,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Multi-arch Docker images (linux/amd64, linux/arm64) via GHCR
 - Automated release workflow via GitHub Actions
 
-[Unreleased]: https://github.com/Fulton-Engineering-Services/bge-m3-embedding-server/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/Fulton-Engineering-Services/bge-m3-embedding-server/compare/v0.9.0...HEAD
+[0.9.0]: https://github.com/Fulton-Engineering-Services/bge-m3-embedding-server/compare/v0.6.0...v0.9.0
 [0.6.0]: https://github.com/Fulton-Engineering-Services/bge-m3-embedding-server/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/Fulton-Engineering-Services/bge-m3-embedding-server/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/Fulton-Engineering-Services/bge-m3-embedding-server/compare/v0.3.0...v0.4.0
