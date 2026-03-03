@@ -15,6 +15,12 @@
 #   - CMake (brew install cmake)
 #   - Python 3 (for ORT build system)
 #
+# Note on protobuf: ORT v1.23.2 fetches and builds its own protobuf v21.12 from
+# source. A system protoc on PATH (e.g. from 'brew install protobuf') causes
+# CMake's FindProtobuf to pick it up, producing a version mismatch with ORT's
+# bundled libprotobuf. This script automatically removes system protoc from PATH
+# for the ORT build step — no manual action required.
+#
 # What this script builds:
 #   1. ONNX Runtime from source with CoreML EP enabled (FES fork with
 #      external-data-path fix required for BGE-M3 CoreML EP support)
@@ -118,9 +124,20 @@ else
         ORT_CMAKE="$ORT_VENV/bin/cmake"
         info "Using CMake: $ORT_CMAKE ($("$ORT_CMAKE" --version | head -1))"
 
+        # ORT v1.23.2 builds its own protobuf v21.12 from source. A system protoc on
+        # PATH (e.g. from 'brew install protobuf') causes CMake's FindProtobuf to find
+        # it, mixing headers/libraries from different protobuf versions. Strip any
+        # directory containing a system protoc from PATH for this build only.
+        ORT_BUILD_PATH="$PATH"
+        if command -v protoc >/dev/null 2>&1; then
+            PROTOC_DIR="$(dirname "$(command -v protoc)")"
+            warn "System protoc found at $PROTOC_DIR/protoc — excluding from ORT build PATH to prevent protobuf version conflict"
+            ORT_BUILD_PATH="$(echo "$PATH" | tr ':' '\n' | grep -Fxv "$PROTOC_DIR" | tr '\n' ':' | sed 's/:$//')"
+        fi
+
         info "Running ORT build (this takes 15-30 minutes on first run)..."
         cd "$ORT_SOURCE_DIR"
-        python3 tools/ci_build/build.py \
+        PATH="$ORT_BUILD_PATH" python3 tools/ci_build/build.py \
             --cmake_path "$ORT_CMAKE" \
             --build_dir "$ORT_OUTPUT_DIR" \
             --config Release \
