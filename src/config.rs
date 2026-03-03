@@ -13,6 +13,12 @@ pub enum ModelVariant {
     /// Recommended for Apple Silicon; ANE-native format.
     /// Reduces peak memory by ~50% per worker vs FP32.
     Fp16,
+    /// Xenova/bge-m3 INT8 quantized model (~568 MB per session).
+    /// Weights-only quantization; ORT dequantizes to f32 internally.
+    /// `CoreML` may not dispatch INT8 ops to ANE — validate dispatch with
+    /// `cargo build --features coreml-profile`. Reduces peak memory by
+    /// ~75% per worker vs FP32. Validate embedding quality before deploying.
+    Int8,
 }
 
 /// Runtime configuration loaded from environment variables.
@@ -63,7 +69,7 @@ pub struct Config {
     pub idle_timeout: Option<Duration>,
     /// ONNX model variant to load.
     ///
-    /// Set with `BGE_M3_MODEL`. Accepts `"fp16"` or `"fp32"`. Defaults to `"fp32"`.
+    /// Set with `BGE_M3_MODEL`. Accepts `"fp32"`, `"fp16"`, or `"int8"`. Defaults to `"fp32"`.
     pub model_variant: ModelVariant,
 }
 
@@ -101,6 +107,7 @@ impl Config {
 
         let model_variant = match lookup("BGE_M3_MODEL").as_deref() {
             Some("fp16") => ModelVariant::Fp16,
+            Some("int8") => ModelVariant::Int8,
             _ => ModelVariant::Fp32,
         };
 
@@ -240,6 +247,14 @@ mod tests {
         let cfg = Config::from_lookup(lookup_from(&map));
 
         assert_eq!(cfg.model_variant, ModelVariant::Fp16);
+    }
+
+    #[test]
+    fn model_variant_int8_when_set() {
+        let map = HashMap::from([("BGE_M3_MODEL", "int8")]);
+        let cfg = Config::from_lookup(lookup_from(&map));
+
+        assert_eq!(cfg.model_variant, ModelVariant::Int8);
     }
 
     #[test]

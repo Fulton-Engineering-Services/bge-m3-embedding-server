@@ -78,7 +78,7 @@ fn download_model_files(
 ) -> Result<ModelFiles> {
     let (repo_id, repo_revision) = match variant {
         ModelVariant::Fp32 => (REPO_ID, REPO_REVISION),
-        ModelVariant::Fp16 => (XENOVA_REPO_ID, XENOVA_REPO_REVISION),
+        ModelVariant::Fp16 | ModelVariant::Int8 => (XENOVA_REPO_ID, XENOVA_REPO_REVISION),
     };
 
     let api = hf_hub::api::sync::ApiBuilder::new()
@@ -108,6 +108,9 @@ fn download_model_files(
         ModelVariant::Fp16 => repo
             .get("onnx/model_fp16.onnx")
             .map_err(|e| anyhow::anyhow!("Failed to get onnx/model_fp16.onnx: {e}"))?,
+        ModelVariant::Int8 => repo
+            .get("onnx/model_int8.onnx")
+            .map_err(|e| anyhow::anyhow!("Failed to get onnx/model_int8.onnx: {e}"))?,
     };
 
     let tokenizer_path = repo
@@ -262,9 +265,10 @@ fn tokenize_to_arrays(
 /// Produces L2-normalized dense embeddings.
 ///
 /// For `ModelVariant::Fp32`, reads `sentence_embedding` [batch, 1024] — already
-/// CLS-pooled by the BAAI/bge-m3 export. For `ModelVariant::Fp16`, reads
-/// `last_hidden_state` [batch, seq, 1024] and CLS-pools by selecting position 0.
-/// ORT promotes FP16 tensor values to f32 during `try_extract_array::<f32>()`.
+/// CLS-pooled by the BAAI/bge-m3 export. For `ModelVariant::Fp16` and
+/// `ModelVariant::Int8`, reads `last_hidden_state` [batch, seq, 1024] and
+/// CLS-pools by selecting position 0. ORT promotes FP16/INT8 tensor values to
+/// f32 during `try_extract_array::<f32>()`.
 #[allow(clippy::cast_possible_truncation)]
 fn embed_dense(
     session: &mut ort::session::Session,
@@ -288,13 +292,13 @@ fn embed_dense(
         })?;
 
         // FP32: sentence_embedding [batch, 1024] — pre-pooled CLS output.
-        // FP16: last_hidden_state [batch, seq, 1024] — CLS token at position 0.
+        // FP16/INT8: last_hidden_state [batch, seq, 1024] — CLS token at position 0.
         // Both branches produce an owned ArrayD<f32> with shape [batch, 1024].
         let emb: ndarray::ArrayD<f32> = match model_variant {
             ModelVariant::Fp32 => outputs["sentence_embedding"]
                 .try_extract_array::<f32>()?
                 .to_owned(),
-            ModelVariant::Fp16 => {
+            ModelVariant::Fp16 | ModelVariant::Int8 => {
                 let lhs = outputs["last_hidden_state"].try_extract_array::<f32>()?;
                 lhs.index_axis(ndarray::Axis(1), 0).to_owned()
             }
@@ -317,7 +321,8 @@ fn embed_dense(
 /// Produces sparse embeddings via the BGE-M3 sparse-linear projection.
 ///
 /// Reads per-token hidden states [batch, seq, 1024] — `token_embeddings` for
-/// `ModelVariant::Fp32`, `last_hidden_state` for `ModelVariant::Fp16` — and
+/// `ModelVariant::Fp32`, `last_hidden_state` for `ModelVariant::Fp16` and
+/// `ModelVariant::Int8` — and
 /// projects each token through the sparse-linear weight vector, applies `ReLU`,
 /// and max-pools across token positions sharing the same vocabulary ID.
 #[allow(clippy::cast_possible_truncation)]
@@ -345,10 +350,12 @@ fn embed_sparse(
         })?;
 
         // FP32: token_embeddings [batch, seq, 1024].
-        // FP16: last_hidden_state [batch, seq, 1024] — same shape, different key.
+        // FP16/INT8: last_hidden_state [batch, seq, 1024] — same shape, different key.
         let token_emb = match model_variant {
             ModelVariant::Fp32 => outputs["token_embeddings"].try_extract_array::<f32>()?,
-            ModelVariant::Fp16 => outputs["last_hidden_state"].try_extract_array::<f32>()?,
+            ModelVariant::Fp16 | ModelVariant::Int8 => {
+                outputs["last_hidden_state"].try_extract_array::<f32>()?
+            }
         };
 
         for (i, enc) in encodings.iter().enumerate() {
@@ -1180,15 +1187,14 @@ mod tests {
     // REPO_REVISION drift detection (ARC-3)
     // -----------------------------------------------------------------------
 
-    /// Extracts the `REPO_REVISION` constant value from a source file by reading
-    /// it as text and finding the `const REPO_REVISION: &str = "...";` line.
-    fn extract_repo_revision(path: &str) -> String {
+    /// Extracts a `const {const_name}: &str = "..."` value from a source file.
+    fn extract_const_str(path: &str, const_name: &str) -> String {
+        let prefix = format!("const {const_name}");
         let content =
             std::fs::read_to_string(path).unwrap_or_else(|e| panic!("failed to read {path}: {e}"));
         for line in content.lines() {
             let trimmed = line.trim();
-            if trimmed.starts_with("const REPO_REVISION") {
-                // Extract the quoted value between the first pair of double quotes
+            if trimmed.starts_with(&prefix) {
                 let start = trimmed.find('"').expect("missing opening quote");
                 let end = trimmed[start + 1..]
                     .find('"')
@@ -1196,14 +1202,14 @@ mod tests {
                 return trimmed[start + 1..start + 1 + end].to_string();
             }
         }
-        panic!("REPO_REVISION not found in {path}");
+        panic!("{const_name} not found in {path}");
     }
 
     #[test]
     fn repo_revision_consistent_across_all_copies() {
-        let embedder = extract_repo_revision("src/embedder.rs");
-        let bench = extract_repo_revision("benches/coreml.rs");
-        let example = extract_repo_revision("examples/fp16_eval.rs");
+        let embedder = extract_const_str("src/embedder.rs", "REPO_REVISION");
+        let bench = extract_const_str("benches/coreml.rs", "REPO_REVISION");
+        let example = extract_const_str("examples/fp16_eval.rs", "REPO_REVISION");
 
         assert_eq!(
             embedder, bench,
@@ -1218,6 +1224,23 @@ mod tests {
         assert!(
             embedder.chars().all(|c| c.is_ascii_hexdigit()),
             "REPO_REVISION should be hexadecimal"
+        );
+    }
+
+    #[test]
+    fn xenova_repo_revision_consistent_across_all_copies() {
+        let embedder = extract_const_str("src/embedder.rs", "XENOVA_REPO_REVISION");
+        let bench = extract_const_str("benches/coreml.rs", "XENOVA_REPO_REVISION");
+
+        assert_eq!(
+            embedder, bench,
+            "XENOVA_REPO_REVISION mismatch: \
+             src/embedder.rs ({embedder}) != benches/coreml.rs ({bench})"
+        );
+        assert_eq!(embedder.len(), 40, "XENOVA_REPO_REVISION should be a 40-char SHA");
+        assert!(
+            embedder.chars().all(|c| c.is_ascii_hexdigit()),
+            "XENOVA_REPO_REVISION should be hexadecimal"
         );
     }
 

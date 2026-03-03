@@ -75,6 +75,10 @@ fn cache_dir() -> PathBuf {
     PathBuf::from(std::env::var("BGE_M3_CACHE_DIR").unwrap_or_else(|_| "/tmp/bge-m3-cache".into()))
 }
 
+fn bench_model_variant() -> String {
+    std::env::var("BGE_M3_MODEL").unwrap_or_else(|_| "fp32".into())
+}
+
 /// Returns the ONNX sub-batch size.
 ///
 /// `CoreML` EPs use 8 to avoid `MLProgram` `FastPrediction` workspace OOM;
@@ -122,6 +126,12 @@ fn build_execution_providers(cache: &Path) -> Vec<ort::ep::ExecutionProviderDisp
 
 const REPO_ID: &str = "BAAI/bge-m3";
 const REPO_REVISION: &str = "5617a9f61b028005a4858fdac845db406aefb181";
+
+const XENOVA_REPO_ID: &str = "Xenova/bge-m3";
+/// Pinned HF commit for Xenova/bge-m3 FP16 and INT8 models.
+/// Must match `XENOVA_REPO_REVISION` in src/embedder.rs.
+const XENOVA_REPO_REVISION: &str = "4de13258303883538bd53b696b452bf8099f0858";
+
 const MAX_SEQ_LENGTH: usize = 512;
 const SPECIAL_TOKENS: [u32; 4] = [0, 1, 2, 3];
 
@@ -138,6 +148,24 @@ struct BenchModels {
 // but is not warranted for the current project size.
 
 fn load_bench_models(cache: &Path, eps: Vec<ort::ep::ExecutionProviderDispatch>) -> BenchModels {
+    load_bench_models_for_variant(cache, eps, &bench_model_variant())
+}
+
+/// Loads model files and builds a session for the given variant string.
+///
+/// - `"fp16"` → Xenova/bge-m3 `onnx/model_fp16.onnx`
+/// - `"int8"` → Xenova/bge-m3 `onnx/model_int8.onnx`
+/// - anything else → BAAI/bge-m3 `onnx/model.onnx` (FP32)
+fn load_bench_models_for_variant(
+    cache: &Path,
+    eps: Vec<ort::ep::ExecutionProviderDispatch>,
+    variant: &str,
+) -> BenchModels {
+    let (repo_id, repo_revision) = match variant {
+        "fp16" | "int8" => (XENOVA_REPO_ID, XENOVA_REPO_REVISION),
+        _ => (REPO_ID, REPO_REVISION),
+    };
+
     let api = hf_hub::api::sync::ApiBuilder::new()
         .with_cache_dir(cache.to_path_buf())
         .with_progress(true)
@@ -145,18 +173,29 @@ fn load_bench_models(cache: &Path, eps: Vec<ort::ep::ExecutionProviderDispatch>)
         .expect("Failed to build hf-hub API");
 
     let repo = api.repo(hf_hub::Repo::with_revision(
-        REPO_ID.to_string(),
+        repo_id.to_string(),
         hf_hub::RepoType::Model,
-        REPO_REVISION.to_string(),
+        repo_revision.to_string(),
     ));
 
-    let onnx_path = repo
-        .get("onnx/model.onnx")
-        .expect("Failed to get model.onnx");
-    repo.get("onnx/model.onnx_data")
-        .expect("Failed to get model.onnx_data");
-    repo.get("onnx/Constant_7_attr__value")
-        .expect("Failed to get Constant_7");
+    let onnx_path = match variant {
+        "fp16" => repo
+            .get("onnx/model_fp16.onnx")
+            .expect("Failed to get model_fp16.onnx"),
+        "int8" => repo
+            .get("onnx/model_int8.onnx")
+            .expect("Failed to get model_int8.onnx"),
+        _ => {
+            let path = repo
+                .get("onnx/model.onnx")
+                .expect("Failed to get model.onnx");
+            repo.get("onnx/model.onnx_data")
+                .expect("Failed to get model.onnx_data");
+            repo.get("onnx/Constant_7_attr__value")
+                .expect("Failed to get Constant_7");
+            path
+        }
+    };
 
     let tokenizer_path = repo
         .get("tokenizer.json")
@@ -261,6 +300,7 @@ fn bench_embed_dense(
     tokenizer: &tokenizers::Tokenizer,
     texts: &[impl AsRef<str>],
     batch_size: usize,
+    variant: &str,
 ) -> Vec<Vec<f32>> {
     let mut all = Vec::with_capacity(texts.len());
     for chunk in texts.chunks(batch_size) {
@@ -276,19 +316,43 @@ fn bench_embed_dense(
                 "token_type_ids" => type_t,
             })
             .expect("session.run failed");
-        let emb = outputs["sentence_embedding"]
-            .try_extract_array::<f32>()
-            .expect("Failed to extract sentence_embedding");
-        for i in 0..chunk.len() {
-            let row = emb.index_axis(ndarray::Axis(0), i);
-            let slice = row.as_slice().expect("contiguous");
-            let norm: f32 = slice.iter().map(|x| x * x).sum::<f32>().sqrt();
-            let normalized: Vec<f32> = if norm > 0.0 {
-                slice.iter().map(|x| x / norm).collect()
-            } else {
-                slice.to_vec()
-            };
-            all.push(normalized);
+
+        // FP32: sentence_embedding [batch, 1024] — pre-pooled CLS.
+        // FP16/INT8: last_hidden_state [batch, seq, 1024] — CLS at position 0.
+        match variant {
+            "fp16" | "int8" => {
+                let lhs = outputs["last_hidden_state"]
+                    .try_extract_array::<f32>()
+                    .expect("Failed to extract last_hidden_state");
+                let cls = lhs.index_axis(ndarray::Axis(1), 0); // [batch, 1024]
+                for i in 0..chunk.len() {
+                    let row = cls.index_axis(ndarray::Axis(0), i);
+                    let slice = row.as_slice().expect("contiguous");
+                    let norm: f32 = slice.iter().map(|x| x * x).sum::<f32>().sqrt();
+                    let normalized: Vec<f32> = if norm > 0.0 {
+                        slice.iter().map(|x| x / norm).collect()
+                    } else {
+                        slice.to_vec()
+                    };
+                    all.push(normalized);
+                }
+            }
+            _ => {
+                let emb = outputs["sentence_embedding"]
+                    .try_extract_array::<f32>()
+                    .expect("Failed to extract sentence_embedding");
+                for i in 0..chunk.len() {
+                    let row = emb.index_axis(ndarray::Axis(0), i);
+                    let slice = row.as_slice().expect("contiguous");
+                    let norm: f32 = slice.iter().map(|x| x * x).sum::<f32>().sqrt();
+                    let normalized: Vec<f32> = if norm > 0.0 {
+                        slice.iter().map(|x| x / norm).collect()
+                    } else {
+                        slice.to_vec()
+                    };
+                    all.push(normalized);
+                }
+            }
         }
     }
     all
@@ -301,6 +365,7 @@ fn bench_embed_sparse(
     batch_size: usize,
     weight: &ndarray::Array1<f32>,
     bias: f32,
+    variant: &str,
 ) -> Vec<HashMap<usize, f32>> {
     let weight_view = weight.view();
     let mut all = Vec::with_capacity(texts.len());
@@ -333,9 +398,15 @@ fn bench_embed_sparse(
                 "token_type_ids" => type_t,
             })
             .expect("session.run failed");
-        let token_emb = outputs["token_embeddings"]
+        // FP32: token_embeddings [batch, seq, 1024].
+        // FP16/INT8: last_hidden_state [batch, seq, 1024] — same shape, different key.
+        let output_key = match variant {
+            "fp16" | "int8" => "last_hidden_state",
+            _ => "token_embeddings",
+        };
+        let token_emb = outputs[output_key]
             .try_extract_array::<f32>()
-            .expect("Failed to extract token_embeddings");
+            .expect("Failed to extract token embeddings");
         for (i, enc) in encodings.iter().enumerate() {
             let ids = enc.get_ids();
             let attn = enc.get_attention_mask();
@@ -380,8 +451,9 @@ fn bench_dense(c: &mut Criterion) {
     let eps = build_execution_providers(&cache);
     let label = ep_name();
     let onnx_bs = onnx_batch_size();
+    let variant = bench_model_variant();
 
-    eprintln!("[bench] Loading model with EP={label} ...");
+    eprintln!("[bench] Loading model with EP={label}, variant={variant} ...");
     let models = load_bench_models(&cache, eps);
 
     // Warmup — triggers CoreML model compilation on first run.
@@ -391,6 +463,7 @@ fn bench_dense(c: &mut Criterion) {
         &models.tokenizer,
         &["warmup text for CoreML compilation"],
         onnx_bs,
+        &variant,
     );
     eprintln!("[bench] Dense model ready.");
 
@@ -408,7 +481,7 @@ fn bench_dense(c: &mut Criterion) {
         let single = &scenario.texts[0..1];
         group.bench_with_input(BenchmarkId::new("single", *name), &single, |b, texts| {
             b.iter(|| {
-                bench_embed_dense(&models.session, &models.tokenizer, texts, onnx_bs);
+                bench_embed_dense(&models.session, &models.tokenizer, texts, onnx_bs, &variant);
             });
         });
 
@@ -417,7 +490,7 @@ fn bench_dense(c: &mut Criterion) {
             &scenario.texts,
             |b, texts| {
                 b.iter(|| {
-                    bench_embed_dense(&models.session, &models.tokenizer, texts, onnx_bs);
+                    bench_embed_dense(&models.session, &models.tokenizer, texts, onnx_bs, &variant);
                 });
             },
         );
@@ -436,8 +509,9 @@ fn bench_sparse(c: &mut Criterion) {
     let eps = build_execution_providers(&cache);
     let label = ep_name();
     let onnx_bs = onnx_batch_size();
+    let variant = bench_model_variant();
 
-    eprintln!("[bench] Loading model with EP={label} (for sparse) ...");
+    eprintln!("[bench] Loading model with EP={label}, variant={variant} (for sparse) ...");
     let models = load_bench_models(&cache, eps);
     let (weight, bias) = load_sparse_weights();
 
@@ -449,6 +523,7 @@ fn bench_sparse(c: &mut Criterion) {
         onnx_bs,
         &weight,
         bias,
+        &variant,
     );
     eprintln!("[bench] Sparse model ready.");
 
@@ -473,6 +548,7 @@ fn bench_sparse(c: &mut Criterion) {
                     onnx_bs,
                     &weight,
                     bias,
+                    &variant,
                 );
             });
         });
@@ -489,6 +565,7 @@ fn bench_sparse(c: &mut Criterion) {
                         onnx_bs,
                         &weight,
                         bias,
+                        &variant,
                     );
                 });
             },
@@ -499,8 +576,171 @@ fn bench_sparse(c: &mut Criterion) {
 }
 
 // ---------------------------------------------------------------------------
+// Quality benchmark — cosine similarity vs FP32 baseline
+// ---------------------------------------------------------------------------
+
+/// Compares embedding quality of the configured variant against the FP32 baseline.
+///
+/// Skipped automatically when `BGE_M3_MODEL=fp32` (no comparison needed).
+///
+/// For each scenario in the corpus, embeds all texts with both FP32 (MLAS,
+/// no EPs) and the configured variant, then reports cosine similarity stats
+/// to stderr. Dense embeddings are already L2-normalized so dot-product
+/// equals cosine similarity directly.
+///
+/// Usage:
+///
+///   `BGE_M3_MODEL=fp16` cargo bench --bench coreml -- quality
+///   `BGE_M3_MODEL=int8` cargo bench --bench coreml -- quality
+#[allow(clippy::too_many_lines, clippy::cast_precision_loss, clippy::cast_sign_loss)]
+fn bench_quality(c: &mut Criterion) {
+    let variant = bench_model_variant();
+    if variant == "fp32" {
+        eprintln!("[quality] Skipping: BGE_M3_MODEL=fp32, no comparison baseline needed.");
+        return;
+    }
+
+    let corpus = load_corpus();
+    let cache = cache_dir();
+    let onnx_bs = onnx_batch_size();
+    let (weight, bias) = load_sparse_weights();
+
+    // Collect all texts in sorted-scenario order for deterministic results.
+    let mut names: Vec<&String> = corpus.scenarios.keys().collect();
+    names.sort();
+    let all_texts: Vec<String> = names
+        .iter()
+        .flat_map(|n| corpus.scenarios[*n].texts.iter().cloned())
+        .collect();
+
+    eprintln!("[quality] Loading FP32 baseline (MLAS, no EPs) for {variant} comparison ...");
+    let fp32_models = load_bench_models_for_variant(&cache, vec![], "fp32");
+
+    eprintln!("[quality] Loading {variant} variant ...");
+    let variant_eps = build_execution_providers(&cache);
+    let variant_models = load_bench_models_for_variant(&cache, variant_eps, &variant);
+
+    eprintln!(
+        "[quality] Computing FP32 reference embeddings ({} texts) ...",
+        all_texts.len()
+    );
+    let fp32_dense = bench_embed_dense(
+        &fp32_models.session,
+        &fp32_models.tokenizer,
+        &all_texts,
+        onnx_bs,
+        "fp32",
+    );
+    let fp32_sparse = bench_embed_sparse(
+        &fp32_models.session,
+        &fp32_models.tokenizer,
+        &all_texts,
+        onnx_bs,
+        &weight,
+        bias,
+        "fp32",
+    );
+
+    eprintln!(
+        "[quality] Computing {variant} embeddings ({} texts) ...",
+        all_texts.len()
+    );
+    let variant_dense = bench_embed_dense(
+        &variant_models.session,
+        &variant_models.tokenizer,
+        &all_texts,
+        onnx_bs,
+        &variant,
+    );
+    let variant_sparse = bench_embed_sparse(
+        &variant_models.session,
+        &variant_models.tokenizer,
+        &all_texts,
+        onnx_bs,
+        &weight,
+        bias,
+        &variant,
+    );
+
+    // Dense cosine similarity (embeddings are L2-normalized → dot product = cosine).
+    let dense_sims: Vec<f32> = fp32_dense
+        .iter()
+        .zip(variant_dense.iter())
+        .map(|(a, b)| a.iter().zip(b.iter()).map(|(x, y)| x * y).sum())
+        .collect();
+    let dense_mean: f32 = dense_sims.iter().sum::<f32>() / dense_sims.len() as f32;
+    let dense_min: f32 = dense_sims
+        .iter()
+        .copied()
+        .fold(f32::INFINITY, f32::min);
+    let mut dense_sorted = dense_sims.clone();
+    dense_sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let p5_idx = (dense_sorted.len() / 20).max(1) - 1; // 5th percentile index
+    let dense_p5 = dense_sorted[p5_idx];
+    eprintln!(
+        "[quality] Dense  {variant} vs fp32 — n={}, mean={:.6}, p5={:.6}, min={:.6}",
+        dense_sims.len(),
+        dense_mean,
+        dense_p5,
+        dense_min,
+    );
+
+    // Sparse cosine similarity over HashMap representation.
+    let sparse_sims: Vec<f32> = fp32_sparse
+        .iter()
+        .zip(variant_sparse.iter())
+        .map(|(ref_map, var_map)| {
+            let dot: f32 = ref_map
+                .iter()
+                .filter_map(|(k, v)| var_map.get(k).map(|w| v * w))
+                .sum();
+            let norm_a: f32 = ref_map.values().map(|v| v * v).sum::<f32>().sqrt();
+            let norm_b: f32 = var_map.values().map(|v| v * v).sum::<f32>().sqrt();
+            if norm_a > 0.0 && norm_b > 0.0 {
+                dot / (norm_a * norm_b)
+            } else {
+                0.0
+            }
+        })
+        .collect();
+    let sparse_mean: f32 = sparse_sims.iter().sum::<f32>() / sparse_sims.len() as f32;
+    let sparse_min: f32 = sparse_sims
+        .iter()
+        .copied()
+        .fold(f32::INFINITY, f32::min);
+    let mut sparse_sorted = sparse_sims.clone();
+    sparse_sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let sparse_p5_idx = (sparse_sorted.len() / 20).max(1) - 1;
+    let sparse_p5 = sparse_sorted[sparse_p5_idx];
+    eprintln!(
+        "[quality] Sparse {variant} vs fp32 — n={}, mean={:.6}, p5={:.6}, min={:.6}",
+        sparse_sims.len(),
+        sparse_mean,
+        sparse_p5,
+        sparse_min,
+    );
+
+    // Benchmark the similarity computation itself (pure dot-product cost).
+    let mut group = c.benchmark_group("quality");
+    group.sample_size(10);
+    group.bench_function(
+        format!("dense_cosine_sim_{variant}_vs_fp32"),
+        |b| {
+            b.iter(|| {
+                let _: Vec<f32> = std::hint::black_box(&fp32_dense)
+                    .iter()
+                    .zip(std::hint::black_box(&variant_dense).iter())
+                    .map(|(a, bv)| a.iter().zip(bv.iter()).map(|(x, y)| x * y).sum::<f32>())
+                    .collect();
+            });
+        },
+    );
+    group.finish();
+}
+
+// ---------------------------------------------------------------------------
 // Criterion harness
 // ---------------------------------------------------------------------------
 
-criterion_group!(benches, bench_dense, bench_sparse);
+criterion_group!(benches, bench_dense, bench_sparse, bench_quality);
 criterion_main!(benches);
