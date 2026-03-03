@@ -279,16 +279,16 @@ enabled by default for lowest latency on Apple Neural Engine.
 ## Architecture
 
 ```mermaid
-graph TD
+flowchart TD
     Client["HTTP Request"]
     Router["Axum Router"]
     Dense["POST /v1/embeddings"]
     Sparse["POST /v1/sparse-embeddings"]
     Health["GET /health"]
-    Channel["Bounded mpsc Channel<br/>(Arc&lt;Mutex&lt;Receiver&gt;&gt;)"]
-    W0["Worker 0<br/>(spawn_blocking)<br/>ORT Session"]
-    W1["Worker 1<br/>(spawn_blocking)<br/>ORT Session"]
-    Wn["Worker N<br/>(spawn_blocking)<br/>ORT Session"]
+    Channel["Bounded mpsc Channel\n(Arc(Mutex(Receiver)))"]
+    W0["Worker 0\nspawn_blocking\nORT Session"]
+    W1["Worker 1\nspawn_blocking\nORT Session"]
+    Wn["Worker N\nspawn_blocking\nORT Session"]
     Reply["oneshot reply channel"]
     Response["JSON Response"]
 
@@ -296,8 +296,8 @@ graph TD
     Router --> Dense
     Router --> Sparse
     Router --> Health
-    Dense -->|"EmbedRequest"| Channel
-    Sparse -->|"EmbedRequest"| Channel
+    Dense -- EmbedRequest --> Channel
+    Sparse -- EmbedRequest --> Channel
     Channel --> W0
     Channel --> W1
     Channel --> Wn
