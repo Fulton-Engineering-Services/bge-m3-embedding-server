@@ -73,7 +73,7 @@ The server starts accepting requests once model warm-up completes (watch logs fo
 | `BGE_M3_MAX_BATCH` | `256` | Maximum number of texts accepted per request (min 1) |
 | `BGE_M3_IDLE_TIMEOUT_SECS` | `300` | Seconds of inactivity before models are unloaded; `0` disables idle unloading |
 | `BGE_M3_ONNX_BATCH_SIZE` | `8` (macOS) / `256` (other) | Max texts per ONNX `session.run()` call. On macOS, CoreML `MLProgram` with `FastPrediction` pre-allocates the full intermediate-tensor workspace; BGE-M3 at batch=50×seq=512 can peak at ~35 GB, triggering Jetsam OOM kills. Chunking to 8 keeps peak under 6 GB. |
-| `BGE_M3_MODEL` | `fp32` | Model variant: `fp32` = `BAAI/bge-m3` (~2.16 GB/session); `fp16` = `Xenova/bge-m3` (~1.08 GB/session); `int8` = `Xenova/bge-m3` quantized (~568 MB/session). FP16 recommended for Apple Silicon; INT8 for maximum memory savings (validate ANE dispatch and embedding quality before deploying). |
+| `BGE_M3_MODEL` | `fp32` | Model variant: `fp32` = `BAAI/bge-m3` (~2.16 GB/session); `fp16` = `Xenova/bge-m3` (~1.08 GB/session); `int8` = `Xenova/bge-m3` quantized (~568 MB/session). FP16 recommended for Apple Silicon (numerically indistinguishable from FP32). INT8 for maximum memory savings; dense cosine similarity vs FP32: mean=0.976, p5=0.969, min=0.963 — see `docs/performance.md`. Validate ANE dispatch before deploying INT8. |
 
 ## Architecture
 

@@ -325,7 +325,7 @@ Estimated savings are relative to the CoreML 2-worker projection of 25–44 GB. 
 | # | Option | Est. Savings | Trade-off |
 |---|--------|-------------|-----------|
 | 8 | **FP16 model** | ~1.08 GB vs 2.16 GB per session (50%) | **Already the Apple Silicon production default** (set via LaunchAgent plist, `BGE_M3_MODEL=fp16`). No action required. |
-| 9 | **INT8 quantized model** | ~543 MB vs 2.16 GB per session (75%) | Largest per-session savings. CoreML may not dispatch INT8 to ANE. Must validate embedding quality (cosine similarity vs FP32). Available from `Xenova/bge-m3`. |
+| 9 | **INT8 quantized model** | ~568 MB vs 2.16 GB per session (74%) | Largest per-session savings. CoreML may not dispatch INT8 ops to ANE. Embedding quality validated — see [Embedding Quality](#embedding-quality) section below. Available from `Xenova/bge-m3`. |
 
 ### Memory projection by configuration
 
@@ -342,3 +342,36 @@ All estimates assume CoreML EP.
 | Shared session + FP16 × 1 worker | 1 | 1.08 GB × 1 = 1.1 GB | 3–22 GB × 1 | 6–10 GB |
 
 The most practical path is options 1 + 4 (1 worker, drop FastPrediction): **8–10 GB total**, beating the MLAS 2-worker baseline of 14 GB while preserving CoreML's 20–61% single-text latency advantage.
+
+## Embedding Quality
+
+Cosine similarity of each model variant vs the FP32 reference (`BAAI/bge-m3`), measured
+on the 184-text bench corpus using MLAS (CPU only, no CoreML EP) on Apple M-series.
+Run via `BGE_M3_MODEL=<variant> cargo bench --bench coreml -- quality`.
+
+### FP16 (`Xenova/bge-m3`, `onnx/model_fp16.onnx`)
+
+| Embedding type | n | mean | p5 | min |
+|----------------|---|------|----|-----|
+| Dense          | 184 | 0.999999 | 0.999999 | 0.999914 |
+| Sparse         | 184 | 1.000000 | 0.999999 | 0.999975 |
+
+FP16 is numerically indistinguishable from FP32 — all 184 texts score above 0.9999.
+ORT internally dequantizes FP16 weights to FP32 for compute, so there is no meaningful
+precision loss in practice.
+
+### INT8 (`Xenova/bge-m3`, `onnx/model_int8.onnx`)
+
+| Embedding type | n | mean | p5 | min |
+|----------------|---|------|----|-----|
+| Dense          | 184 | 0.976085 | 0.968588 | 0.962981 |
+| Sparse         | 184 | 0.994023 | 0.983805 | 0.974505 |
+
+INT8 uses weights-only quantization (Optimum). Dense embeddings drift more than sparse
+(min ~0.963 vs ~0.975), because rounding error accumulates across 24 transformer layers
+before CLS pooling. Sparse embeddings pass through one additional linear projection that
+partially averages the per-token error.
+
+**Verdict:** INT8 is acceptable for approximate nearest-neighbour search and semantic
+ranking tasks where cosine similarity > 0.96 is sufficient. Avoid INT8 for applications
+that require ranking precision within very small similarity margins (< 0.05 apart).
