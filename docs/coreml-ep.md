@@ -77,7 +77,23 @@ regardless of dynamic inputs. With the FP16 model compiled to `MLProgram` format
 FFN) remains on the GPU, consistent with Activity Monitor GPU utilization during
 inference. The `ios18.cast` op name is specific to the macOS 15 / iOS 18
 `MLProgram` runtime; it represents a dtype conversion at compute-unit handoff
-boundaries and carries zero estimated cost.
+boundaries.
+
+**Quantitative verification (Mac15,14, M3 Ultra Mac Studio):** `powermetrics
+--samplers cpu_power,gpu_power` at 1-second intervals over 40 samples confirms
+the operational picture: ANE power was 0 mW in 39 of 40 samples (2 mW in one
+sample — background noise), while GPU power ranged 1,506–4,000 mW throughout
+inference. The `ios18.cast` converts the attention mask from int32→fp32 — a
+tensor of 10–50 values (~40–200 bytes). This is sub-microsecond work, well below
+the ~1 mW measurement floor of `powermetrics` at 1-second sampling. ANE is
+operationally idle for this model despite the `MLNeuralEngineComputeDevice`
+dispatch classification.
+
+Inspection of the compiled CoreML MIL confirms the same picture from the source
+direction: across all 77 compiled subgraph partitions, `cast` appears exactly
+**once** (partition 0, attention mask int32→fp32), while `matmul` appears 192
+times — all GPU-dispatched. See [Compiled CoreML Model Evidence](#compiled-coreml-model-evidence)
+for the full MIL analysis.
 
 ## Dependency Chain
 
@@ -353,6 +369,65 @@ ReduceMin, ReduceProd, ReduceSum, Relu, Reshape, Resize, Round, Shape,
 Sigmoid, Slice, Softmax, Split, Sqrt, Squeeze, Sub, Tanh, Transpose,
 Unsqueeze
 ```
+
+## Compiled CoreML Model Evidence
+
+### Partition Structure
+
+ORT's CoreML EP partitions the 2,495-op ONNX graph into dynamically-shaped
+`MLProgram` subgraphs. The compiled cache lives at
+`{BGE_M3_CACHE_DIR}/coreml/{hash}/` and contains 77
+`N_dynamic_mlprogram` directories, one per partition:
+
+```
+{hash}/
+├── 0_dynamic_mlprogram/      # attention mask preprocessing
+│   └── model/compiled_model.mlmodelc/model.mil
+├── 1_dynamic_mlprogram/      # embedding stack + layer 0 QKV
+│   └── model/compiled_model.mlmodelc/model.mil
+├── ...
+└── 76_dynamic_mlprogram/     # final pooling / output
+    └── model/compiled_model.mlmodelc/model.mil
+```
+
+All 77 partitions use `func main<ios18>` — the macOS 15 / iOS 18 `MLProgram`
+function format. Manifest files are authored by `com.microsoft.OnnxRuntime`.
+
+### MIL Op Distribution
+
+Tallied from all 77 `model.mil` files:
+
+| Op | Count | Notes |
+|----|-------|-------|
+| `add` | 340 | Residual connections, bias additions |
+| `matmul` | 192 | **Primary compute** — QKV projections, attention, FFN |
+| `reduce_mean` | 98 | LayerNorm mean |
+| `real_div` | 98 | LayerNorm normalization |
+| `mul` | 98 | LayerNorm scaling |
+| `transpose` | 96 | Attention head reshaping |
+| `pow` | 51 | LayerNorm variance |
+| `sub` | 50 | LayerNorm centering |
+| `sqrt` | 49 | LayerNorm denominator |
+| `erf` | 24 | GELU activation (FFN) |
+| `gather` | 3 | Token / position embedding lookups |
+| `shape` | 2 | Input shape queries |
+| `reduce_sum` | 1 | Output pooling |
+| `identity` | 1 | Partition boundary no-op |
+| `clip` | 1 | Output clamping |
+| **`cast`** | **1** | **Attention mask int32→fp32 — the `ios18.cast → ANE` op** |
+
+`cast` appears exactly once across all 77 partitions. This single op is the
+`ios18.cast → MLNeuralEngineComputeDevice` entry reported by `ProfileComputePlan`.
+The 192 `matmul` ops are the dominant compute, all GPU-dispatched.
+
+### FP32 Compute Types in Compiled MLProgram
+
+All intermediate tensor declarations in the compiled MIL are typed
+`tensor<fp32, ...>`, even when loading the FP16 ONNX model
+(`BGE_M3_MODEL=fp16`). CoreML's compiled graph operates in FP32 regardless of
+the source model precision. The memory saving from `BGE_M3_MODEL=fp16` (~1.08 GB
+vs ~2.16 GB per ORT session) reflects the smaller ONNX file loaded by ORT;
+the CoreML compiled representation and GPU runtime operate in FP32.
 
 ## Dynamic Shape Impact and Compute Unit Strategy
 
