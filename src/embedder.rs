@@ -44,7 +44,7 @@ const REPO_ID: &str = "BAAI/bge-m3";
 const REPO_REVISION: &str = "5617a9f61b028005a4858fdac845db406aefb181";
 
 const XENOVA_REPO_ID: &str = "Xenova/bge-m3";
-/// Pinned HF commit for the Xenova/bge-m3 FP16 model (~1.08 GB, single file).
+/// Pinned HF commit for the Xenova/bge-m3 FP16 (~1.08 GB) and INT8 (~568 MB) models.
 /// Update intentionally after verifying equivalent embedding quality vs FP32.
 const XENOVA_REPO_REVISION: &str = "4de13258303883538bd53b696b452bf8099f0858";
 
@@ -68,9 +68,12 @@ struct ModelFiles {
 /// to [`REPO_REVISION`]. The FP32 model uses external initializer files that must
 /// be co-located with `model.onnx`.
 ///
-/// For `ModelVariant::Fp16`, downloads from `Xenova/bge-m3` (FP16, ~1.08 GB) pinned
-/// to [`XENOVA_REPO_REVISION`]. The FP16 model is a single self-contained ONNX file
-/// with no external data.
+/// For `ModelVariant::Fp16`, downloads `onnx/model_fp16.onnx` from `Xenova/bge-m3`
+/// (~1.08 GB) pinned to [`XENOVA_REPO_REVISION`]. Single self-contained ONNX file.
+///
+/// For `ModelVariant::Int8`, downloads `onnx/model_int8.onnx` from `Xenova/bge-m3`
+/// (~568 MB) pinned to [`XENOVA_REPO_REVISION`]. Weights-only INT8 quantization;
+/// activations remain f32, so output tensors are extracted as `f32` at runtime.
 fn download_model_files(
     cache_dir: &Path,
     show_progress: bool,
