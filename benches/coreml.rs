@@ -593,6 +593,10 @@ fn bench_quality(c: &mut Criterion) {
         eprintln!("[quality] Skipping: BGE_M3_MODEL=fp32, no comparison baseline needed.");
         return;
     }
+    if std::env::var("BGE_M3_SKIP_QUALITY").is_ok() {
+        eprintln!("[quality] Skipping: BGE_M3_SKIP_QUALITY set (quality data already recorded).");
+        return;
+    }
 
     let corpus = load_corpus();
     let cache = cache_dir();
