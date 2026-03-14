@@ -3,21 +3,50 @@ use std::time::Duration;
 
 /// ONNX model variant to load.
 ///
-/// Controlled by `BGE_M3_MODEL`. Defaults to [`ModelVariant::Fp32`].
+/// Controlled by `BGE_M3_MODEL`. Defaults to [`ModelVariant::Fp16`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModelVariant {
     /// BAAI/bge-m3 FP32 model (~2.16 GB per session).
-    /// Default for Docker and Linux deployments.
+    ///
+    /// Set `BGE_M3_MODEL=fp32` to enable. Recommended for Apple Silicon CoreML
+    /// deployments where latency is the primary constraint: the FP32 ONNX graph
+    /// contains no Cast nodes, so ORT can dispatch the entire multi-head
+    /// attention + FFN block as one contiguous CoreML subgraph to the GPU —
+    /// delivering 20–61% lower latency than the MLAS CPU baseline.
+    ///
+    /// **Not the default.** Linux/Intel (MLAS-only) deployments should prefer
+    /// [`ModelVariant::Fp16`] for lower RAM and fleet-wide embedding consistency.
     Fp32,
-    /// Xenova/bge-m3 FP16 model (~1.08 GB per session).
-    /// Recommended for Apple Silicon; ANE-native format.
-    /// Reduces peak memory by ~50% per worker vs FP32.
+    /// Xenova/bge-m3 FP16 model (~1.08 GB per session). **Default.**
+    /// Halves per-session memory vs FP32 (~50% reduction; ~1.08 GB vs ~2.16 GB).
+    ///
+    /// This is the fleet default: all Apple Silicon LaunchAgent deployments set
+    /// `BGE_M3_MODEL=fp16` explicitly, and the server default matches so that
+    /// Linux/Docker deployments produce consistent embeddings without any
+    /// additional configuration.
+    ///
+    /// **Latency caveat (CoreML only).** The Xenova FP16 ONNX model contains
+    /// FP16↔FP32 Cast nodes at every transformer-layer boundary. ORT's CoreML EP
+    /// cannot fuse these into the attention/FFN subgraphs; each Cast executes on
+    /// CPU and the transformer block never forms a single contiguous GPU subgraph.
+    /// Result: FP16 + CoreML EP runs 6–10× slower than FP32 + CoreML. On
+    /// MLAS/CPU EP (Linux, Intel), this Cast overhead is similarly present but
+    /// the MLAS FP16 penalty (~6–9×) is the accepted trade-off for lower RAM and
+    /// fleet consistency. Use `BGE_M3_MODEL=fp32` on Apple Silicon to recover
+    /// CoreML GPU acceleration.
     Fp16,
     /// Xenova/bge-m3 INT8 quantized model (~568 MB per session).
     /// Weights-only quantization; ORT dequantizes to f32 internally.
-    /// `CoreML` may not dispatch INT8 ops to ANE — validate dispatch with
-    /// `cargo build --features coreml-profile`. Reduces peak memory by
-    /// ~75% per worker vs FP32. Validate embedding quality before deploying.
+    /// Reduces peak memory by ~74% per worker vs FP32.
+    ///
+    /// Embedding quality validated: dense cosine similarity ≥ 0.963 vs FP32
+    /// reference across a 184-text corpus — suitable for ANN search and semantic
+    /// ranking. Avoid for applications requiring ranking precision within very
+    /// small similarity margins (< 0.05 apart).
+    ///
+    /// **Use with MLAS (CPU EP) only.** `DequantizeLinear` nodes fragment the
+    /// CoreML execution plan identically to FP16 Cast nodes; INT8 + CoreML EP
+    /// runs 42–79% slower than INT8 + MLAS with no GPU benefit.
     Int8,
 }
 
@@ -65,11 +94,16 @@ pub struct Config {
     /// Set to `0` to disable idle unloading entirely.
     ///
     /// When unloaded, models are automatically reloaded on the next incoming request.
-    /// The reload blocks the request until complete (~10–30 s from cache).
+    /// The reload blocks the request until complete (~5–10 s from CoreML compiled
+    /// cache; ~15–30 s cold).
     pub idle_timeout: Option<Duration>,
     /// ONNX model variant to load.
     ///
-    /// Set with `BGE_M3_MODEL`. Accepts `"fp32"`, `"fp16"`, or `"int8"`. Defaults to `"fp32"`.
+    /// Set with `BGE_M3_MODEL`. Accepts `"fp32"`, `"fp16"`, or `"int8"`.
+    /// Defaults to `"fp16"` for fleet-wide embedding consistency and reduced RAM
+    /// on Linux/Intel deployments. Set `BGE_M3_MODEL=fp32` on Apple Silicon to
+    /// recover CoreML GPU acceleration. See [`ModelVariant`] for per-variant
+    /// performance and memory trade-offs.
     pub model_variant: ModelVariant,
 }
 
@@ -106,9 +140,9 @@ impl Config {
         let idle_timeout = (idle_timeout_secs > 0).then(|| Duration::from_secs(idle_timeout_secs));
 
         let model_variant = match lookup("BGE_M3_MODEL").as_deref() {
-            Some("fp16") => ModelVariant::Fp16,
+            Some("fp32") => ModelVariant::Fp32,
             Some("int8") => ModelVariant::Int8,
-            _ => ModelVariant::Fp32,
+            _ => ModelVariant::Fp16,
         };
 
         Self {
@@ -142,7 +176,7 @@ mod tests {
         assert_eq!(cfg.workers, 2);
         assert_eq!(cfg.max_batch, 256);
         assert_eq!(cfg.idle_timeout, Some(Duration::from_secs(300)));
-        assert_eq!(cfg.model_variant, ModelVariant::Fp32);
+        assert_eq!(cfg.model_variant, ModelVariant::Fp16);
         // Platform-specific: macOS=8 (CoreML OOM guard), other=256
         let expected_onnx: usize = if cfg!(target_os = "macos") { 8 } else { 256 };
         assert_eq!(cfg.onnx_batch_size, expected_onnx);
@@ -234,19 +268,19 @@ mod tests {
     }
 
     #[test]
-    fn model_variant_defaults_to_fp32() {
+    fn model_variant_defaults_to_fp16() {
         let map = HashMap::new();
         let cfg = Config::from_lookup(lookup_from(&map));
 
-        assert_eq!(cfg.model_variant, ModelVariant::Fp32);
+        assert_eq!(cfg.model_variant, ModelVariant::Fp16);
     }
 
     #[test]
-    fn model_variant_fp16_when_set() {
-        let map = HashMap::from([("BGE_M3_MODEL", "fp16")]);
+    fn model_variant_fp32_when_set() {
+        let map = HashMap::from([("BGE_M3_MODEL", "fp32")]);
         let cfg = Config::from_lookup(lookup_from(&map));
 
-        assert_eq!(cfg.model_variant, ModelVariant::Fp16);
+        assert_eq!(cfg.model_variant, ModelVariant::Fp32);
     }
 
     #[test]
@@ -258,10 +292,10 @@ mod tests {
     }
 
     #[test]
-    fn model_variant_unknown_value_falls_back_to_fp32() {
+    fn model_variant_unknown_value_falls_back_to_fp16() {
         let map = HashMap::from([("BGE_M3_MODEL", "invalid")]);
         let cfg = Config::from_lookup(lookup_from(&map));
 
-        assert_eq!(cfg.model_variant, ModelVariant::Fp32);
+        assert_eq!(cfg.model_variant, ModelVariant::Fp16);
     }
 }
