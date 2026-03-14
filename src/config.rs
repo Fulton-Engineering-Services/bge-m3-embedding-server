@@ -8,10 +8,10 @@ use std::time::Duration;
 pub enum ModelVariant {
     /// BAAI/bge-m3 FP32 model (~2.16 GB per session).
     ///
-    /// Set `BGE_M3_MODEL=fp32` to enable. Recommended for Apple Silicon CoreML
+    /// Set `BGE_M3_MODEL=fp32` to enable. Recommended for Apple Silicon `CoreML`
     /// deployments where latency is the primary constraint: the FP32 ONNX graph
     /// contains no Cast nodes, so ORT can dispatch the entire multi-head
-    /// attention + FFN block as one contiguous CoreML subgraph to the GPU —
+    /// attention + FFN block as one contiguous `CoreML` subgraph to the GPU —
     /// delivering 20–61% lower latency than the MLAS CPU baseline.
     ///
     /// **Not the default.** Linux/Intel (MLAS-only) deployments should prefer
@@ -20,20 +20,20 @@ pub enum ModelVariant {
     /// Xenova/bge-m3 FP16 model (~1.08 GB per session). **Default.**
     /// Halves per-session memory vs FP32 (~50% reduction; ~1.08 GB vs ~2.16 GB).
     ///
-    /// This is the fleet default: all Apple Silicon LaunchAgent deployments set
+    /// This is the fleet default: all Apple Silicon `LaunchAgent` deployments set
     /// `BGE_M3_MODEL=fp16` explicitly, and the server default matches so that
     /// Linux/Docker deployments produce consistent embeddings without any
     /// additional configuration.
     ///
-    /// **Latency caveat (CoreML only).** The Xenova FP16 ONNX model contains
-    /// FP16↔FP32 Cast nodes at every transformer-layer boundary. ORT's CoreML EP
+    /// **Latency caveat (`CoreML` only).** The Xenova FP16 ONNX model contains
+    /// FP16↔FP32 Cast nodes at every transformer-layer boundary. ORT's `CoreML` EP
     /// cannot fuse these into the attention/FFN subgraphs; each Cast executes on
     /// CPU and the transformer block never forms a single contiguous GPU subgraph.
-    /// Result: FP16 + CoreML EP runs 6–10× slower than FP32 + CoreML. On
+    /// Result: FP16 + `CoreML` EP runs 6–10× slower than FP32 + `CoreML`. On
     /// MLAS/CPU EP (Linux, Intel), this Cast overhead is similarly present but
     /// the MLAS FP16 penalty (~6–9×) is the accepted trade-off for lower RAM and
     /// fleet consistency. Use `BGE_M3_MODEL=fp32` on Apple Silicon to recover
-    /// CoreML GPU acceleration.
+    /// `CoreML` GPU acceleration.
     Fp16,
     /// Xenova/bge-m3 INT8 quantized model (~568 MB per session).
     /// Weights-only quantization; ORT dequantizes to f32 internally.
@@ -45,7 +45,7 @@ pub enum ModelVariant {
     /// small similarity margins (< 0.05 apart).
     ///
     /// **Use with MLAS (CPU EP) only.** `DequantizeLinear` nodes fragment the
-    /// CoreML execution plan identically to FP16 Cast nodes; INT8 + CoreML EP
+    /// `CoreML` execution plan identically to FP16 Cast nodes; INT8 + `CoreML` EP
     /// runs 42–79% slower than INT8 + MLAS with no GPU benefit.
     Int8,
 }
@@ -94,7 +94,7 @@ pub struct Config {
     /// Set to `0` to disable idle unloading entirely.
     ///
     /// When unloaded, models are automatically reloaded on the next incoming request.
-    /// The reload blocks the request until complete (~5–10 s from CoreML compiled
+    /// The reload blocks the request until complete (~5–10 s from `CoreML` compiled
     /// cache; ~15–30 s cold).
     pub idle_timeout: Option<Duration>,
     /// ONNX model variant to load.
@@ -102,7 +102,7 @@ pub struct Config {
     /// Set with `BGE_M3_MODEL`. Accepts `"fp32"`, `"fp16"`, or `"int8"`.
     /// Defaults to `"fp16"` for fleet-wide embedding consistency and reduced RAM
     /// on Linux/Intel deployments. Set `BGE_M3_MODEL=fp32` on Apple Silicon to
-    /// recover CoreML GPU acceleration. See [`ModelVariant`] for per-variant
+    /// recover `CoreML` GPU acceleration. See [`ModelVariant`] for per-variant
     /// performance and memory trade-offs.
     pub model_variant: ModelVariant,
 }
