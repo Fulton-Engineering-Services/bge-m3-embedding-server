@@ -8,6 +8,7 @@ ignore = [
     # Transitive deps with no safe upgrade available — revisit when upstream updates.
     "RUSTSEC-2024-0436",  # paste (via tokenizers → macro_rules_attribute)
     "RUSTSEC-2025-0119",  # number_prefix (via hf-hub → indicatif)
+    "RUSTSEC-2026-0049",  # rustls-webpki CRL DP matching (via ureq → rustls); limited impact
 ]
 
 [licenses]
@@ -18,10 +19,7 @@ allow = [
     "BSD-3-Clause",
     "ISC",
     "Unicode-3.0",
-    "Unicode-DFS-2016",
-    "OpenSSL",
     "Zlib",
-    "CC0-1.0",
     "Unlicense",
     "MPL-2.0",                # option-ext (dirs-sys → dirs → hf-hub)
     "CDLA-Permissive-2.0",   # webpki-roots, webpki-root-certs (ureq → ort-sys)
@@ -33,6 +31,9 @@ ignore = true
 [bans]
 multiple-versions = "warn"
 wildcards = "allow"
+skip-tree = [
+    { crate = "windows-targets" },
+]
 
 [sources]
 unknown-registry = "warn"

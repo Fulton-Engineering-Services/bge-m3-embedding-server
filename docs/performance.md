@@ -527,4 +527,3 @@ Dense embeddings shown. Sparse values are within 5% of dense for all configurati
 | Memory-critical (≤ 1 GB/session) | INT8 + MLAS EP with `BGE_M3_WORKERS=1` | One session (~0.54 GB) |
 | Avoid | FP16 (any EP) | 6–10× slower than FP32; no CoreML benefit |
 | Avoid | INT8 + CoreML EP | 42–79% slower than INT8 + MLAS |
-
