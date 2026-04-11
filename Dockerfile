@@ -28,7 +28,9 @@ FROM ubuntu:24.04@sha256:d1e2e92c075e5ca139d51a140fff46f84315c0fdce203eab2807c7e
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates libssl3t64 \
     && rm -rf /var/lib/apt/lists/*
-RUN useradd --system --no-create-home --shell /sbin/nologin bge
+# UID/GID must match EFS model-cache access point in Codekeeper CDK (10002).
+RUN groupadd --system --gid 10002 bge \
+    && useradd --system --uid 10002 --gid bge --no-create-home --shell /sbin/nologin bge
 
 COPY --from=builder /app/target/release/bge-m3-embedding-server /usr/local/bin/
 USER bge
