@@ -375,3 +375,155 @@ partially averages the per-token error.
 **Verdict:** INT8 is acceptable for approximate nearest-neighbour search and semantic
 ranking tasks where cosine similarity > 0.96 is sufficient. Avoid INT8 for applications
 that require ranking precision within very small similarity margins (< 0.05 apart).
+
+---
+
+## FP16 Inference Performance
+
+**Model:** `Xenova/bge-m3` (`onnx/model_fp16.onnx`), commit `4de13258303883538bd53b696b452bf8099f0858`
+
+**Session memory:** ~1.08 GB per session (vs ~2.16 GB for FP32; 50% reduction).
+
+### FP16 MLAS Baseline
+
+`BGE_M3_MODEL=fp16 BGE_M3_BENCH_EP=mlas_only` — single-text only. FP16 batch via MLAS is
+prohibitively slow (Cast overhead scales super-linearly with batch×seq\_len; measured at
+~173 s/iter for `document_chunks` with `onnx_batch_size=8`).
+
+| Scenario | Dense Single | Sparse Single |
+|----------|-------------|---------------|
+| code\_symbols (50×, 22–120 chars) | 283.75 ms (**+715%**) | 284.14 ms (**+756%**) |
+| document\_chunks (50×, 337–1,599 chars) | 947.48 ms (**+521%**) | 946.42 ms (**+604%**) |
+| tool\_descriptions (75×, 33–283 chars) | 233.03 ms (**+664%**) | 235.73 ms (**+665%**) |
+
+Percentages are vs FP32 MLAS baseline. **FP16 MLAS is 6–9× slower than FP32 MLAS.**
+
+ORT's MLAS executor does not support native FP16 GEMM. For every layer, the ORT graph engine
+inserts a `Cast(float16 → float32)` node before each MatMul and a `Cast(float32 → float16)`
+node after. These Cast operations dominate inference time and scale with the full compute
+budget of the transformer (batch × sequence\_length × hidden\_dim), not just the weight size.
+
+### FP16 CoreML Results
+
+`BGE_M3_MODEL=fp16 BGE_M3_BENCH_EP=coreml_all`, single-text only. Batch not collected:
+FP16 CoreML batch matches FP16 MLAS batch in latency (CoreML provides no acceleration; see below).
+
+| Scenario | Dense Single | Sparse Single |
+|----------|-------------|---------------|
+| code\_symbols (50×, 22–120 chars) | 291.26 ms (**+1,028%**) | ~284 ms† |
+| document\_chunks (50×, 337–1,599 chars) | 966.42 ms (**+1,506%**) | ~947 ms† |
+| tool\_descriptions (75×, 33–283 chars) | 243.43 ms (**+1,011%**) | 238.47 ms (**+728%**) |
+
+Percentages are vs FP32 CoreML baseline. †Sparse code\_symbols/document\_chunks not
+independently benchmarked: tool\_descriptions sparse (238 ms) matches FP16 MLAS (236 ms),
+consistent with the dense pattern.
+
+**Key finding: CoreML provides no acceleration for FP16 ONNX graphs.**
+
+FP16 CoreML single-text latency (~291 ms for `code_symbols`) matches FP16 MLAS (~284 ms),
+not FP32 CoreML (25.8 ms). The root cause is structural: the Xenova FP16 ONNX model contains
+FP16↔FP32 Cast nodes at every layer boundary. ORT's CoreML EP builds a CoreML execution plan
+around these Cast nodes, but CoreML cannot fuse them into the larger MatMul/attention
+subgraphs. Each Cast node executes on CPU; the transformer block never forms a single
+contiguous subgraph eligible for GPU dispatch.
+
+In contrast, the FP32 ONNX model has no Cast nodes. ORT can dispatch the entire
+multi-head attention + FFN block as one CoreML subgraph, achieving 20–61% faster inference
+than MLAS via M-series GPU utilization.
+
+**Deployment guidance:**
+- FP16 + CoreML EP offers no latency advantage over FP16 + MLAS (both ~8–10× slower than FP32 + CoreML)
+- The sole benefit of FP16 is session memory (~1.08 GB vs ~2.16 GB per session, 50% reduction)
+- For latency-critical paths, FP32 + CoreML EP is the correct choice
+- FP16 is appropriate only when memory is the primary constraint and the ~8× latency regression is acceptable
+
+---
+
+## INT8 Inference Performance
+
+**Model:** `Xenova/bge-m3` (`onnx/model_int8.onnx`), commit `4de13258303883538bd53b696b452bf8099f0858`
+
+**Session memory:** ~568 MB per session (vs ~2.16 GB for FP32; 74% reduction).
+
+### INT8 MLAS Baseline
+
+`BGE_M3_MODEL=int8 BGE_M3_BENCH_EP=mlas_only` — single-text only.
+
+| Scenario | Dense Single | Sparse Single |
+|----------|-------------|---------------|
+| code\_symbols (50×, 22–120 chars) | 42.48 ms (**+22%**) | 42.44 ms (**+28%**) |
+| document\_chunks (50×, 337–1,599 chars) | 249.68 ms (**+64%**) | 251.85 ms (**+87%**) |
+| tool\_descriptions (75×, 33–283 chars) | 27.88 ms (**−9%**) | 27.84 ms (**−10%**) |
+
+Percentages are vs FP32 MLAS baseline. **INT8 MLAS is within 22–87% of FP32 MLAS** (and
+faster for short texts). This is dramatically better than FP16 MLAS (+715%) because
+INT8 dequantization uses simple integer arithmetic (zero\_point subtraction, scale multiply
+via `DequantizeLinear`) rather than the full floating-point format conversion required by
+FP16 `Cast`. Additionally, INT8 weights are 4× smaller than FP32, reducing memory bandwidth
+pressure — which explains the −9% improvement on `tool_descriptions` (where texts are short
+enough that weight-loading latency dominates compute).
+
+### INT8 CoreML Results
+
+`BGE_M3_MODEL=int8 BGE_M3_BENCH_EP=coreml_all`, single-text only. Batch not collected:
+INT8 CoreML singles are slower than INT8 MLAS singles (see below); batch performance follows
+the same fragmentation pattern as FP16 CoreML.
+
+| Scenario | Dense Single | Sparse Single |
+|----------|-------------|---------------|
+| code\_symbols (50×, 22–120 chars) | 69.29 ms (**+169%**) | 70.86 ms (**+165%**) |
+| document\_chunks (50×, 337–1,599 chars) | 355.63 ms (**+491%**) | 360.19 ms (**+453%**) |
+| tool\_descriptions (75×, 33–283 chars) | 49.95 ms (**+128%**) | 50.03 ms (**+74%**) |
+
+Percentages are vs FP32 CoreML baseline. The "Context leak detected, CoreAnalytics returned
+false" messages logged during the INT8 CoreML run are benign CoreML framework diagnostics
+(analytics context lifecycle), not errors.
+
+**Key finding: INT8 CoreML is slower than INT8 MLAS.**
+
+| Scenario | INT8 MLAS | INT8 CoreML | CoreML overhead |
+|----------|-----------|-------------|----------------|
+| code\_symbols dense single | 42.48 ms | 69.29 ms | +63% |
+| document\_chunks dense single | 249.68 ms | 355.63 ms | +42% |
+| tool\_descriptions dense single | 27.88 ms | 49.95 ms | +79% |
+
+The Xenova INT8 model uses ONNX `DequantizeLinear` nodes to convert INT8 weights to FP32 at
+runtime. ORT's CoreML EP fragments the execution graph around these nodes (same mechanism as
+FP16 Cast nodes): CoreML dispatches small FP32 subgraphs between each `DequantizeLinear` op,
+but the per-subgraph dispatch overhead (CoreML scheduler → Metal submit → completion fence)
+exceeds the compute saved by GPU acceleration. The net result is slower than single-threaded
+MLAS, which processes the `DequantizeLinear` + MatMul fused sequence on-die without dispatch
+overhead.
+
+**Deployment guidance for INT8:**
+- INT8 + MLAS EP is the correct deployment choice: 74% memory savings with only 22–87%
+  latency overhead (and −9% faster than FP32 for short texts)
+- INT8 + CoreML EP adds 42–79% overhead over INT8 MLAS with no GPU benefit
+- For latency-critical paths, FP32 + CoreML EP remains the best option
+
+---
+
+## Model Variant Comparison Summary
+
+All single-text medians (lower is better). Machine: MacBook Pro M3 Max, macOS Tahoe.
+
+| Config | Session memory | code\_symbols | document\_chunks | tool\_descriptions |
+|--------|----------------|---------------|------------------|--------------------|
+| FP32 + MLAS | 2.16 GB | 34.8 ms | 152.6 ms | 30.5 ms |
+| **FP32 + CoreML** | **2.16 GB** | **25.8 ms** | **60.2 ms** | **21.9 ms** |
+| FP16 + MLAS | 1.08 GB | 283.8 ms | 947.5 ms | 233.0 ms |
+| FP16 + CoreML | 1.08 GB | 291.3 ms | 966.4 ms | 243.4 ms |
+| **INT8 + MLAS** | **0.54 GB** | **42.5 ms** | **249.7 ms** | **27.9 ms** |
+| INT8 + CoreML | 0.54 GB | 69.3 ms | 355.6 ms | 50.0 ms |
+
+Dense embeddings shown. Sparse values are within 5% of dense for all configurations.
+
+**Recommendations:**
+
+| Constraint | Recommended config | Rationale |
+|------------|-------------------|-----------|
+| Best latency | FP32 + CoreML EP | 20–61% faster than MLAS; full GPU dispatch |
+| Memory-constrained (≤ 2 GB/session) | INT8 + MLAS EP | 74% memory savings; near-FP32 latency |
+| Memory-critical (≤ 1 GB/session) | INT8 + MLAS EP with `BGE_M3_WORKERS=1` | One session (~0.54 GB) |
+| Avoid | FP16 (any EP) | 6–10× slower than FP32; no CoreML benefit |
+| Avoid | INT8 + CoreML EP | 42–79% slower than INT8 + MLAS |

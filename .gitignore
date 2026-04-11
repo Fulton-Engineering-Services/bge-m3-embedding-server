@@ -1,5 +1,4 @@
 /target
 /.worktrees
 
-# macOS system files
 .DS_Store
