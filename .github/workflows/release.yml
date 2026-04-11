@@ -28,7 +28,7 @@ jobs:
           toolchain: stable
           components: rustfmt, clippy
 
-      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5  # v2
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4  # v2
 
       - name: Check formatting
         run: cargo fmt --all --check
@@ -45,7 +45,7 @@ jobs:
         with:
           toolchain: stable
 
-      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5  # v2
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4  # v2
       - uses: taiki-e/install-action@554bdce7edf79d43854a6b7c1e392e7da7eb97a9  # cargo-nextest
 
       - name: Run tests
