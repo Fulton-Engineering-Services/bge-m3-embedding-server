@@ -325,6 +325,23 @@ flowchart TD
 - `tower-http::TraceLayer` + `SetRequestIdLayer` provide per-request tracing and `X-Request-ID`
   header propagation.
 
+## Versioning
+
+This project uses manual semantic versioning. The version is defined in `Cargo.toml` (line 3):
+
+```toml
+version = "0.13.0"
+```
+
+To release a new version:
+
+1. Update the version string in `Cargo.toml`
+2. Commit the change with a message following the format: `chore: bump version to X.Y.Z`
+3. Tag the commit with the version: `git tag vX.Y.Z`
+4. Push both the commit and tag: `git push origin main && git push origin vX.Y.Z`
+
+Cargo publishes to [crates.io](https://crates.io/crates/bge-m3-embedding-server) and the Docker image is pushed to [ghcr.io](https://github.com/Fulton-Engineering-Services/bge-m3-embedding-server/pkgs/container/bge-m3-embedding-server) during CI/CD.
+
 ## License
 
 Licensed under the Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE))
