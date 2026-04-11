@@ -29,8 +29,8 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates libssl3t64 \
     && rm -rf /var/lib/apt/lists/*
 # UID/GID must match EFS model-cache access point in Codekeeper CDK (10002).
-RUN groupadd --system --gid 10002 bge \
-    && useradd --system --uid 10002 --gid bge --no-create-home --shell /sbin/nologin bge
+RUN groupadd --gid 10002 bge \
+    && useradd --uid 10002 --gid bge --no-create-home --shell /sbin/nologin bge
 
 COPY --from=builder /app/target/release/bge-m3-embedding-server /usr/local/bin/
 USER bge
