@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.15.0-rc1] - 2026-05-09
+
+### Added
+- **Unified dense + sparse embeddings endpoint** (`POST /v1/embeddings:both`) — runs **one** ONNX `session.run()` per chunk and projects both dense (CLS-pooled, L2-normalized) and sparse (SPLADE-style) outputs from the same forward pass. Numerically equivalent to calling `/v1/embeddings` and `/v1/sparse-embeddings` separately on the same inputs, within FP rounding tolerance, but at near-zero marginal GPU cost. Existing `/v1/embeddings` and `/v1/sparse-embeddings` endpoints are unchanged.
+- `EmbedPool::both(texts)` Rust API, `Both` job variant in the worker pool, and `embed_both` shared-pass implementation.
+- `DualRequest` / `DualResponse` / `DualEmbeddingData` request/response types.
+- Handler-level validation tests, router-level tests, and an opt-in (`BGE_M3_EQUIVALENCE_TEST=1`) integration test verifying that the dual-pass path matches separate dense + sparse passes within FP tolerance.
+- OpenAPI documentation for the new endpoint plus `DualRequest`/`DualResponse`/`DualEmbeddingData` schemas.
+
 ## [0.14.0] - 2026-05-09
 
 ### Added

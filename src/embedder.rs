@@ -39,6 +39,13 @@ pub struct SparseEmbedding {
     pub values: Vec<f32>,
 }
 
+/// Paired dense + sparse embeddings produced from a single forward pass.
+#[derive(Debug, Clone)]
+pub struct DualEmbedding {
+    pub dense: Vec<f32>,
+    pub sparse: SparseEmbedding,
+}
+
 /// OS headroom reserved for kernel, stack, ORT arena, and other non-model
 /// allocations. Subtracted from available memory before computing
 /// per-worker workspace.
@@ -52,6 +59,11 @@ pub enum EmbedRequest {
     Sparse {
         texts: Vec<String>,
         reply: oneshot::Sender<Result<Vec<SparseEmbedding>>>,
+    },
+    /// Computes dense and sparse embeddings from a single forward pass per chunk.
+    Both {
+        texts: Vec<String>,
+        reply: oneshot::Sender<Result<Vec<DualEmbedding>>>,
     },
     /// Internal: used during startup probe to run a single batch and measure
     /// peak RSS delta. Workers only process this before `ready` is set.
@@ -447,6 +459,120 @@ fn embed_sparse(
         .collect())
 }
 
+/// Produces paired dense + sparse embeddings using **one** `session.run()` per chunk.
+///
+/// Both projections are derived from the same forward pass:
+/// - **FP32**: extracts both `sentence_embedding` (dense) and `token_embeddings`
+///   (sparse base) from the model's dual outputs.
+/// - **FP16/INT8**: extracts dense from the CLS token (position 0) of
+///   `last_hidden_state`, and sparse from the full hidden states of the same
+///   tensor. This avoids a second forward pass.
+///
+/// Numerically equivalent to calling [`embed_dense`] and [`embed_sparse`]
+/// separately, within FP rounding tolerance.
+#[allow(clippy::cast_possible_truncation)]
+fn embed_both(
+    session: &mut ort::session::Session,
+    tokenizer: &tokenizers::Tokenizer,
+    texts: &[String],
+    cost_model: &CostModel,
+    model_variant: ModelVariant,
+) -> Result<Vec<DualEmbedding>> {
+    let (weight, bias) = crate::weights::sparse_linear();
+    let weight_view = weight.view();
+
+    let encodings = tokenize_no_pad(tokenizer, texts)?;
+    let seq_lens: Vec<usize> = encodings.iter().map(|e| e.get_ids().len()).collect();
+
+    let chunks = bin_pack(&seq_lens, cost_model);
+
+    let mut all_dual: Vec<Option<DualEmbedding>> = (0..texts.len()).map(|_| None).collect();
+
+    for chunk_indices in &chunks {
+        let chunk_max = chunk_indices
+            .iter()
+            .map(|&i| seq_lens[i])
+            .max()
+            .unwrap_or(1)
+            .max(1);
+
+        let (ids_array, mask_array) = build_chunk_arrays(&encodings, chunk_indices, chunk_max)?;
+
+        let ids_tensor = TensorRef::from_array_view(ids_array.view()).map_err(ort_err)?;
+        let mask_tensor = TensorRef::from_array_view(mask_array.view()).map_err(ort_err)?;
+
+        let outputs = session
+            .run(ort::inputs! {
+                "input_ids" => ids_tensor,
+                "attention_mask" => mask_tensor,
+            })
+            .map_err(ort_err)?;
+
+        // Extract dense + token-level hidden states from the same outputs.
+        // FP32: separate sentence_embedding + token_embeddings outputs.
+        // FP16/INT8: derive dense (CLS) and sparse-base from last_hidden_state.
+        let (dense_emb, token_emb) = match model_variant {
+            ModelVariant::Fp32 => {
+                let dense = outputs["sentence_embedding"]
+                    .try_extract_array::<f32>()
+                    .map_err(ort_err)?
+                    .to_owned();
+                let tokens = outputs["token_embeddings"]
+                    .try_extract_array::<f32>()
+                    .map_err(ort_err)?
+                    .to_owned();
+                (dense, tokens)
+            }
+            ModelVariant::Fp16 | ModelVariant::Int8 => {
+                let lhs = outputs["last_hidden_state"]
+                    .try_extract_array::<f32>()
+                    .map_err(ort_err)?;
+                let dense = lhs.index_axis(ndarray::Axis(1), 0).to_owned();
+                let tokens = lhs.to_owned();
+                (dense, tokens)
+            }
+        };
+
+        for (chunk_pos, &orig_idx) in chunk_indices.iter().enumerate() {
+            // Dense: CLS row, L2-normalized.
+            let dense_row = dense_emb.index_axis(ndarray::Axis(0), chunk_pos);
+            let mut dense_vec = dense_row
+                .as_slice()
+                .expect("dense embedding should be contiguous")
+                .to_vec();
+            normalize_l2(&mut dense_vec);
+
+            // Sparse: project each token's hidden state, then max-pool.
+            let enc = &encodings[orig_idx];
+            let ids = enc.get_ids();
+            let mask = enc.get_attention_mask();
+            let batch_hidden = token_emb.index_axis(ndarray::Axis(0), chunk_pos);
+
+            let scores: Vec<f32> = (0..ids.len())
+                .map(|j| {
+                    let hidden = batch_hidden.index_axis(ndarray::Axis(0), j);
+                    let hidden_slice = hidden
+                        .as_slice()
+                        .expect("hidden state should be contiguous");
+                    sparse_project(hidden_slice, &weight_view, *bias)
+                })
+                .collect();
+
+            let (indices, values) = sparse_maxpool(ids, mask, &scores);
+
+            all_dual[orig_idx] = Some(DualEmbedding {
+                dense: dense_vec,
+                sparse: SparseEmbedding { indices, values },
+            });
+        }
+    }
+
+    Ok(all_dual
+        .into_iter()
+        .map(|d| d.expect("every slot must be filled"))
+        .collect())
+}
+
 /// Runs a single `session.run()` for the probe, measuring RSS before and after.
 ///
 /// The probe texts are already tokenized and padded to `pad_to` externally.
@@ -642,6 +768,9 @@ fn run_worker(
                                 EmbedRequest::Sparse { reply, .. } => {
                                     let _ = reply.send(Err(err));
                                 }
+                                EmbedRequest::Both { reply, .. } => {
+                                    let _ = reply.send(Err(err));
+                                }
                                 EmbedRequest::Probe { reply, .. } => {
                                     let _ = reply.send(Err(err));
                                 }
@@ -675,6 +804,17 @@ fn run_worker(
                             config.model_variant,
                         )
                         .map_err(|e| anyhow::anyhow!("Sparse embed error: {e}"));
+                        let _ = reply.send(result);
+                    }
+                    EmbedRequest::Both { texts, reply } => {
+                        let result = embed_both(
+                            session,
+                            tokenizer,
+                            &texts,
+                            &config.cost_model,
+                            config.model_variant,
+                        )
+                        .map_err(|e| anyhow::anyhow!("Dual embed error: {e}"));
                         let _ = reply.send(result);
                     }
                     EmbedRequest::Probe { texts, reply } => {
@@ -853,6 +993,25 @@ impl EmbedPool {
             .map_err(|_| anyhow::anyhow!("Worker dropped reply sender"))?
     }
 
+    /// Runs a single forward pass that yields both dense and sparse embeddings.
+    ///
+    /// Equivalent to calling [`Self::dense`] and [`Self::sparse`] back-to-back,
+    /// but uses one `session.run()` per chunk instead of two — at near-zero
+    /// marginal GPU cost.
+    pub async fn both(&self, texts: Vec<String>) -> Result<Vec<DualEmbedding>> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.tx
+            .send(EmbedRequest::Both {
+                texts,
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|_| anyhow::anyhow!("EmbedPool channel closed"))?;
+        reply_rx
+            .await
+            .map_err(|_| anyhow::anyhow!("Worker dropped reply sender"))?
+    }
+
     /// Sends a probe request to a single worker and returns the result.
     /// Only called during init before `ready` is set.
     pub(crate) async fn probe(&self, texts: Vec<String>) -> Result<ProbeResult> {
@@ -903,6 +1062,8 @@ impl EmbedPool {
         let (tx, mut rx) = mpsc::channel::<EmbedRequest>(8);
         let dense = Arc::new(dense_fixture);
         let sparse = Arc::new(sparse_fixture);
+        let dense_both = Arc::clone(&dense);
+        let sparse_both = Arc::clone(&sparse);
         tokio::spawn(async move {
             while let Some(req) = rx.recv().await {
                 match req {
@@ -911,6 +1072,20 @@ impl EmbedPool {
                     }
                     EmbedRequest::Sparse { reply, .. } => {
                         let _ = reply.send(Ok((*sparse).clone()));
+                    }
+                    EmbedRequest::Both { reply, .. } => {
+                        // Pair dense_fixture[i] with sparse_fixture[i] elementwise.
+                        // Truncate to the shorter of the two so the test fixture is
+                        // self-consistent.
+                        let pairs: Vec<DualEmbedding> = dense_both
+                            .iter()
+                            .zip(sparse_both.iter())
+                            .map(|(d, s)| DualEmbedding {
+                                dense: d.clone(),
+                                sparse: s.clone(),
+                            })
+                            .collect();
+                        let _ = reply.send(Ok(pairs));
                     }
                     EmbedRequest::Probe { reply, .. } => {
                         let _ = reply.send(Ok(ProbeResult {
@@ -1025,6 +1200,39 @@ mod tests {
         let result = pool.sparse(vec!["hello".into()]).await;
         let err = result.expect_err("expected an error");
         assert!(err.to_string().contains("channel closed"));
+    }
+
+    #[tokio::test]
+    async fn both_returns_error_when_channel_closed() {
+        let pool = EmbedPool::closed_for_test();
+        let result = pool.both(vec!["hello".into()]).await;
+        let err = result.expect_err("expected an error");
+        assert!(err.to_string().contains("channel closed"));
+    }
+
+    #[tokio::test]
+    async fn both_returns_paired_dense_and_sparse_from_fixture() {
+        let dense_fixture = vec![vec![0.1f32, 0.2, 0.3], vec![0.4, 0.5, 0.6]];
+        let sparse_fixture = vec![
+            SparseEmbedding {
+                indices: vec![10],
+                values: vec![0.7],
+            },
+            SparseEmbedding {
+                indices: vec![20, 30],
+                values: vec![0.8, 0.9],
+            },
+        ];
+        let pool = EmbedPool::with_fixed_responses(dense_fixture.clone(), sparse_fixture.clone());
+        let result = pool
+            .both(vec!["a".into(), "b".into()])
+            .await
+            .expect("both should succeed against fixture pool");
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].dense, dense_fixture[0]);
+        assert_eq!(result[1].dense, dense_fixture[1]);
+        assert_eq!(result[0].sparse.indices, sparse_fixture[0].indices);
+        assert_eq!(result[1].sparse.indices, sparse_fixture[1].indices);
     }
 
     #[test]

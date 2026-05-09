@@ -40,6 +40,7 @@ pub(crate) fn build_router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/v1/embeddings", post(handler::dense_embeddings))
         .route("/v1/sparse-embeddings", post(handler::sparse_embeddings))
+        .route("/v1/embeddings:both", post(handler::both_embeddings))
         .route("/v1/models", get(handler::models))
         .route("/health", get(handler::health))
         .layer(DefaultBodyLimit::max(2_097_152))
@@ -489,6 +490,76 @@ mod tests {
             .expect("request should build");
         let resp: Response = app.oneshot(req).await.expect("router should respond");
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn router_both_returns_503_when_not_ready() {
+        let app = build_router(make_test_state(false, 256));
+        let body = serde_json::to_vec(&serde_json::json!({"input": ["test"]}))
+            .expect("request body should serialize");
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/embeddings:both")
+            .header("content-type", "application/json")
+            .body(Body::from(body))
+            .expect("request should build");
+        let resp: Response = app.oneshot(req).await.expect("router should respond");
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn router_both_returns_503_when_pool_dead() {
+        let app = build_router(make_test_state(true, 256));
+        let body = serde_json::to_vec(&serde_json::json!({"input": ["test"]}))
+            .expect("request body should serialize");
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/embeddings:both")
+            .header("content-type", "application/json")
+            .body(Body::from(body))
+            .expect("request should build");
+        let resp: Response = app.oneshot(req).await.expect("router should respond");
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn router_both_returns_200_with_paired_dense_and_sparse() {
+        let dense_fixture = vec![vec![0.1f32, 0.2, 0.3]];
+        let sparse_fixture = vec![crate::embedder::SparseEmbedding {
+            indices: vec![42usize],
+            values: vec![0.5f32],
+        }];
+        let app = build_router(Arc::new(AppState {
+            pool: EmbedPool::with_fixed_responses(dense_fixture, sparse_fixture),
+            ready: AtomicBool::new(true),
+            max_batch: 256,
+            total_workers: 1,
+            max_seq_length: 8192,
+            tuning: std::sync::OnceLock::new(),
+        }));
+        let body = serde_json::to_vec(&serde_json::json!({"input": ["hello"]}))
+            .expect("request body should serialize");
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/embeddings:both")
+            .header("content-type", "application/json")
+            .body(Body::from(body))
+            .expect("request should build");
+        let resp: Response = app.oneshot(req).await.expect("router should respond");
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp
+            .into_body()
+            .collect()
+            .await
+            .expect("body readable")
+            .to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("valid json");
+        assert_eq!(json["object"], "list");
+        assert_eq!(json["model"], "bge-m3");
+        assert_eq!(json["data"][0]["index"], 0);
+        assert_eq!(json["data"][0]["embedding"][0], 0.1_f32);
+        assert_eq!(json["data"][0]["sparse_values"]["indices"][0], 42);
+        assert_eq!(json["data"][0]["sparse_values"]["values"][0], 0.5_f32);
     }
 
     #[tokio::test]

@@ -6,6 +6,7 @@ info:
 
     - **Dense embeddings** (`/v1/embeddings`): OpenAI-compatible endpoint returning 1024-dimensional float vectors.
     - **Sparse embeddings** (`/v1/sparse-embeddings`): BGE-M3 SPLADE-style sparse token weights.
+    - **Dense + sparse embeddings** (`/v1/embeddings:both`): Single forward pass yielding both projections; equivalent to calling the two endpoints above on the same inputs but at near-zero marginal GPU cost.
     - **Health** (`/health`): Readiness probe with worker pool status.
   version: "0.9.0"
   license:
@@ -104,6 +105,70 @@ paths:
           description: Content-Type is not application/json
         "422":
           description: Valid JSON but invalid schema
+        "503":
+          description: Service not ready or all workers have exited
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /v1/embeddings:both:
+    post:
+      summary: Generate paired dense + sparse embeddings (single forward pass)
+      description: |
+        Accepts one or more text strings and returns both the dense
+        1024-dimensional vector and the BGE-M3 SPLADE-style sparse token
+        weights for each input. Internally runs **one** ONNX `session.run()`
+        per chunk and projects both outputs from the same forward pass — so
+        callers that need both representations (e.g. hybrid retrieval
+        ingestion pipelines) avoid a second model invocation.
+
+        The numerical outputs are equivalent to calling `/v1/embeddings` and
+        `/v1/sparse-embeddings` separately on the same input, within FP
+        rounding tolerance.
+
+        The colon (`:`) in the path follows the AIP-136 "custom verb" convention
+        used by Google Cloud APIs for non-standard operations on a resource.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/DualRequest"
+            examples:
+              single_string:
+                summary: Single string input
+                value:
+                  input: "Document to embed for hybrid retrieval"
+              array_input:
+                summary: Array of strings
+                value:
+                  input:
+                    - "First document"
+                    - "Second document"
+      responses:
+        "200":
+          description: Paired dense and sparse embeddings generated successfully
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DualResponse"
+        "400":
+          description: Malformed JSON body
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "413":
+          description: Request body exceeds 2 MiB limit
+        "415":
+          description: Content-Type is not application/json
+        "422":
+          description: Valid JSON but invalid schema
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
         "503":
           description: Service not ready or all workers have exited
           content:
@@ -279,6 +344,52 @@ components:
           type: array
           items:
             $ref: "#/components/schemas/SparseEmbeddingData"
+
+    DualRequest:
+      type: object
+      required:
+        - input
+      properties:
+        input:
+          $ref: "#/components/schemas/TextInput"
+        model:
+          type: string
+          description: Accepted for OpenAI API compatibility; always uses BGE-M3.
+          example: "bge-m3"
+
+    DualEmbeddingData:
+      type: object
+      required: [index, embedding, sparse_values]
+      properties:
+        index:
+          type: integer
+          minimum: 0
+          description: Zero-based position of this entry in the input batch.
+        embedding:
+          type: array
+          items:
+            type: number
+            format: float
+          description: 1024-dimensional dense vector (L2-normalized).
+        sparse_values:
+          $ref: "#/components/schemas/SparseValues"
+
+    DualResponse:
+      type: object
+      required: [object, model, data, usage]
+      properties:
+        object:
+          type: string
+          enum: ["list"]
+        model:
+          type: string
+          enum: ["bge-m3"]
+        data:
+          type: array
+          items:
+            $ref: "#/components/schemas/DualEmbeddingData"
+        usage:
+          $ref: "#/components/schemas/Usage"
 
     HealthResponse:
       type: object

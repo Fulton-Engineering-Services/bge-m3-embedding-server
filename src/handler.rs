@@ -3,8 +3,9 @@ use std::sync::{atomic::Ordering, Arc};
 
 use crate::error::AppError;
 use crate::models::{
-    DenseEmbeddingData, DenseRequest, DenseResponse, ModelEntry, ModelsResponse,
-    SparseEmbeddingData, SparseRequest, SparseResponse, SparseValues, Usage,
+    DenseEmbeddingData, DenseRequest, DenseResponse, DualEmbeddingData, DualRequest, DualResponse,
+    ModelEntry, ModelsResponse, SparseEmbeddingData, SparseRequest, SparseResponse, SparseValues,
+    Usage,
 };
 use crate::state::AppState;
 
@@ -124,6 +125,46 @@ pub async fn sparse_embeddings(
         .collect();
 
     Ok(Json(SparseResponse { data }))
+}
+
+#[allow(clippy::cast_possible_truncation)]
+#[tracing::instrument(skip(state, req), fields(batch_size))]
+pub async fn both_embeddings(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<DualRequest>,
+) -> Result<Json<DualResponse>, AppError> {
+    check_ready(&state)?;
+    let texts = req.input.0;
+    drop(req.model);
+    validate_input(&texts, state.max_batch)?;
+    tracing::Span::current().record("batch_size", texts.len());
+
+    let prompt_tokens: usize = texts.iter().map(|t| t.chars().count() / 4 + 1).sum();
+
+    let pairs = state.pool.both(texts).await?;
+
+    let data = pairs
+        .into_iter()
+        .enumerate()
+        .map(|(index, pair)| DualEmbeddingData {
+            index,
+            embedding: pair.dense,
+            sparse_values: SparseValues {
+                indices: pair.sparse.indices.iter().map(|i| *i as u32).collect(),
+                values: pair.sparse.values,
+            },
+        })
+        .collect();
+
+    Ok(Json(DualResponse {
+        object: "list",
+        model: "bge-m3",
+        data,
+        usage: Usage {
+            prompt_tokens,
+            total_tokens: prompt_tokens,
+        },
+    }))
 }
 
 pub async fn health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
@@ -597,6 +638,119 @@ mod tests {
         assert_eq!(resp.data[1].index, 1);
         assert_eq!(resp.object, "list");
         assert_eq!(resp.model, "bge-m3");
+    }
+
+    // --- both_embeddings handler ---
+
+    #[tokio::test]
+    async fn both_embeddings_rejects_when_not_ready() {
+        use crate::models::TextInput;
+        let state = make_state(false, 256);
+        let req = DualRequest {
+            input: TextInput(vec!["hello".to_string()]),
+            model: None,
+        };
+        let result = both_embeddings(State(state), Json(req)).await;
+        assert!(matches!(result, Err(AppError::ServiceUnavailable(_))));
+    }
+
+    #[tokio::test]
+    async fn both_embeddings_rejects_when_pool_dead() {
+        use crate::models::TextInput;
+        let state = make_state(true, 256);
+        let req = DualRequest {
+            input: TextInput(vec!["hello".to_string()]),
+            model: None,
+        };
+        let result = both_embeddings(State(state), Json(req)).await;
+        assert!(
+            matches!(result, Err(AppError::ServiceUnavailable(msg)) if msg == "no workers available")
+        );
+    }
+
+    #[tokio::test]
+    async fn both_embeddings_returns_invalid_request_for_empty_input_when_ready() {
+        use crate::models::TextInput;
+        let state = Arc::new(AppState {
+            pool: EmbedPool::with_fixed_responses(vec![], vec![]),
+            ready: AtomicBool::new(true),
+            max_batch: 256,
+            total_workers: 1,
+            max_seq_length: 8192,
+            tuning: std::sync::OnceLock::new(),
+        });
+        let req = DualRequest {
+            input: TextInput(vec![]),
+            model: None,
+        };
+        let result = both_embeddings(State(state), Json(req)).await;
+        assert!(
+            matches!(result, Err(AppError::InvalidRequest(ref msg)) if msg.contains("empty")),
+            "expected InvalidRequest for empty input, got: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn both_embeddings_returns_invalid_request_for_over_batch_when_ready() {
+        use crate::models::TextInput;
+        let state = Arc::new(AppState {
+            pool: EmbedPool::with_fixed_responses(vec![], vec![]),
+            ready: AtomicBool::new(true),
+            max_batch: 2,
+            total_workers: 1,
+            max_seq_length: 8192,
+            tuning: std::sync::OnceLock::new(),
+        });
+        let req = DualRequest {
+            input: TextInput(vec!["a".into(), "b".into(), "c".into()]),
+            model: None,
+        };
+        let result = both_embeddings(State(state), Json(req)).await;
+        assert!(
+            matches!(result, Err(AppError::InvalidRequest(ref msg)) if msg.contains("exceeds")),
+            "expected InvalidRequest for over-batch, got: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn both_embeddings_returns_correct_shape() {
+        use crate::models::TextInput;
+        let dense_fixture = vec![vec![0.1f32, 0.2, 0.3], vec![0.4, 0.5, 0.6]];
+        let sparse_fixture = vec![
+            crate::embedder::SparseEmbedding {
+                indices: vec![42usize],
+                values: vec![0.5f32],
+            },
+            crate::embedder::SparseEmbedding {
+                indices: vec![100usize, 200usize],
+                values: vec![0.7f32, 0.9f32],
+            },
+        ];
+        let state = Arc::new(AppState {
+            pool: EmbedPool::with_fixed_responses(dense_fixture, sparse_fixture),
+            ready: AtomicBool::new(true),
+            max_batch: 256,
+            total_workers: 1,
+            max_seq_length: 8192,
+            tuning: std::sync::OnceLock::new(),
+        });
+        let req = DualRequest {
+            input: TextInput(vec!["hello".into(), "world".into()]),
+            model: None,
+        };
+        let result = both_embeddings(State(state), Json(req)).await;
+        assert!(result.is_ok(), "expected Ok but got: {:?}", result.err());
+        let Json(resp) = result.expect("both_embeddings should succeed");
+        assert_eq!(resp.object, "list");
+        assert_eq!(resp.model, "bge-m3");
+        assert_eq!(resp.data.len(), 2);
+        assert_eq!(resp.data[0].index, 0);
+        assert_eq!(resp.data[1].index, 1);
+        assert_eq!(resp.data[0].embedding, vec![0.1f32, 0.2, 0.3]);
+        assert_eq!(resp.data[1].embedding, vec![0.4, 0.5, 0.6]);
+        assert_eq!(resp.data[0].sparse_values.indices, vec![42u32]);
+        assert_eq!(resp.data[1].sparse_values.indices, vec![100u32, 200u32]);
+        assert_eq!(resp.data[1].sparse_values.values, vec![0.7f32, 0.9f32]);
     }
 
     #[tokio::test]
