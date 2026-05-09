@@ -133,6 +133,10 @@ fn env_override() -> Option<usize> {
 
 #[cfg(target_os = "linux")]
 fn cgroup_memory() -> Option<MemoryReading> {
+    // Sentinel threshold: the cgroup v1 kernel uses a near-i64::MAX value when
+    // no limit is configured. Treat any value ≥ 1 TiB as "unlimited".
+    const ONE_TIB: usize = 1024 * 1024 * 1024 * 1024;
+
     // cgroup v2: /sys/fs/cgroup/memory.max (value "max" means unlimited)
     if let Ok(raw) = std::fs::read_to_string("/sys/fs/cgroup/memory.max") {
         let trimmed = raw.trim();
@@ -148,9 +152,6 @@ fn cgroup_memory() -> Option<MemoryReading> {
     }
 
     // cgroup v1: /sys/fs/cgroup/memory/memory.limit_in_bytes
-    // The kernel sets a sentinel value of 9223372036854771712 (near i64::MAX)
-    // when no limit is configured. Treat any value ≥ 1 TiB as "unlimited".
-    const ONE_TIB: usize = 1024 * 1024 * 1024 * 1024;
     if let Ok(raw) = std::fs::read_to_string("/sys/fs/cgroup/memory/memory.limit_in_bytes") {
         let trimmed = raw.trim();
         if let Ok(bytes) = trimmed.parse::<usize>() {
