@@ -1,0 +1,15 @@
+# Rust build artifacts (can be several GB)
+target/
+
+# Git history
+.git/
+
+# Documentation and tooling config
+*.md
+.github/
+deny.toml
+.gitignore
+
+# Dev-only source directories not copied by the Dockerfile
+examples/
+tests/
