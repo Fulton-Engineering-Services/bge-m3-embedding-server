@@ -96,10 +96,22 @@ derives the state — there is no cached status that can go stale.
 
 ### ok — Fully operational
 
+When ready, the response also includes `max_seq_length` and the `tuning` object
+derived at startup (null if the probe has not yet run or was skipped):
+
 ```json
 {
   "status": "ok",
-  "workers": { "live": 2, "total": 2 }
+  "workers": { "live": 2, "total": 2 },
+  "max_seq_length": 8192,
+  "tuning": {
+    "a_bytes_per_token": 18432.0,
+    "b_bytes_per_token_sq": 6.2,
+    "max_workspace_bytes": 2500000000,
+    "memory_source": "cgroup_v2",
+    "available_bytes": 28991029248,
+    "model_rss_bytes_per_worker": 1100000000
+  }
 }
 ```
 

@@ -1,6 +1,8 @@
 # Performance
 
-This document covers MLAS vs CoreML benchmark results, the `BGE_M3_ONNX_BATCH_SIZE` OOM fix, and memory footprint analysis for the BGE-M3 embedding server on Apple Silicon.
+This document covers MLAS vs CoreML benchmark results, memory footprint analysis, and embedding quality for the BGE-M3 embedding server on Apple Silicon.
+
+> **BGE_M3_ONNX_BATCH_SIZE note:** The static batch-size knob described in sections below is now deprecated. The server automatically derives a safe workspace budget via the startup probe on Linux (see [architecture.md](architecture.md)). The historical analysis below remains accurate for understanding why the static default was `8` on macOS and informs the conservative fallback constants in the quadratic cost model.
 
 ## Overview
 
@@ -309,7 +311,7 @@ Estimated savings are relative to the CoreML 2-worker projection of 25–44 GB. 
 |---|--------|-------------|-----------|
 | 1 | **`BGE_M3_WORKERS=1`** | ~12–22 GB (CoreML) | Requests queue behind a single worker. P99 ~120 ms queued still beats MLAS P50 for long texts. |
 | 2 | **Shorter idle timeout** | Full model memory when idle | `BGE_M3_IDLE_TIMEOUT_SECS` already implemented. With CoreML model cache, reload ~5–10 s from compiled cache vs ~15–30 s cold. |
-| 3 | **Smaller `BGE_M3_ONNX_BATCH_SIZE`** | Reduces `FastPrediction` workspace | Already at 8 (safe minimum). Reducing to 4 halves workspace but doubles wall-clock for batch indexing. |
+| 3 | **Lower `BGE_M3_MAX_SEQ_LENGTH`** | Reduces auto-budget workspace ceiling | Setting `BGE_M3_MAX_SEQ_LENGTH=512` restores historical behavior; setting `=2048` matches codekeeper `max-tokens`. The bin-packer will pack more texts per chunk at shorter lengths. |
 
 ### Tier 2 — Moderate code changes
 

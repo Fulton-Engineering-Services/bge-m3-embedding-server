@@ -52,7 +52,8 @@ Source: [`../scripts/ai.bge-m3.server.plist`](../scripts/ai.bge-m3.server.plist)
 | `BGE_M3_WORKERS` | `2` | Two worker threads, each with its own ORT session |
 | `BGE_M3_MAX_BATCH` | `256` | Maximum texts per request |
 | `BGE_M3_IDLE_TIMEOUT_SECS` | `0` | Models stay resident permanently — dedicated server |
-| `BGE_M3_ONNX_BATCH_SIZE` | `8` | Limits CoreML FastPrediction tensor workspace; prevents OOM on all text lengths. See [performance.md](performance.md) |
+| `BGE_M3_MAX_SEQ_LENGTH` | `2048` | Sequence length capped to match consumer `max-tokens=2048`; avoids the full 8192 probe cost on Apple Silicon where auto-budget uses conservative defaults. |
+| `BGE_M3_DISABLE_AUTO_BUDGET` | `1` | Startup probe uses Linux cgroup/proc APIs; skip on macOS to avoid unnecessary delay. |
 | `BGE_M3_MODEL` | `fp16` | Xenova/bge-m3 FP16 (~1.08 GB/session); halves peak memory vs fp32. See [model-variants.md](model-variants.md) |
 | `BGE_M3_CACHE_DIR` | `~/.cache/bge-m3` | Model cache location (resolved from `__HOME__` by the install script; `launchd` does not expand `~`) |
 | `BGE_M3_LOG_FORMAT` | `json` | Structured logging |
