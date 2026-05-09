@@ -18,7 +18,7 @@ This document covers MLAS vs CoreML benchmark results, memory footprint analysis
 
 ## Benchmark Corpus
 
-Curated from three production databases on `jpfulton-imac.lan` via the `db-backup` container. Stored at `benches/fixtures/corpus.json`.
+Curated from three production databases via a `db-backup` sidecar. Stored at `benches/fixtures/corpus.json`.
 
 | Scenario | Source | Count | Char range | Description |
 |----------|--------|-------|------------|-------------|
@@ -35,43 +35,35 @@ Curated from three production databases on `jpfulton-imac.lan` via the `db-backu
 | `codekeeper` | `codekeeper-db` | `symbols`, `symbol_embeddings` | 185K symbols / 0 embeddings | Embeddings not yet generated; symbols have name_path + signature |
 | `langfuse` | `langfuse-db` | `observations`, `traces` | 0 / 0 | Not yet wired for tracing |
 
-**Extraction queries (for reproducibility):**
+**Extraction queries (for reproducibility):** the corpus is built by sampling rows from
+three Postgres databases used by downstream consumers. The exact `psql` commands are not
+portable — adapt the queries below to your own environment by pointing them at any
+Postgres instance with similar tables.
 
-```bash
-# From local machine — pipes through SSH to db-backup container
+```sql
+-- Knowledgebase chunks (stratified by length)
+SELECT json_agg(row_to_json(t)) FROM (
+  (SELECT content, length(content) AS char_count, 'short' AS bucket
+   FROM chunks WHERE length(content) < 1000 ORDER BY random() LIMIT 10)
+  UNION ALL
+  (SELECT content, length(content), 'medium'
+   FROM chunks WHERE length(content) BETWEEN 1000 AND 1500 ORDER BY random() LIMIT 20)
+  UNION ALL
+  (SELECT content, length(content), 'long'
+   FROM chunks WHERE length(content) > 1500 ORDER BY random() LIMIT 20)
+) t;
 
-# Knowledgebase chunks (stratified)
-ssh jpfulton-imac-ha "cd ~/dpos-ha-config && docker exec db-backup \
-  env PGPASSWORD=\$(grep KB_DB_PASSWORD .env | cut -d= -f2) \
-  psql -h coordinator-db -U knowledgebase -d knowledgebase -t -A -c \"
-    SELECT json_agg(row_to_json(t)) FROM (
-      (SELECT content, length(content) AS char_count, 'short' AS bucket
-       FROM chunks WHERE length(content) < 1000 ORDER BY random() LIMIT 10)
-      UNION ALL
-      (SELECT content, length(content), 'medium'
-       FROM chunks WHERE length(content) BETWEEN 1000 AND 1500 ORDER BY random() LIMIT 20)
-      UNION ALL
-      (SELECT content, length(content), 'long'
-       FROM chunks WHERE length(content) > 1500 ORDER BY random() LIMIT 20)
-    ) t\""
+-- Tool descriptions (complete set)
+SELECT json_agg(row_to_json(t)) FROM (
+  SELECT content, length(content) AS char_count
+  FROM vector_store WHERE content IS NOT NULL ORDER BY length(content)
+) t;
 
-# Coordinator vector_store (complete)
-ssh jpfulton-imac-ha "cd ~/dpos-ha-config && docker exec db-backup \
-  env PGPASSWORD=\$(grep COORDINATOR_DB_PASSWORD .env | cut -d= -f2) \
-  psql -h coordinator-db -U coordinator -d coordinator -t -A -c \"
-    SELECT json_agg(row_to_json(t)) FROM (
-      SELECT content, length(content) AS char_count
-      FROM vector_store WHERE content IS NOT NULL ORDER BY length(content)
-    ) t\""
-
-# Codekeeper symbols (random sample)
-ssh jpfulton-imac-ha "cd ~/dpos-ha-config && docker exec db-backup \
-  env PGPASSWORD=\$(grep CODEKEEPER_DB_PASSWORD .env | cut -d= -f2) \
-  psql -h codekeeper-db -U codekeeper -d codekeeper -t -A -c \"
-    SELECT json_agg(row_to_json(t)) FROM (
-      SELECT s.name_path AS content, length(s.name_path) AS char_count, s.kind
-      FROM symbols s ORDER BY random() LIMIT 50
-    ) t\""
+-- Code symbols (random sample)
+SELECT json_agg(row_to_json(t)) FROM (
+  SELECT s.name_path AS content, length(s.name_path) AS char_count, s.kind
+  FROM symbols s ORDER BY random() LIMIT 50
+) t;
 ```
 
 ---
@@ -287,7 +279,7 @@ Projected total for `BGE_M3_WORKERS=2`:
 | GPU/Metal allocations | — | unknown | Metal command buffers, shader cache |
 | **Total** | **14 GB** | **25–44 GB** | 2–3× increase |
 
-On 128 GB hardware this is workable (20–34% of RAM). On 96 GB (`jpfulton-imac.lan` production server), the upper range could cause memory pressure alongside other services (LiteLLM, Langfuse, coordinator, STT, Homebridge).
+On 128 GB hardware this is workable (20–34% of RAM). On a 96 GB host the upper range could cause memory pressure when running alongside other services (LLM gateway, observability, vector DBs, etc.).
 
 ### Worker Count Trade-Off
 

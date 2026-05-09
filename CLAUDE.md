@@ -2,10 +2,11 @@
 
 Axum HTTP server serving BGE-M3 dense and sparse embeddings via direct ONNX Runtime integration.
 
-## Consumers
+## Use Cases
 
-- **mcp-local-knowledge-base** — calls `/v1/sparse-embeddings` and `/v1/embeddings` to index and search documents
-- **dpos-coordinator** — calls `/v1/embeddings` for semantic memory retrieval
+- Document indexing and hybrid search via the `/v1/embeddings` (dense) and `/v1/sparse-embeddings` (SPLADE-style) endpoints
+- Semantic memory retrieval for agent / RAG workloads via the OpenAI-compatible `/v1/embeddings` endpoint
+- Drop-in replacement for hosted embedding APIs when local inference, data residency, or BGE-M3-specific sparse vectors are required
 
 ## Features
 
@@ -169,6 +170,31 @@ memory detection but cannot read process RSS, so conservative defaults apply. Ap
 Silicon CoreML behavior is unchanged. **Note:** the Linux Docker image runs `/proc`
 + cgroup paths normally even on Apple Silicon hosts (the probe sees the Docker VM,
 not the macOS host), so the scope limitation only affects the native macOS binary.
+
+## Verifying auto-budget tuning after deploy
+
+After the server starts and `/health` returns `ok`, curl the health endpoint to confirm the
+probe ran and the expected knobs are in effect:
+
+```bash
+curl http://localhost:8081/health | jq '{status,max_seq_length,tuning}'
+```
+
+Expected fields in the response:
+
+| Field | Meaning |
+|---|---|
+| `max_seq_length` | Should match the configured (or default) `BGE_M3_MAX_SEQ_LENGTH` — e.g. `8192` |
+| `tuning.memory_source` | How memory was detected — `cgroup_v2`, `cgroup_v1`, or `proc_meminfo` |
+| `tuning.available_bytes` | Container memory visible to the server |
+| `tuning.max_workspace_bytes` | Derived workspace budget after applying `BGE_M3_MEMORY_SAFETY_FACTOR` |
+| `tuning.a_bytes_per_token` | Probe-fitted linear coefficient; should be ~18000–20000 for fp16 on amd64 |
+| `tuning.b_bytes_per_token_sq` | Probe-fitted quadratic coefficient; should be ~5–8 for fp16 |
+| `tuning.model_rss_bytes_per_worker` | Per-worker model RSS — ~1.1 GB for fp16 |
+
+If `tuning` is absent or `max_seq_length` does not match the expected value, check whether
+`BGE_M3_DISABLE_AUTO_BUDGET=1` was accidentally set, or whether the model variant lacks
+positional embeddings at the configured length (the startup probe will error in that case).
 
 ## Docker
 

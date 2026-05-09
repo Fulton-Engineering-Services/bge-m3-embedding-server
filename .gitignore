@@ -2,3 +2,6 @@
 /.worktrees
 
 .DS_Store
+
+# AI assistant working state — never commit
+.serena/
