@@ -1,4 +1,6 @@
+use crate::binpack::{bin_pack, CostModel};
 use crate::config::ModelVariant;
+use crate::sysinfo;
 use anyhow::Result;
 use ndarray::ArrayView1;
 use ort::value::TensorRef;
@@ -22,6 +24,11 @@ pub struct SparseEmbedding {
     pub values: Vec<f32>,
 }
 
+/// OS headroom reserved for kernel, stack, ORT arena, and other non-model
+/// allocations. Subtracted from available memory before computing
+/// per-worker workspace.
+pub(crate) const OS_HEADROOM_BYTES: usize = 256 * 1024 * 1024; // 256 MiB
+
 pub enum EmbedRequest {
     Dense {
         texts: Vec<String>,
@@ -31,6 +38,18 @@ pub enum EmbedRequest {
         texts: Vec<String>,
         reply: oneshot::Sender<Result<Vec<SparseEmbedding>>>,
     },
+    /// Internal: used during startup probe to run a single batch and measure
+    /// peak RSS delta. Workers only process this before `ready` is set.
+    Probe {
+        texts: Vec<String>,
+        reply: oneshot::Sender<Result<ProbeResult>>,
+    },
+}
+
+/// Result of a single probe `session.run()` call.
+pub(crate) struct ProbeResult {
+    pub rss_before: usize,
+    pub rss_after: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -48,8 +67,6 @@ const XENOVA_REPO_ID: &str = "Xenova/bge-m3";
 /// Update intentionally after verifying equivalent embedding quality vs FP32.
 const XENOVA_REPO_REVISION: &str = "4de13258303883538bd53b696b452bf8099f0858";
 
-const MAX_SEQ_LENGTH: usize = 512;
-
 /// CLS, PAD, SEP/EOS, UNK — excluded from sparse output.
 const SPECIAL_TOKENS: [u32; 4] = [0, 1, 2, 3];
 
@@ -63,17 +80,6 @@ struct ModelFiles {
 }
 
 /// Downloads BGE-M3 model files from Hugging Face Hub (or returns cached paths).
-///
-/// For `ModelVariant::Fp32`, downloads from `BAAI/bge-m3` (FP32, ~2.16 GB) pinned
-/// to [`REPO_REVISION`]. The FP32 model uses external initializer files that must
-/// be co-located with `model.onnx`.
-///
-/// For `ModelVariant::Fp16`, downloads `onnx/model_fp16.onnx` from `Xenova/bge-m3`
-/// (~1.08 GB) pinned to [`XENOVA_REPO_REVISION`]. Single self-contained ONNX file.
-///
-/// For `ModelVariant::Int8`, downloads `onnx/model_int8.onnx` from `Xenova/bge-m3`
-/// (~568 MB) pinned to [`XENOVA_REPO_REVISION`]. Weights-only INT8 quantization;
-/// activations remain f32, so output tensors are extracted as `f32` at runtime.
 fn download_model_files(
     cache_dir: &Path,
     show_progress: bool,
@@ -101,7 +107,6 @@ fn download_model_files(
             let path = repo
                 .get("onnx/model.onnx")
                 .map_err(|e| anyhow::anyhow!("Failed to get onnx/model.onnx: {e}"))?;
-            // External initializer files must be co-located with model.onnx.
             repo.get("onnx/model.onnx_data")
                 .map_err(|e| anyhow::anyhow!("Failed to get onnx/model.onnx_data: {e}"))?;
             repo.get("onnx/Constant_7_attr__value")
@@ -120,34 +125,29 @@ fn download_model_files(
         .get("tokenizer.json")
         .map_err(|e| anyhow::anyhow!("Failed to get tokenizer.json: {e}"))?;
 
-    Ok(ModelFiles {
-        onnx_path,
-        tokenizer_path,
-    })
+    Ok(ModelFiles { onnx_path, tokenizer_path })
 }
 
-/// Loads and configures the BGE-M3 tokenizer.
-///
-/// Truncation: `LongestFirst` at `MAX_SEQ_LENGTH` (512).
-/// Padding: `BatchLongest` with `pad_id=1`, `pad_token=<pad>`.
-fn load_tokenizer(tokenizer_path: &Path) -> Result<tokenizers::Tokenizer> {
+/// Loads and configures the BGE-M3 tokenizer with truncation at `max_seq_length`
+/// but **no** padding. Padding is applied per-chunk in [`build_chunk_arrays`].
+fn load_tokenizer(
+    tokenizer_path: &Path,
+    max_seq_length: usize,
+) -> Result<tokenizers::Tokenizer> {
     let mut tokenizer = tokenizers::Tokenizer::from_file(tokenizer_path)
         .map_err(|e| anyhow::anyhow!("Failed to load tokenizer: {e}"))?;
 
     tokenizer
         .with_truncation(Some(tokenizers::TruncationParams {
-            max_length: MAX_SEQ_LENGTH,
+            max_length: max_seq_length,
             strategy: tokenizers::TruncationStrategy::LongestFirst,
             ..Default::default()
         }))
         .map_err(|e| anyhow::anyhow!("Failed to set truncation: {e}"))?;
 
-    tokenizer.with_padding(Some(tokenizers::PaddingParams {
-        strategy: tokenizers::PaddingStrategy::BatchLongest,
-        pad_id: 1,
-        pad_token: "<pad>".to_string(),
-        ..Default::default()
-    }));
+    // No BatchLongest padding here — we pad manually in build_chunk_arrays
+    // so each chunk only pads to its own longest sequence.
+    tokenizer.with_padding(None);
 
     Ok(tokenizer)
 }
@@ -220,45 +220,57 @@ fn sparse_maxpool(ids: &[u32], mask: &[u32], scores: &[f32]) -> (Vec<usize>, Vec
 }
 
 // ---------------------------------------------------------------------------
-// Shared tokenization helper
+// Tokenization helpers (no-pad path)
 // ---------------------------------------------------------------------------
 
-/// Tokenizes a batch of texts and returns `(input_ids, attention_mask, encodings)`.
-///
-/// The returned `Array2<i64>` matrices have shape `[batch, seq_len]` with padding
-/// applied by `BatchLongest`. The raw `Encoding` vector is returned so callers
-/// that need per-token IDs (sparse path) can iterate without re-tokenizing.
-fn tokenize_to_arrays(
+/// Tokenizes `texts` without applying any padding. Returns one `Encoding` per text,
+/// each truncated to the tokenizer's configured `max_length`.
+fn tokenize_no_pad(
     tokenizer: &tokenizers::Tokenizer,
     texts: &[String],
-) -> Result<(
-    ndarray::Array2<i64>,
-    ndarray::Array2<i64>,
-    Vec<tokenizers::Encoding>,
-)> {
+) -> Result<Vec<tokenizers::Encoding>> {
     let str_refs: Vec<&str> = texts.iter().map(String::as_str).collect();
     let encodings = tokenizer
-        .encode_batch(str_refs, true)
+        .encode_batch_fast(str_refs, true)
         .map_err(|e| anyhow::anyhow!("Tokenization failed: {e}"))?;
+    Ok(encodings)
+}
 
-    if encodings.is_empty() {
-        anyhow::bail!("tokenizer returned empty batch for non-empty input");
+/// Builds `input_ids` and `attention_mask` arrays for a single chunk.
+///
+/// `indices` selects which encodings from `all_encodings` belong to this chunk.
+/// `pad_to` is the chunk-local maximum sequence length; all sequences are
+/// right-padded with `pad_id = 1` (XLM-RoBERTa `<pad>` token).
+#[allow(clippy::cast_possible_truncation)]
+fn build_chunk_arrays(
+    all_encodings: &[tokenizers::Encoding],
+    indices: &[usize],
+    pad_to: usize,
+) -> Result<(ndarray::Array2<i64>, ndarray::Array2<i64>)> {
+    let batch = indices.len();
+    let mut ids_flat: Vec<i64> = Vec::with_capacity(batch * pad_to);
+    let mut mask_flat: Vec<i64> = Vec::with_capacity(batch * pad_to);
+
+    for &idx in indices {
+        let enc = &all_encodings[idx];
+        let token_ids = enc.get_ids();
+        let attn_mask = enc.get_attention_mask();
+        let seq_len = token_ids.len();
+
+        // Copy token ids and mask
+        ids_flat.extend(token_ids.iter().map(|&id| i64::from(id)));
+        mask_flat.extend(attn_mask.iter().map(|&m| i64::from(m)));
+
+        // Right-pad with pad_id=1 / mask=0
+        let pad = pad_to.saturating_sub(seq_len);
+        ids_flat.extend(std::iter::repeat(1i64).take(pad));
+        mask_flat.extend(std::iter::repeat(0i64).take(pad));
     }
 
-    let batch_len = encodings.len();
-    let seq_len = encodings[0].get_ids().len();
+    let ids_array = ndarray::Array2::from_shape_vec((batch, pad_to), ids_flat)?;
+    let mask_array = ndarray::Array2::from_shape_vec((batch, pad_to), mask_flat)?;
 
-    let mut ids_flat: Vec<i64> = Vec::with_capacity(batch_len * seq_len);
-    let mut mask_flat: Vec<i64> = Vec::with_capacity(batch_len * seq_len);
-    for enc in &encodings {
-        ids_flat.extend(enc.get_ids().iter().map(|&id| i64::from(id)));
-        mask_flat.extend(enc.get_attention_mask().iter().map(|&m| i64::from(m)));
-    }
-
-    let ids_array = ndarray::Array2::from_shape_vec((batch_len, seq_len), ids_flat)?;
-    let mask_array = ndarray::Array2::from_shape_vec((batch_len, seq_len), mask_flat)?;
-
-    Ok((ids_array, mask_array, encodings))
+    Ok((ids_array, mask_array))
 }
 
 // ---------------------------------------------------------------------------
@@ -267,23 +279,34 @@ fn tokenize_to_arrays(
 
 /// Produces L2-normalized dense embeddings.
 ///
-/// For `ModelVariant::Fp32`, reads `sentence_embedding` [batch, 1024] — already
-/// CLS-pooled by the BAAI/bge-m3 export. For `ModelVariant::Fp16` and
-/// `ModelVariant::Int8`, reads `last_hidden_state` [batch, seq, 1024] and
-/// CLS-pools by selecting position 0. ORT promotes FP16/INT8 tensor values to
-/// f32 during `try_extract_array::<f32>()`.
+/// Tokenizes once, then uses the cost model to bin-pack into chunks that fit
+/// within the workspace budget. Results are scattered back to the original
+/// input order.
 #[allow(clippy::cast_possible_truncation)]
 fn embed_dense(
     session: &mut ort::session::Session,
     tokenizer: &tokenizers::Tokenizer,
     texts: &[String],
-    batch_size: usize,
+    cost_model: &CostModel,
     model_variant: ModelVariant,
 ) -> Result<Vec<Vec<f32>>> {
-    let mut all_embeddings = Vec::with_capacity(texts.len());
+    let encodings = tokenize_no_pad(tokenizer, texts)?;
+    let seq_lens: Vec<usize> = encodings.iter().map(|e| e.get_ids().len()).collect();
 
-    for chunk in texts.chunks(batch_size) {
-        let (ids_array, mask_array, _encodings) = tokenize_to_arrays(tokenizer, chunk)?;
+    let chunks = bin_pack(&seq_lens, cost_model);
+
+    // Pre-allocate output slots (one per input text, filled below).
+    let mut all_embeddings: Vec<Vec<f32>> = (0..texts.len()).map(|_| Vec::new()).collect();
+
+    for chunk_indices in &chunks {
+        let chunk_max = chunk_indices
+            .iter()
+            .map(|&i| seq_lens[i])
+            .max()
+            .unwrap_or(1)
+            .max(1); // guard: at least 1 to avoid 0-dim tensors
+
+        let (ids_array, mask_array) = build_chunk_arrays(&encodings, chunk_indices, chunk_max)?;
         let batch_len = ids_array.nrows();
 
         let ids_tensor = TensorRef::from_array_view(ids_array.view())?;
@@ -296,7 +319,6 @@ fn embed_dense(
 
         // FP32: sentence_embedding [batch, 1024] — pre-pooled CLS output.
         // FP16/INT8: last_hidden_state [batch, seq, 1024] — CLS token at position 0.
-        // Both branches produce an owned ArrayD<f32> with shape [batch, 1024].
         let emb: ndarray::ArrayD<f32> = match model_variant {
             ModelVariant::Fp32 => outputs["sentence_embedding"]
                 .try_extract_array::<f32>()?
@@ -307,14 +329,15 @@ fn embed_dense(
             }
         };
 
-        for i in 0..batch_len {
-            let row = emb.index_axis(ndarray::Axis(0), i);
+        for (chunk_pos, &orig_idx) in chunk_indices.iter().enumerate() {
+            debug_assert!(chunk_pos < batch_len, "chunk_pos must be within batch");
+            let row = emb.index_axis(ndarray::Axis(0), chunk_pos);
             let mut vec = row
                 .as_slice()
                 .expect("embedding should be contiguous")
                 .to_vec();
             normalize_l2(&mut vec);
-            all_embeddings.push(vec);
+            all_embeddings[orig_idx] = vec;
         }
     }
 
@@ -323,26 +346,35 @@ fn embed_dense(
 
 /// Produces sparse embeddings via the BGE-M3 sparse-linear projection.
 ///
-/// Reads per-token hidden states [batch, seq, 1024] — `token_embeddings` for
-/// `ModelVariant::Fp32`, `last_hidden_state` for `ModelVariant::Fp16` and
-/// `ModelVariant::Int8` — and
-/// projects each token through the sparse-linear weight vector, applies `ReLU`,
-/// and max-pools across token positions sharing the same vocabulary ID.
+/// Tokenizes once, then uses the cost model to bin-pack into chunks. Results
+/// are scattered back to the original input order.
 #[allow(clippy::cast_possible_truncation)]
 fn embed_sparse(
     session: &mut ort::session::Session,
     tokenizer: &tokenizers::Tokenizer,
     texts: &[String],
-    batch_size: usize,
+    cost_model: &CostModel,
     model_variant: ModelVariant,
 ) -> Result<Vec<SparseEmbedding>> {
     let (weight, bias) = crate::weights::sparse_linear();
     let weight_view = weight.view();
 
-    let mut all_sparse = Vec::with_capacity(texts.len());
+    let encodings = tokenize_no_pad(tokenizer, texts)?;
+    let seq_lens: Vec<usize> = encodings.iter().map(|e| e.get_ids().len()).collect();
 
-    for chunk in texts.chunks(batch_size) {
-        let (ids_array, mask_array, encodings) = tokenize_to_arrays(tokenizer, chunk)?;
+    let chunks = bin_pack(&seq_lens, cost_model);
+
+    let mut all_sparse: Vec<Option<SparseEmbedding>> = (0..texts.len()).map(|_| None).collect();
+
+    for chunk_indices in &chunks {
+        let chunk_max = chunk_indices
+            .iter()
+            .map(|&i| seq_lens[i])
+            .max()
+            .unwrap_or(1)
+            .max(1);
+
+        let (ids_array, mask_array) = build_chunk_arrays(&encodings, chunk_indices, chunk_max)?;
 
         let ids_tensor = TensorRef::from_array_view(ids_array.view())?;
         let mask_tensor = TensorRef::from_array_view(mask_array.view())?;
@@ -361,12 +393,12 @@ fn embed_sparse(
             }
         };
 
-        for (i, enc) in encodings.iter().enumerate() {
+        for (chunk_pos, &orig_idx) in chunk_indices.iter().enumerate() {
+            let enc = &encodings[orig_idx];
             let ids = enc.get_ids();
             let mask = enc.get_attention_mask();
-            let batch_hidden = token_emb.index_axis(ndarray::Axis(0), i);
+            let batch_hidden = token_emb.index_axis(ndarray::Axis(0), chunk_pos);
 
-            // Project each token's hidden state through sparse_linear.
             let scores: Vec<f32> = (0..ids.len())
                 .map(|j| {
                     let hidden = batch_hidden.index_axis(ndarray::Axis(0), j);
@@ -378,47 +410,50 @@ fn embed_sparse(
                 .collect();
 
             let (indices, values) = sparse_maxpool(ids, mask, &scores);
-            all_sparse.push(SparseEmbedding { indices, values });
+            all_sparse[orig_idx] = Some(SparseEmbedding { indices, values });
         }
     }
 
-    Ok(all_sparse)
+    Ok(all_sparse
+        .into_iter()
+        .map(|s| s.expect("every slot must be filled"))
+        .collect())
+}
+
+/// Runs a single `session.run()` for the probe, measuring RSS before and after.
+///
+/// The probe texts are already tokenized and padded to `pad_to` externally.
+/// This function just runs inference and returns RSS deltas so `probe.rs` can
+/// fit the cost model.
+pub(crate) fn probe_run_dense(
+    session: &mut ort::session::Session,
+    ids_array: ndarray::Array2<i64>,
+    mask_array: ndarray::Array2<i64>,
+) -> Result<ProbeResult> {
+    let rss_before = sysinfo::read_process_rss_bytes().unwrap_or(0);
+
+    let ids_tensor = TensorRef::from_array_view(ids_array.view())?;
+    let mask_tensor = TensorRef::from_array_view(mask_array.view())?;
+
+    // Run inference (output discarded — we only care about RSS).
+    let _outputs = session.run(ort::inputs! {
+        "input_ids" => ids_tensor,
+        "attention_mask" => mask_tensor,
+    })?;
+
+    let rss_after = sysinfo::read_process_rss_bytes().unwrap_or(rss_before);
+
+    Ok(ProbeResult { rss_before, rss_after })
 }
 
 // ---------------------------------------------------------------------------
 // Execution provider configuration
 // ---------------------------------------------------------------------------
 
-/// Returns the execution providers to use for ONNX Runtime sessions.
-///
-/// On macOS (Apple Silicon), registers the `CoreML` Execution Provider to
-/// dispatch model subgraphs to the Neural Engine, GPU, or Accelerate (AMX).
-/// `CoreML` EP requires a source-built ORT with `-Donnxruntime_USE_COREML=ON`
-/// pointed at via `ORT_LIB_LOCATION`. If the EP fails to register, ORT
-/// silently falls back to the CPU EP with MLAS NEON kernels.
-///
-/// Configuration rationale:
-/// - **`MLProgram`** — newer `CoreML` format with broader op coverage and
-///   better optimisation passes; requires macOS 12+ (production targets Tahoe/26).
-/// - **`FastPrediction`** — trades higher model-specialisation time and
-///   memory for lower per-request latency.
-/// - **Model cache** — caches the compiled `CoreML` model to
-///   `{cache_dir}/coreml`, eliminating 5–15 s recompilation per session
-///   load (critical for the idle-unload-reload cycle).
-/// - **`coreml-profile` feature** — when compiled with
-///   `--features coreml-profile`, enables `ProfileComputePlan` which logs
-///   per-op hardware dispatch decisions (GPU vs CPU vs ANE) to stderr.
-///   Diagnostic only; excluded from default builds by `#[cfg]`.
-///
-/// On all other platforms, returns an empty vec (CPU EP only).
 fn execution_providers(cache_dir: &Path) -> Vec<ort::ep::ExecutionProviderDispatch> {
     #[cfg(target_os = "macos")]
     {
         let coreml_cache = cache_dir.join("coreml");
-        // ARC-6: Allow overriding the CoreML specialization strategy via env var.
-        // FastPrediction pre-allocates the full intermediate-tensor workspace, which
-        // can exceed available RAM on low-memory Macs. Set to "default" to fall back
-        // to the CoreML default strategy.
         let strategy = match std::env::var("BGE_M3_COREML_STRATEGY").ok().as_deref() {
             Some("default") => ort::ep::coreml::SpecializationStrategy::Default,
             _ => ort::ep::coreml::SpecializationStrategy::FastPrediction,
@@ -442,25 +477,19 @@ fn execution_providers(cache_dir: &Path) -> Vec<ort::ep::ExecutionProviderDispat
 // Worker infrastructure
 // ---------------------------------------------------------------------------
 
-/// Loads both the ORT session and tokenizer from `cache_dir`.
-///
-/// Called at worker startup and again after an idle unload whenever a new
-/// request arrives. Both session and tokenizer are always loaded and unloaded
-/// as a pair.
 fn load_models(
     cache_dir: &Path,
     show_download_progress: bool,
     model_variant: ModelVariant,
+    max_seq_length: usize,
 ) -> Result<(ort::session::Session, tokenizers::Tokenizer)> {
     let files = download_model_files(cache_dir, show_download_progress, model_variant)?;
-    let tokenizer = load_tokenizer(&files.tokenizer_path)?;
+    let tokenizer = load_tokenizer(&files.tokenizer_path, max_seq_length)?;
     let eps = execution_providers(cache_dir);
     let session = load_session(&files.onnx_path, eps)?;
     Ok((session, tokenizer))
 }
 
-/// RAII guard that decrements the live-worker counter when dropped.
-/// Guarantees decrement fires on clean exit AND on panic unwind.
 struct WorkerGuard(Arc<AtomicUsize>);
 
 impl Drop for WorkerGuard {
@@ -476,24 +505,18 @@ impl Drop for WorkerGuard {
 }
 
 /// Execution-policy configuration shared by all workers.
-///
-/// Groups the policy arguments that were previously passed as individual
-/// positional parameters to `run_worker`, keeping the function signature
-/// manageable as configuration options grow.
 #[derive(Clone)]
 pub(crate) struct WorkerConfig {
-    /// Maximum texts per ONNX `session.run()` call.
-    pub onnx_batch_size: usize,
+    /// Quadratic-aware workspace cost model and per-worker budget.
+    pub cost_model: CostModel,
     /// Duration of inactivity before workers unload their model instances.
     pub idle_timeout: Option<Duration>,
-    /// ONNX model variant to load (FP32 or FP16).
+    /// ONNX model variant to load (FP32, FP16, or INT8).
     pub model_variant: ModelVariant,
+    /// Maximum tokenized sequence length.
+    pub max_seq_length: usize,
 }
 
-/// Body of a single embedding worker thread.
-///
-/// Called from a `spawn_blocking` task. Loads models, signals readiness, then
-/// processes requests from the shared channel until it closes.
 #[allow(clippy::needless_pass_by_value, clippy::too_many_lines)]
 fn run_worker(
     id: usize,
@@ -511,7 +534,12 @@ fn run_worker(
     info!("Loading models (worker {id})...");
     let load_start = std::time::Instant::now();
     let rt = Handle::current();
-    let initial_models = match load_models(&cache_dir, id == 0, config.model_variant) {
+    let initial_models = match load_models(
+        &cache_dir,
+        id == 0,
+        config.model_variant,
+        config.max_seq_length,
+    ) {
         Ok(models) => {
             tracing::info!(
                 elapsed_ms = load_start.elapsed().as_millis(),
@@ -531,16 +559,8 @@ fn run_worker(
 
     let mut models: Option<(ort::session::Session, tokenizers::Tokenizer)> = Some(initial_models);
 
-    // CONCURRENCY NOTE (COR-2): The shared-receiver pattern with Mutex
-    // serializes which worker is *waiting* for the next message — only one
-    // worker holds the lock on recv() at a time. The Mutex is released as
-    // soon as recv() returns a message, allowing the next idle worker to
-    // acquire it. Under normal load (ONNX inference takes 10-100ms per
-    // request), at most one request is queued behind the lock.
     info!("Worker {id} entering request loop");
     loop {
-        // Apply idle timeout only when models are loaded.
-        // Once unloaded, wait indefinitely — no timer wakeups needed.
         let msg = if let Some(timeout) = config.idle_timeout.filter(|_| models.is_some()) {
             rt.block_on(async {
                 tokio::time::timeout(timeout, async { rx.lock().await.recv().await }).await
@@ -551,7 +571,6 @@ fn run_worker(
 
         match msg {
             Err(_elapsed) => {
-                // Idle timeout fired while models were loaded — unload them.
                 models = None;
                 loaded_workers.fetch_sub(1, Ordering::AcqRel);
                 tracing::info!("Worker {id} unloaded models after idle timeout");
@@ -564,12 +583,15 @@ fn run_worker(
                 break;
             }
             Ok(Some(request)) => {
-                // Reload models if they were unloaded due to idle timeout.
-                // This blocks the current request until reload completes (~10-30 s).
                 if models.is_none() {
                     tracing::info!("Worker {id} reloading models after idle...");
                     let reload_start = std::time::Instant::now();
-                    match load_models(&cache_dir, false, config.model_variant) {
+                    match load_models(
+                        &cache_dir,
+                        false,
+                        config.model_variant,
+                        config.max_seq_length,
+                    ) {
                         Ok(m) => {
                             models = Some(m);
                             loaded_workers.fetch_add(1, Ordering::AcqRel);
@@ -580,7 +602,6 @@ fn run_worker(
                         }
                         Err(e) => {
                             tracing::error!(error = %e, "Worker {id} failed to reload models");
-                            // Send the error back to this caller and retry on the next request.
                             let err = anyhow::anyhow!("Model reload failed: {e}");
                             match request {
                                 EmbedRequest::Dense { reply, .. } => {
@@ -589,13 +610,15 @@ fn run_worker(
                                 EmbedRequest::Sparse { reply, .. } => {
                                     let _ = reply.send(Err(err));
                                 }
+                                EmbedRequest::Probe { reply, .. } => {
+                                    let _ = reply.send(Err(err));
+                                }
                             }
                             continue;
                         }
                     }
                 }
 
-                // Models are guaranteed loaded at this point.
                 let (session, tokenizer) =
                     models.as_mut().expect("models loaded after reload check");
 
@@ -605,7 +628,7 @@ fn run_worker(
                             session,
                             tokenizer,
                             &texts,
-                            config.onnx_batch_size,
+                            &config.cost_model,
                             config.model_variant,
                         )
                         .map_err(|e| anyhow::anyhow!("Dense embed error: {e}"));
@@ -616,10 +639,16 @@ fn run_worker(
                             session,
                             tokenizer,
                             &texts,
-                            config.onnx_batch_size,
+                            &config.cost_model,
                             config.model_variant,
                         )
                         .map_err(|e| anyhow::anyhow!("Sparse embed error: {e}"));
+                        let _ = reply.send(result);
+                    }
+                    EmbedRequest::Probe { texts, reply } => {
+                        // Probe: tokenize once without padding, run dense inference
+                        // on a single flat batch at the chunk's natural max_seq.
+                        let result = run_probe_batch(session, tokenizer, &texts);
                         let _ = reply.send(result);
                     }
                 }
@@ -628,6 +657,25 @@ fn run_worker(
     }
 
     Ok(())
+}
+
+/// Runs one probe batch: tokenize texts, build padded arrays, call session.run(),
+/// and return RSS deltas. Uses `embed_dense`'s no-pad tokenizer path.
+fn run_probe_batch(
+    session: &mut ort::session::Session,
+    tokenizer: &tokenizers::Tokenizer,
+    texts: &[String],
+) -> Result<ProbeResult> {
+    let encodings = tokenize_no_pad(tokenizer, texts)?;
+    let pad_to = encodings
+        .iter()
+        .map(|e| e.get_ids().len())
+        .max()
+        .unwrap_or(1)
+        .max(1);
+    let indices: Vec<usize> = (0..texts.len()).collect();
+    let (ids_array, mask_array) = build_chunk_arrays(&encodings, &indices, pad_to)?;
+    probe_run_dense(session, ids_array, mask_array)
 }
 
 // ---------------------------------------------------------------------------
@@ -639,34 +687,12 @@ pub struct EmbedPool {
     tx: mpsc::Sender<EmbedRequest>,
     live_workers: Arc<AtomicUsize>,
     /// Number of workers that currently have model instances loaded in memory.
-    ///
-    /// Decremented when a worker drops its models after an idle timeout;
-    /// incremented when a worker reloads them on the next request.
-    /// Used by the `/health` endpoint to distinguish the transient `"idle"`
-    /// state (models unloaded, will auto-reload) from a fatal `"fail"` state.
     loaded_workers: Arc<AtomicUsize>,
 }
 
 impl EmbedPool {
     /// Spawns `n` embedding worker threads and returns the pool plus an init
     /// handle that resolves once all workers have finished loading their models.
-    ///
-    /// `config` — execution policy shared by all workers (batch size, idle timeout).
-    ///
-    /// # Cold-start ordering
-    ///
-    /// Worker 0 (the "leader") is spawned and awaited **before** any follower
-    /// workers. This guarantees the model cache is warm before followers start.
-    ///
-    /// `hf-hub` acquires per-blob exclusive file locks (`flock(LOCK_EX)`) during
-    /// download with a hardcoded 5-second retry window. BGE-M3 ONNX models are
-    /// ~2 GB — a fresh download takes minutes, far exceeding that window. If all
-    /// workers start concurrently on an empty cache, followers fail with
-    /// `ApiError::LockAcquisition`. The leader-then-followers ordering avoids
-    /// the contention entirely; followers load from the now-warm local cache.
-    ///
-    /// Idle-timeout reloads are unaffected: model files remain on disk after
-    /// unload, so concurrent reloads never hit the network download path.
     pub fn spawn(
         n: usize,
         cache_dir: PathBuf,
@@ -676,13 +702,9 @@ impl EmbedPool {
         let (tx, rx) = mpsc::channel::<EmbedRequest>(capacity);
         let rx = Arc::new(Mutex::new(rx));
 
-        // Readiness channel: each worker sends Ok(()) after loading models.
-        // Capacity = n so senders never block.
         let (ready_tx, mut ready_rx) = mpsc::channel::<Result<()>>(n);
 
         let live_workers = Arc::new(AtomicUsize::new(n));
-        // Start at 0; incremented as each worker successfully signals readiness.
-        // This avoids a stale count if the leader or a follower fails during init.
         let loaded_workers = Arc::new(AtomicUsize::new(0));
         let live_workers_for_init = Arc::clone(&live_workers);
         let loaded_workers_for_init = Arc::clone(&loaded_workers);
@@ -691,16 +713,14 @@ impl EmbedPool {
             async move {
                 let mut worker_handles = Vec::with_capacity(n);
 
-                // Closure that spawns a single worker, eliminating duplication
-                // between the leader (Phase 1) and follower (Phase 2) paths.
                 let spawn_worker = |id: usize,
-                                    ready_tx_clone: mpsc::Sender<Result<()>>|
+                                    ready_tx_clone: mpsc::Sender<Result<()>>,
+                                    worker_config: WorkerConfig|
                  -> JoinHandle<Result<()>> {
                     let rx_clone = Arc::clone(&rx);
                     let cache_dir_clone = cache_dir.clone();
                     let live_for_worker = Arc::clone(&live_workers_for_init);
                     let loaded_for_worker = Arc::clone(&loaded_workers_for_init);
-                    let worker_config = config.clone();
                     tokio::task::spawn_blocking(move || {
                         run_worker(
                             id,
@@ -715,9 +735,8 @@ impl EmbedPool {
                 };
 
                 // --- Phase 1: spawn leader worker (may download models) ---
-                worker_handles.push(spawn_worker(0, ready_tx.clone()));
+                worker_handles.push(spawn_worker(0, ready_tx.clone(), config.clone()));
 
-                // Await leader readiness — cache is warm after this succeeds.
                 match ready_rx.recv().await {
                     Some(Ok(())) => {
                         loaded_workers_for_init.fetch_add(1, Ordering::AcqRel);
@@ -734,15 +753,12 @@ impl EmbedPool {
                 }
 
                 // --- Phase 2: spawn follower workers (load from warm cache) ---
-                // When n == 1, both loops below are no-ops (1..1 is empty).
                 for id in 1..n {
-                    worker_handles.push(spawn_worker(id, ready_tx.clone()));
+                    worker_handles.push(spawn_worker(id, ready_tx.clone(), config.clone()));
                 }
 
-                // Drop our copy so recv() can detect early worker exit.
                 drop(ready_tx);
 
-                // Collect follower readiness signals (n - 1 remaining).
                 for i in 1..n {
                     match ready_rx.recv().await {
                         Some(Ok(())) => {
@@ -760,9 +776,6 @@ impl EmbedPool {
                     }
                 }
 
-                // Workers continue running in the background. Their
-                // spawn_blocking tasks are detached when handles are dropped
-                // and will self-terminate when the channel closes (pool drop).
                 drop(worker_handles);
 
                 Ok(())
@@ -771,11 +784,7 @@ impl EmbedPool {
         );
 
         (
-            Self {
-                tx,
-                live_workers,
-                loaded_workers,
-            },
+            Self { tx, live_workers, loaded_workers },
             init_handle,
         )
     }
@@ -783,10 +792,7 @@ impl EmbedPool {
     pub async fn dense(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.tx
-            .send(EmbedRequest::Dense {
-                texts,
-                reply: reply_tx,
-            })
+            .send(EmbedRequest::Dense { texts, reply: reply_tx })
             .await
             .map_err(|_| anyhow::anyhow!("EmbedPool channel closed"))?;
         reply_rx
@@ -797,10 +803,7 @@ impl EmbedPool {
     pub async fn sparse(&self, texts: Vec<String>) -> Result<Vec<SparseEmbedding>> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.tx
-            .send(EmbedRequest::Sparse {
-                texts,
-                reply: reply_tx,
-            })
+            .send(EmbedRequest::Sparse { texts, reply: reply_tx })
             .await
             .map_err(|_| anyhow::anyhow!("EmbedPool channel closed"))?;
         reply_rx
@@ -808,17 +811,24 @@ impl EmbedPool {
             .map_err(|_| anyhow::anyhow!("Worker dropped reply sender"))?
     }
 
-    /// Returns the number of currently live embedding workers.
-    /// Returns 0 if all workers have exited (pool is fully degraded).
+    /// Sends a probe request to a single worker and returns the result.
+    /// Only called during init before `ready` is set.
+    pub(crate) async fn probe(&self, texts: Vec<String>) -> Result<ProbeResult> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.tx
+            .send(EmbedRequest::Probe { texts, reply: reply_tx })
+            .await
+            .map_err(|_| anyhow::anyhow!("EmbedPool channel closed"))?;
+        reply_rx
+            .await
+            .map_err(|_| anyhow::anyhow!("Worker dropped reply sender"))?
+    }
+
     #[must_use]
     pub fn live_worker_count(&self) -> usize {
         self.live_workers.load(Ordering::Acquire)
     }
 
-    /// Returns the number of workers that currently have model instances loaded in memory.
-    ///
-    /// A value of `0` with [`live_worker_count`][Self::live_worker_count] `> 0` indicates
-    /// the pool is in an idle state — models will reload automatically on the next request.
     #[must_use]
     pub fn loaded_worker_count(&self) -> usize {
         self.loaded_workers.load(Ordering::Acquire)
@@ -831,7 +841,6 @@ impl EmbedPool {
 
 #[cfg(test)]
 impl EmbedPool {
-    /// Creates an [`EmbedPool`] with an already-closed channel for testing error paths.
     pub(crate) fn closed_for_test() -> Self {
         let (tx, rx) = mpsc::channel::<EmbedRequest>(1);
         drop(rx);
@@ -842,11 +851,6 @@ impl EmbedPool {
         }
     }
 
-    /// Creates an [`EmbedPool`] that responds with fixed fixture data for testing happy paths.
-    ///
-    /// The pool has `live_workers = 1` and `loaded_workers = 1` so `check_ready` passes.
-    /// Responds to every dense request with `dense_fixture` and every sparse request
-    /// with `sparse_fixture`, regardless of input text.
     pub(crate) fn with_fixed_responses(
         dense_fixture: Vec<Vec<f32>>,
         sparse_fixture: Vec<SparseEmbedding>,
@@ -863,6 +867,12 @@ impl EmbedPool {
                     EmbedRequest::Sparse { reply, .. } => {
                         let _ = reply.send(Ok((*sparse).clone()));
                     }
+                    EmbedRequest::Probe { reply, .. } => {
+                        let _ = reply.send(Ok(ProbeResult {
+                            rss_before: 0,
+                            rss_after: 0,
+                        }));
+                    }
                 }
             }
         });
@@ -873,13 +883,8 @@ impl EmbedPool {
         }
     }
 
-    /// Creates an [`EmbedPool`] representing the idle state — workers alive but models unloaded.
-    ///
-    /// `live_workers = 1`, `loaded_workers = 0`. Used to test the `/health` `"idle"` response.
     pub(crate) fn idle_for_test() -> Self {
         let (tx, _rx) = mpsc::channel::<EmbedRequest>(1);
-        // _rx is intentionally dropped: tests using this pool only inspect health-state
-        // atomics, never send actual embedding requests.
         Self {
             tx,
             live_workers: Arc::new(AtomicUsize::new(1)),
@@ -895,11 +900,14 @@ impl EmbedPool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
-    /// Uses an impossible cache path that causes `load_models` to fail
-    /// immediately without any network access or delay.
     fn bad_cache_dir() -> PathBuf {
         PathBuf::from("/dev/null/impossible")
+    }
+
+    fn test_cost_model() -> CostModel {
+        CostModel::conservative(CostModel::DEFAULT_MAX_WORKSPACE)
     }
 
     #[tokio::test]
@@ -908,9 +916,10 @@ mod tests {
             1,
             bad_cache_dir(),
             WorkerConfig {
-                onnx_batch_size: 8,
+                cost_model: test_cost_model(),
                 idle_timeout: None,
                 model_variant: crate::config::ModelVariant::Fp32,
+                max_seq_length: 512,
             },
         );
 
@@ -919,17 +928,13 @@ mod tests {
             .expect("init_handle should resolve quickly, not hang")
             .expect("JoinHandle should not panic");
 
-        assert!(
-            result.is_err(),
-            "init should return Err on leader load failure"
-        );
+        assert!(result.is_err(), "init should return Err on leader load failure");
         let msg = result.unwrap_err().to_string();
         assert!(
             msg.contains("failed to load"),
             "error should mention load failure, got: {msg}"
         );
 
-        // COR-1: loaded_workers must be 0, not the optimistic `n`
         assert_eq!(pool.loaded_worker_count(), 0);
     }
 
@@ -939,9 +944,10 @@ mod tests {
             3,
             bad_cache_dir(),
             WorkerConfig {
-                onnx_batch_size: 8,
+                cost_model: test_cost_model(),
                 idle_timeout: None,
                 model_variant: crate::config::ModelVariant::Fp32,
+                max_seq_length: 512,
             },
         );
 
@@ -950,12 +956,7 @@ mod tests {
             .expect("init_handle should resolve quickly, not hang")
             .expect("JoinHandle should not panic");
 
-        assert!(
-            result.is_err(),
-            "init should fail without spawning followers"
-        );
-
-        // loaded_workers must still be 0 — no worker succeeded
+        assert!(result.is_err(), "init should fail without spawning followers");
         assert_eq!(pool.loaded_worker_count(), 0);
     }
 
@@ -964,10 +965,7 @@ mod tests {
         let pool = EmbedPool::closed_for_test();
         let result = pool.dense(vec!["hello".into()]).await;
         assert!(result.is_err());
-        assert!(
-            result.unwrap_err().to_string().contains("channel closed"),
-            "expected channel closed error"
-        );
+        assert!(result.unwrap_err().to_string().contains("channel closed"));
     }
 
     #[tokio::test]
@@ -975,10 +973,7 @@ mod tests {
         let pool = EmbedPool::closed_for_test();
         let result = pool.sparse(vec!["hello".into()]).await;
         let err = result.expect_err("expected an error");
-        assert!(
-            err.to_string().contains("channel closed"),
-            "expected channel closed error"
-        );
+        assert!(err.to_string().contains("channel closed"));
     }
 
     #[test]
@@ -1034,10 +1029,7 @@ mod tests {
     fn normalize_l2_sign_preservation() {
         let mut v = vec![-3.0, 4.0];
         normalize_l2(&mut v);
-        assert!(
-            (v[0] - (-0.6)).abs() < 1e-6,
-            "negative sign must be preserved"
-        );
+        assert!((v[0] - (-0.6)).abs() < 1e-6, "negative sign must be preserved");
         assert!((v[1] - 0.8).abs() < 1e-6);
     }
 
@@ -1045,17 +1037,11 @@ mod tests {
     fn normalize_l2_single_element() {
         let mut v = vec![5.0];
         normalize_l2(&mut v);
-        assert!(
-            (v[0] - 1.0).abs() < 1e-6,
-            "single positive element normalizes to 1.0"
-        );
+        assert!((v[0] - 1.0).abs() < 1e-6);
 
         let mut v2 = vec![-7.0];
         normalize_l2(&mut v2);
-        assert!(
-            (v2[0] - (-1.0)).abs() < 1e-6,
-            "single negative element normalizes to -1.0"
-        );
+        assert!((v2[0] - (-1.0)).abs() < 1e-6);
     }
 
     #[test]
@@ -1063,17 +1049,13 @@ mod tests {
         let mut v = vec![1.0, 2.0, 3.0, 4.0, 5.0];
         normalize_l2(&mut v);
         let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
-        assert!(
-            (norm - 1.0).abs() < 1e-6,
-            "output norm must equal 1.0, got {norm}"
-        );
+        assert!((norm - 1.0).abs() < 1e-6, "output norm must equal 1.0, got {norm}");
     }
 
     #[test]
     fn sparse_project_positive_score() {
         let weight = ndarray::array![1.0, 2.0, 3.0];
         let hidden = [1.0, 1.0, 1.0];
-        // dot = 1+2+3 = 6, + bias 0.5 = 6.5, ReLU = 6.5
         let score = sparse_project(&hidden, &weight.view(), 0.5);
         assert!((score - 6.5).abs() < 1e-6);
     }
@@ -1082,62 +1064,49 @@ mod tests {
     fn sparse_project_relu_clamps_negative() {
         let weight = ndarray::array![1.0, 1.0];
         let hidden = [-5.0, -5.0];
-        // dot = -10, + bias 0.0 = -10, ReLU = 0
         let score = sparse_project(&hidden, &weight.view(), 0.0);
-        assert!(
-            score.abs() < 1e-6,
-            "negative scores should be clamped to zero"
-        );
+        assert!(score.abs() < 1e-6, "negative scores should be clamped to zero");
     }
 
     #[test]
     fn sparse_project_zero_weight() {
         let weight = ndarray::array![0.0, 0.0, 0.0];
         let hidden = [1.0, 2.0, 3.0];
-        // dot = 0, + bias 1.0 = 1.0, ReLU = 1.0
         let score = sparse_project(&hidden, &weight.view(), 1.0);
-        assert!(
-            (score - 1.0).abs() < 1e-6,
-            "zero weights with positive bias"
-        );
+        assert!((score - 1.0).abs() < 1e-6);
     }
 
     #[test]
     fn sparse_project_negative_bias() {
         let weight = ndarray::array![1.0, 1.0];
         let hidden = [1.0, 1.0];
-        // dot = 2, + bias -3.0 = -1.0, ReLU = 0.0
         let score = sparse_project(&hidden, &weight.view(), -3.0);
         assert!(score.abs() < 1e-6, "negative bias should clamp via ReLU");
     }
 
     #[test]
     fn sparse_maxpool_all_masked_out() {
-        // All non-special tokens have mask=0 (padding) → empty output
         let ids = [100, 200, 300];
         let mask = [0, 0, 0];
         let scores = [0.5, 0.8, 0.3];
         let (indices, values) = sparse_maxpool(&ids, &mask, &scores);
-        assert!(indices.is_empty(), "all-masked should produce empty output");
+        assert!(indices.is_empty());
         assert!(values.is_empty());
     }
 
     #[test]
     fn sparse_maxpool_basic() {
-        // token_id 10 appears twice with scores 0.3, 0.7 → max = 0.7
-        // token_id 20 appears once  with score  0.5     → 0.5
         let ids = [10, 20, 10];
         let mask = [1, 1, 1];
         let scores = [0.3, 0.5, 0.7];
         let (indices, values) = sparse_maxpool(&ids, &mask, &scores);
-        assert_eq!(indices, vec![10, 20]); // sorted by ID
-        assert!((values[0] - 0.7).abs() < 1e-6); // max(0.3, 0.7)
+        assert_eq!(indices, vec![10, 20]);
+        assert!((values[0] - 0.7).abs() < 1e-6);
         assert!((values[1] - 0.5).abs() < 1e-6);
     }
 
     #[test]
     fn sparse_maxpool_filters_special_tokens() {
-        // IDs 0, 1, 2, 3 are SPECIAL_TOKENS — should be excluded
         let ids = [0, 1, 2, 3, 100];
         let mask = [1, 1, 1, 1, 1];
         let scores = [0.9, 0.9, 0.9, 0.9, 0.5];
@@ -1148,7 +1117,6 @@ mod tests {
 
     #[test]
     fn sparse_maxpool_respects_attention_mask() {
-        // mask=0 means the token is padding → excluded
         let ids = [100, 200];
         let mask = [1, 0];
         let scores = [0.5, 0.9];
@@ -1163,7 +1131,7 @@ mod tests {
         let mask = [1, 1];
         let scores = [0.0, 0.5];
         let (indices, values) = sparse_maxpool(&ids, &mask, &scores);
-        assert_eq!(indices, vec![200], "zero-score tokens should be excluded");
+        assert_eq!(indices, vec![200]);
         assert!((values[0] - 0.5).abs() < 1e-6);
     }
 
@@ -1183,14 +1151,13 @@ mod tests {
         let mask = [1, 1, 1];
         let scores = [0.1, 0.2, 0.3];
         let (indices, _) = sparse_maxpool(&ids, &mask, &scores);
-        assert_eq!(indices, vec![100, 200, 300], "indices should be sorted");
+        assert_eq!(indices, vec![100, 200, 300]);
     }
 
     // -----------------------------------------------------------------------
     // REPO_REVISION drift detection (ARC-3)
     // -----------------------------------------------------------------------
 
-    /// Extracts a `const {const_name}: &str = "..."` value from a source file.
     fn extract_const_str(path: &str, const_name: &str) -> String {
         let prefix = format!("const {const_name}");
         let content =
@@ -1222,7 +1189,6 @@ mod tests {
             embedder, example,
             "REPO_REVISION mismatch: src/embedder.rs ({embedder}) != examples/fp16_eval.rs ({example})"
         );
-        // Sanity: should look like a git commit SHA
         assert_eq!(embedder.len(), 40, "REPO_REVISION should be a 40-char SHA");
         assert!(
             embedder.chars().all(|c| c.is_ascii_hexdigit()),
@@ -1240,15 +1206,8 @@ mod tests {
             "XENOVA_REPO_REVISION mismatch: \
              src/embedder.rs ({embedder}) != benches/coreml.rs ({bench})"
         );
-        assert_eq!(
-            embedder.len(),
-            40,
-            "XENOVA_REPO_REVISION should be a 40-char SHA"
-        );
-        assert!(
-            embedder.chars().all(|c| c.is_ascii_hexdigit()),
-            "XENOVA_REPO_REVISION should be hexadecimal"
-        );
+        assert_eq!(embedder.len(), 40);
+        assert!(embedder.chars().all(|c| c.is_ascii_hexdigit()));
     }
 
     // -----------------------------------------------------------------------
@@ -1262,24 +1221,16 @@ mod tests {
         let corpus: serde_json::Value =
             serde_json::from_str(&content).expect("corpus.json must be valid JSON");
 
-        // Verify top-level structure
         assert!(corpus.get("metadata").is_some(), "must have 'metadata' key");
-        assert!(
-            corpus.get("scenarios").is_some(),
-            "must have 'scenarios' key"
-        );
+        assert!(corpus.get("scenarios").is_some(), "must have 'scenarios' key");
 
-        // Verify metadata.sources counts
         let sources = &corpus["metadata"]["sources"];
         assert_eq!(sources["knowledgebase_chunks"]["count"], 50);
         assert_eq!(sources["coordinator_vector_store"]["count"], 75);
         assert_eq!(sources["codekeeper_symbols"]["count"], 50);
         assert_eq!(sources["boundary_cases"]["count"], 9);
 
-        // Verify scenarios have matching text counts
-        let scenarios = corpus["scenarios"]
-            .as_object()
-            .expect("scenarios must be object");
+        let scenarios = corpus["scenarios"].as_object().expect("scenarios must be object");
         let expected: &[(&str, usize)] = &[
             ("document_chunks", 50),
             ("tool_descriptions", 75),
@@ -1292,15 +1243,9 @@ mod tests {
                 .and_then(|s| s.get("texts"))
                 .and_then(|t| t.as_array())
                 .unwrap_or_else(|| panic!("scenarios.{name}.texts must be an array"));
-            assert_eq!(
-                texts.len(),
-                count,
-                "scenarios.{name} should have {count} texts, got {}",
-                texts.len()
-            );
+            assert_eq!(texts.len(), count);
         }
 
-        // Total texts = 184
         let total: usize = scenarios
             .values()
             .filter_map(|s| s.get("texts").and_then(|t| t.as_array()).map(Vec::len))

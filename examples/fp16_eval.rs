@@ -62,7 +62,8 @@ fn load_corpus() -> Result<Corpus> {
 
 const REPO_ID: &str = "BAAI/bge-m3";
 const REPO_REVISION: &str = "5617a9f61b028005a4858fdac845db406aefb181";
-const MAX_SEQ_LENGTH: usize = 512;
+/// Default eval sequence length. Set `BGE_M3_MAX_SEQ_LENGTH` env var to override at runtime.
+const MAX_SEQ_LENGTH: usize = 8192;
 const SPECIAL_TOKENS: [u32; 4] = [0, 1, 2, 3];
 
 // ── Sparse weight loading (bundled safetensors) ─────────────────────────
