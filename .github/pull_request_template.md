@@ -21,6 +21,7 @@
 - [ ] Clippy clean (`cargo clippy --all-targets --all-features -- -D warnings`)
 - [ ] Formatted (`cargo fmt --check`)
 - [ ] Supply chain audit passes (`cargo deny check`)
+- [ ] All commits are signed off (`git commit -s` / DCO — see [CONTRIBUTING.md](../CONTRIBUTING.md))
 
 ## Notes for Reviewers
 

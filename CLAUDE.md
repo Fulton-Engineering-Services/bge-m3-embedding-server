@@ -2,10 +2,11 @@
 
 Axum HTTP server serving BGE-M3 dense and sparse embeddings via direct ONNX Runtime integration.
 
-## Consumers
+## Use Cases
 
-- **mcp-local-knowledge-base** — calls `/v1/sparse-embeddings` and `/v1/embeddings` to index and search documents
-- **dpos-coordinator** — calls `/v1/embeddings` for semantic memory retrieval
+- Document indexing and hybrid search via the `/v1/embeddings` (dense) and `/v1/sparse-embeddings` (SPLADE-style) endpoints
+- Semantic memory retrieval for agent / RAG workloads via the OpenAI-compatible `/v1/embeddings` endpoint
+- Drop-in replacement for hosted embedding APIs when local inference, data residency, or BGE-M3-specific sparse vectors are required
 
 ## Features
 

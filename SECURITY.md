@@ -2,12 +2,13 @@
 
 ## Supported Versions
 
+Only the latest minor release receives security updates. Older versions receive no
+backports — please upgrade to the latest release.
+
 | Version | Supported |
 |---------|-----------|
-| 0.6.x   | ✓         |
-| 0.5.x   | ✗         |
-
-Older versions receive no security updates. Please upgrade to the latest release.
+| 0.14.x  | ✓         |
+| < 0.14  | ✗         |
 
 ## Reporting a Vulnerability
 
