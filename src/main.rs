@@ -55,6 +55,12 @@ pub(crate) fn build_router(state: Arc<AppState>) -> Router {
 /// 3. Derives the final cost model.
 /// 4. Runs dense + sparse readiness probes.
 /// 5. Sets `state.ready = true`.
+// cast_precision_loss: available_bytes and total_workspace are ≤ ~28 GB (Fargate task
+//   limit), well within f64's 2^52 mantissa (~4.5 PB); cfg_workers is ≤ 32.
+// cast_possible_truncation: per_worker_workspace is a byte budget; truncating
+//   sub-byte fractions is intentional and harmless.
+// cast_sign_loss: total_workspace is derived from saturating_sub so it is always
+//   ≥ 0 before the float multiplication.
 #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 async fn run_readiness_probe(
     init_handle: tokio::task::JoinHandle<anyhow::Result<()>>,

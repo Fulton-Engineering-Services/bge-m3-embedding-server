@@ -63,6 +63,13 @@ impl CostModel {
     /// `count` texts and `max_seq` as the padded sequence length.
     ///
     /// Uses saturating arithmetic on `u128` to avoid overflow at large inputs.
+    //
+    // cast_precision_loss: n is u128, but realistic values (batch ≤ 256, seq ≤ 8192)
+    //   keep n ≤ 2_097_152 — well within f64's 2^52 mantissa — so no bits are lost.
+    // cast_possible_truncation: f64 → u128 intentionally floors fractional bytes;
+    //   this is a memory *budget estimate*, not an exact byte count.
+    // cast_sign_loss: a and b are validated positive at construction, so the
+    //   products are always ≥ 0 before the cast.
     #[allow(
         clippy::cast_precision_loss,
         clippy::cast_possible_truncation,
@@ -280,6 +287,8 @@ mod tests {
         let long_chunks = bin_pack(&long_seqs, &cm);
 
         // Short chunks should pack many texts; long chunks should be much smaller.
+        // cast_precision_loss: chunk counts are small (≤ 300), far within f64
+        //   precision; the assertion only checks an order-of-magnitude ratio (5×).
         #[allow(clippy::cast_precision_loss)]
         let avg_short: f64 = short_chunks.iter().map(Vec::len).sum::<usize>() as f64
             / short_chunks.len() as f64;

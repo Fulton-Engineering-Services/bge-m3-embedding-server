@@ -30,6 +30,15 @@
 //! `position_ids` input shape to verify it can handle the configured
 //! `BGE_M3_MAX_SEQ_LENGTH`.
 
+// cast_precision_loss / cast_possible_truncation / cast_sign_loss:
+//   Test-only arithmetic on small integer indices and byte offsets (batch ≤ 16,
+//   seq ≤ 8192, array lengths ≤ a few thousand). All values are well within f64
+//   mantissa range; fractional bytes are intentionally floored.
+//
+// too_many_lines:
+//   `run_equivalence_for_seq` is a single coherent test scenario — load fixture,
+//   tokenize, infer, verify cosines. Splitting it across helper functions would
+//   obscure the test flow without improving readability.
 #![allow(
     clippy::cast_precision_loss,
     clippy::cast_possible_truncation,

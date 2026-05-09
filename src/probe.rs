@@ -196,6 +196,10 @@ pub(crate) async fn run_probe(
 /// - Either coefficient is negative (physically impossible workspace).
 /// - Either coefficient falls outside the sane ranges `[4 KiB, 256 KiB]` for
 ///   `a` and `[0.1, 10_000]` for `b` (clamped not rejected; see below).
+//
+// cast_precision_loss: batch (≤ 16), seq (≤ 8192), and rss_delta (≤ ~28 GB) are
+//   all well within f64's 2^52 mantissa (~4.5 PB). Coefficients are computed via
+//   ordinary least squares where sub-integer precision in the inputs is irrelevant.
 #[allow(clippy::cast_precision_loss)]
 fn fit_cost_model(data: &[DataPoint]) -> Option<(f64, f64)> {
     if data.len() < 2 {

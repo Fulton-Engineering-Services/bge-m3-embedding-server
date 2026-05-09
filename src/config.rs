@@ -227,6 +227,12 @@ impl Config {
 /// Resolves an optional `CostModel` from env vars that explicitly override auto-tuning.
 ///
 /// Returns `None` when the server should run the startup probe.
+//
+// cast_precision_loss: token_budget and max_seq_length are small integers (≤ 8192)
+//   that are well within f64 mantissa range; cost-per-position is an estimate.
+// cast_possible_truncation / cast_sign_loss: the workspace result is always positive
+//   (products of positive coefficients and non-negative token counts), and fractional
+//   bytes are intentionally floored when converting back to usize.
 #[allow(
     clippy::cast_precision_loss,
     clippy::cast_possible_truncation,
