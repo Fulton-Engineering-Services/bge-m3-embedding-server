@@ -63,6 +63,11 @@ impl CostModel {
     /// `count` texts and `max_seq` as the padded sequence length.
     ///
     /// Uses saturating arithmetic on `u128` to avoid overflow at large inputs.
+    #[allow(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss
+    )]
     pub fn chunk_cost(&self, count: usize, max_seq: usize) -> u128 {
         let n = count as u128 * max_seq as u128;
         let linear = (self.a * n as f64) as u128;
@@ -206,7 +211,7 @@ mod tests {
         let chunks = bin_pack(&seqs, &cm);
 
         // The huge text should be alone (900 + 5 > 1000 for any pairing with a 5-token text).
-        let huge_chunk = chunks.iter().find(|c| c.iter().any(|&i| i == 100));
+        let huge_chunk = chunks.iter().find(|c| c.contains(&100));
         let huge_chunk = huge_chunk.expect("huge text must be in some chunk");
         assert_eq!(huge_chunk.len(), 1, "huge text should be alone");
 
@@ -214,8 +219,8 @@ mod tests {
         // The tiny chunks should each hold 200 texts (floor(1000/5) = 200).
         let total_tiny: usize = chunks
             .iter()
-            .filter(|c| !c.iter().any(|&i| i == 100))
-            .map(|c| c.len())
+            .filter(|c| !c.contains(&100))
+            .map(Vec::len)
             .sum();
         assert_eq!(total_tiny, 100);
 
@@ -275,9 +280,11 @@ mod tests {
         let long_chunks = bin_pack(&long_seqs, &cm);
 
         // Short chunks should pack many texts; long chunks should be much smaller.
-        let avg_short: f64 = short_chunks.iter().map(|c| c.len()).sum::<usize>() as f64
+        #[allow(clippy::cast_precision_loss)]
+        let avg_short: f64 = short_chunks.iter().map(Vec::len).sum::<usize>() as f64
             / short_chunks.len() as f64;
-        let avg_long: f64 = long_chunks.iter().map(|c| c.len()).sum::<usize>() as f64
+        #[allow(clippy::cast_precision_loss)]
+        let avg_long: f64 = long_chunks.iter().map(Vec::len).sum::<usize>() as f64
             / long_chunks.len() as f64;
 
         assert!(

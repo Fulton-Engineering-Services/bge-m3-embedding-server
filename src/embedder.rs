@@ -263,8 +263,8 @@ fn build_chunk_arrays(
 
         // Right-pad with pad_id=1 / mask=0
         let pad = pad_to.saturating_sub(seq_len);
-        ids_flat.extend(std::iter::repeat(1i64).take(pad));
-        mask_flat.extend(std::iter::repeat(0i64).take(pad));
+        ids_flat.extend(std::iter::repeat_n(1i64, pad));
+        mask_flat.extend(std::iter::repeat_n(0i64, pad));
     }
 
     let ids_array = ndarray::Array2::from_shape_vec((batch, pad_to), ids_flat)?;
@@ -427,8 +427,8 @@ fn embed_sparse(
 /// fit the cost model.
 pub(crate) fn probe_run_dense(
     session: &mut ort::session::Session,
-    ids_array: ndarray::Array2<i64>,
-    mask_array: ndarray::Array2<i64>,
+    ids_array: &ndarray::Array2<i64>,
+    mask_array: &ndarray::Array2<i64>,
 ) -> Result<ProbeResult> {
     let rss_before = sysinfo::read_process_rss_bytes().unwrap_or(0);
 
@@ -659,7 +659,7 @@ fn run_worker(
     Ok(())
 }
 
-/// Runs one probe batch: tokenize texts, build padded arrays, call session.run(),
+/// Runs one probe batch: tokenize texts, build padded arrays, call `session.run()`,
 /// and return RSS deltas. Uses `embed_dense`'s no-pad tokenizer path.
 fn run_probe_batch(
     session: &mut ort::session::Session,
@@ -675,7 +675,7 @@ fn run_probe_batch(
         .max(1);
     let indices: Vec<usize> = (0..texts.len()).collect();
     let (ids_array, mask_array) = build_chunk_arrays(&encodings, &indices, pad_to)?;
-    probe_run_dense(session, ids_array, mask_array)
+    probe_run_dense(session, &ids_array, &mask_array)
 }
 
 // ---------------------------------------------------------------------------

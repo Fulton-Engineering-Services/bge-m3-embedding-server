@@ -160,24 +160,21 @@ pub(crate) async fn run_probe(
         return (CostModel::CONSERVATIVE_A, CostModel::CONSERVATIVE_B);
     }
 
-    match fit_cost_model(&data) {
-        Some((a, b)) => {
-            info!(
-                a = format!("{a:.0}"),
-                b = format!("{b:.4}"),
-                data_points = data.len(),
-                "Probe: fitted cost model"
-            );
-            (a, b)
-        }
-        None => {
-            warn!(
-                data_points = data.len(),
-                "Probe: least-squares fit failed or produced invalid coefficients; \
-                 using conservative defaults"
-            );
-            (CostModel::CONSERVATIVE_A, CostModel::CONSERVATIVE_B)
-        }
+    if let Some((a, b)) = fit_cost_model(&data) {
+        info!(
+            a = format!("{a:.0}"),
+            b = format!("{b:.4}"),
+            data_points = data.len(),
+            "Probe: fitted cost model"
+        );
+        (a, b)
+    } else {
+        warn!(
+            data_points = data.len(),
+            "Probe: least-squares fit failed or produced invalid coefficients; \
+             using conservative defaults"
+        );
+        (CostModel::CONSERVATIVE_A, CostModel::CONSERVATIVE_B)
     }
 }
 
@@ -199,6 +196,7 @@ pub(crate) async fn run_probe(
 /// - Either coefficient is negative (physically impossible workspace).
 /// - Either coefficient falls outside the sane ranges `[4 KiB, 256 KiB]` for
 ///   `a` and `[0.1, 10_000]` for `b` (clamped not rejected; see below).
+#[allow(clippy::cast_precision_loss)]
 fn fit_cost_model(data: &[DataPoint]) -> Option<(f64, f64)> {
     if data.len() < 2 {
         return None;

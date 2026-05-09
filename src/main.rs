@@ -55,6 +55,7 @@ pub(crate) fn build_router(state: Arc<AppState>) -> Router {
 /// 3. Derives the final cost model.
 /// 4. Runs dense + sparse readiness probes.
 /// 5. Sets `state.ready = true`.
+#[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 async fn run_readiness_probe(
     init_handle: tokio::task::JoinHandle<anyhow::Result<()>>,
     state: Arc<AppState>,

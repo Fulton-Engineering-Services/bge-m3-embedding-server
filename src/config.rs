@@ -227,6 +227,11 @@ impl Config {
 /// Resolves an optional `CostModel` from env vars that explicitly override auto-tuning.
 ///
 /// Returns `None` when the server should run the startup probe.
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss
+)]
 fn resolve_cost_model_override<F: Fn(&str) -> Option<String>>(
     lookup: &F,
     max_seq_length: usize,
@@ -235,8 +240,7 @@ fn resolve_cost_model_override<F: Fn(&str) -> Option<String>>(
     //    max_workspace_bytes comes from BGE_M3_AVAILABLE_MEMORY_BYTES if set,
     //    otherwise uses the built-in default (2 GiB).
     if lookup("BGE_M3_DISABLE_AUTO_BUDGET")
-        .map(|v| matches!(v.as_str(), "1" | "true" | "yes"))
-        .unwrap_or(false)
+        .is_some_and(|v| matches!(v.as_str(), "1" | "true" | "yes"))
     {
         let max_workspace = lookup("BGE_M3_AVAILABLE_MEMORY_BYTES")
             .and_then(|v| v.parse::<usize>().ok())
@@ -348,8 +352,8 @@ mod tests {
         let map = HashMap::from([("BGE_M3_DISABLE_AUTO_BUDGET", "1")]);
         let cfg = Config::from_lookup(lookup_from(&map));
         let cm = cfg.cost_model_override.expect("override must be set");
-        assert_eq!(cm.a, CostModel::CONSERVATIVE_A);
-        assert_eq!(cm.b, CostModel::CONSERVATIVE_B);
+        assert!((cm.a - CostModel::CONSERVATIVE_A).abs() < f64::EPSILON);
+        assert!((cm.b - CostModel::CONSERVATIVE_B).abs() < f64::EPSILON);
         assert_eq!(cm.max_workspace_bytes, CostModel::DEFAULT_MAX_WORKSPACE);
     }
 
@@ -361,8 +365,8 @@ mod tests {
         let cfg = Config::from_lookup(lookup_from(&map));
         let cm = cfg.cost_model_override.expect("override must be set");
         assert!(cm.max_workspace_bytes > 0);
-        assert_eq!(cm.a, CostModel::CONSERVATIVE_A);
-        assert_eq!(cm.b, CostModel::CONSERVATIVE_B);
+        assert!((cm.a - CostModel::CONSERVATIVE_A).abs() < f64::EPSILON);
+        assert!((cm.b - CostModel::CONSERVATIVE_B).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -376,7 +380,7 @@ mod tests {
         let cm = cfg.cost_model_override.expect("override must be set");
         assert!((cm.a - 20_000.0).abs() < 1e-9);
         assert!((cm.b - 5.0).abs() < 1e-9);
-        assert_eq!(cm.max_workspace_bytes, 1073741824);
+        assert_eq!(cm.max_workspace_bytes, 1_073_741_824);
     }
 
     #[test]

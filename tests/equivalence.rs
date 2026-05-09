@@ -13,7 +13,7 @@
 //! run in CI without explicit opt-in.
 //!
 //! These tests:
-//! 1. Load the ONNX model (downloads from HuggingFace if not cached).
+//! 1. Load the ONNX model (downloads from `HuggingFace` if not cached).
 //! 2. Embed each fixture's texts via the server's embed pipeline.
 //! 3. Assert cosine similarity vs the reference dense vectors.
 //! 4. Assert sparse index overlap vs the reference sparse vectors.
@@ -33,7 +33,8 @@
 #![allow(
     clippy::cast_precision_loss,
     clippy::cast_possible_truncation,
-    clippy::cast_sign_loss
+    clippy::cast_sign_loss,
+    clippy::too_many_lines
 )]
 
 use std::path::Path;
@@ -89,7 +90,7 @@ fn manifest_exists_and_has_expected_fields() {
     );
 }
 
-/// Checks that the manifest's model_revision matches the server's pinned REPO_REVISION.
+/// Checks that the manifest's `model_revision` matches the server's pinned `REPO_REVISION`.
 ///
 /// If they diverge, fixtures may have been generated with a different model
 /// checkpoint than the server is using — equivalence assertions become meaningless.
@@ -123,7 +124,7 @@ fn manifest_revision_matches_server_repo_revision() {
     );
 }
 
-/// For each seq_length listed in the manifest, verify the fixture files exist
+/// For each `seq_length` listed in the manifest, verify the fixture files exist
 /// and the dense array has the expected shape.
 #[test]
 fn fixture_files_have_expected_shape() {
@@ -211,13 +212,12 @@ fn equivalence_all_seq_lengths() {
     }
 
     let manifest_path = fixture_dir().join("manifest.json");
-    if !manifest_path.exists() {
-        panic!(
-            "Fixture manifest not found at {}. \
-             Run scripts/generate_equivalence_fixtures.py first.",
-            manifest_path.display()
-        );
-    }
+    assert!(
+        manifest_path.exists(),
+        "Fixture manifest not found at {}. \
+         Run scripts/generate_equivalence_fixtures.py first.",
+        manifest_path.display()
+    );
 
     let raw = std::fs::read_to_string(&manifest_path).unwrap();
     let manifest: serde_json::Value = serde_json::from_str(&raw).unwrap();
@@ -236,8 +236,8 @@ fn equivalence_all_seq_lengths() {
 
 /// Run positional embedding inspection.
 ///
-/// Verifies that the loaded model's position_ids or position_embedding table
-/// supports at least the configured BGE_M3_MAX_SEQ_LENGTH.
+/// Verifies that the loaded model's `position_ids` or `position_embedding` table
+/// supports at least the configured `BGE_M3_MAX_SEQ_LENGTH`.
 #[test]
 #[ignore = "requires BGE_M3_EQUIVALENCE_TEST=1 and model download"]
 fn onnx_positional_embedding_supports_configured_max_seq() {
@@ -389,8 +389,8 @@ fn run_equivalence_for_seq(seq: usize, model_str: &str, tolerances: &Tolerances)
         ids_flat.extend(ids.iter().map(|&id| i64::from(id)));
         mask_flat.extend(mask.iter().map(|&m| i64::from(m)));
         let pad = pad_to.saturating_sub(seq_len);
-        ids_flat.extend(std::iter::repeat(1i64).take(pad));
-        mask_flat.extend(std::iter::repeat(0i64).take(pad));
+        ids_flat.extend(std::iter::repeat_n(1i64, pad));
+        mask_flat.extend(std::iter::repeat_n(0i64, pad));
     }
 
     let ids_arr = ndarray::Array2::from_shape_vec((n, pad_to), ids_flat).expect("ids array");
@@ -409,25 +409,22 @@ fn run_equivalence_for_seq(seq: usize, model_str: &str, tolerances: &Tolerances)
         .expect("inference");
 
     // Extract dense embeddings and L2-normalize.
-    let dense_out: Vec<f32> = match model_str {
-        "fp32" => {
-            let emb = outputs["sentence_embedding"]
-                .try_extract_array::<f32>()
-                .expect("sentence_embedding");
-            emb.as_slice().expect("contiguous").to_vec()
+    let dense_out: Vec<f32> = if model_str == "fp32" {
+        let emb = outputs["sentence_embedding"]
+            .try_extract_array::<f32>()
+            .expect("sentence_embedding");
+        emb.as_slice().expect("contiguous").to_vec()
+    } else {
+        let lhs = outputs["last_hidden_state"]
+            .try_extract_array::<f32>()
+            .expect("last_hidden_state");
+        // CLS pool: take first token of each example.
+        let mut pooled = Vec::with_capacity(n * 1024);
+        for i in 0..n {
+            let offset = i * pad_to * 1024;
+            pooled.extend_from_slice(&lhs.as_slice().expect("contiguous")[offset..offset + 1024]);
         }
-        _ => {
-            let lhs = outputs["last_hidden_state"]
-                .try_extract_array::<f32>()
-                .expect("last_hidden_state");
-            // CLS pool: take first token of each example.
-            let mut pooled = Vec::with_capacity(n * 1024);
-            for i in 0..n {
-                let offset = i * pad_to * 1024;
-                pooled.extend_from_slice(&lhs.as_slice().expect("contiguous")[offset..offset + 1024]);
-            }
-            pooled
-        }
+        pooled
     };
 
     let computed_dense: Vec<Vec<f32>> = dense_out
@@ -445,7 +442,7 @@ fn run_equivalence_for_seq(seq: usize, model_str: &str, tolerances: &Tolerances)
         .enumerate()
         .map(|(i, computed)| {
             let reference = &reference_dense[i * 1024..(i + 1) * 1024];
-            cosine_similarity(computed, reference) as f64
+            f64::from(cosine_similarity(computed, reference))
         })
         .collect();
 
@@ -541,7 +538,7 @@ fn load_npy_f32(path: &Path) -> Vec<f32> {
         .collect()
 }
 
-/// Locates the model ONNX file in the HuggingFace cache.
+/// Locates the model ONNX file in the `HuggingFace` cache.
 ///
 /// The path layout is: `{cache_dir}/models--{org}--{model}/snapshots/{rev}/onnx/model*.onnx`.
 fn locate_model_file(cache_dir: &str, model_str: &str) -> Option<std::path::PathBuf> {
@@ -569,7 +566,7 @@ fn locate_model_file(cache_dir: &str, model_str: &str) -> Option<std::path::Path
 
     // HF cache layout: {cache_dir}/models--{org}--{model}/snapshots/{rev}/{file}
     let snapshot_dir = Path::new(cache_dir)
-        .join(format!("models--{}--{}", repo_org, model_name))
+        .join(format!("models--{repo_org}--{model_name}"))
         .join("snapshots")
         .join(&revision);
 
@@ -582,7 +579,7 @@ fn locate_model_file(cache_dir: &str, model_str: &str) -> Option<std::path::Path
     None
 }
 
-/// Locates the tokenizer.json file in the HuggingFace cache.
+/// Locates the tokenizer.json file in the `HuggingFace` cache.
 fn locate_tokenizer(cache_dir: &str, model_str: &str) -> Option<std::path::PathBuf> {
     let embedder_src = std::fs::read_to_string(
         Path::new(env!("CARGO_MANIFEST_DIR")).join("src/embedder.rs"),
@@ -601,7 +598,7 @@ fn locate_tokenizer(cache_dir: &str, model_str: &str) -> Option<std::path::PathB
     };
 
     let candidate = Path::new(cache_dir)
-        .join(format!("models--{}--{}", repo_org, model_name))
+        .join(format!("models--{repo_org}--{model_name}"))
         .join("snapshots")
         .join(&revision)
         .join("tokenizer.json");
