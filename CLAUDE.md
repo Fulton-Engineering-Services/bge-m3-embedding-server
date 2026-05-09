@@ -163,10 +163,12 @@ probe handle this automatically — long-seq requests get fewer texts per ONNX c
 to validate that embeddings at long context lengths are equivalent to the FP32 reference.
 
 **macOS scope limitation (v1):** the startup probe and auto-budget derive memory from
-`/proc` and cgroups, which are Linux-only. On macOS, the server uses host RAM from
-`sysctl hw.memsize` for memory detection but cannot read process RSS. The probe runs
-but uses 0 as the model RSS delta — conservative defaults apply. Apple Silicon CoreML
-behavior is unchanged.
+`/proc` and cgroups, which are Linux-only. The native macOS LaunchAgent build (the
+`scripts/install-bge-m3-apple.sh` path) uses host RAM from `sysctl hw.memsize` for
+memory detection but cannot read process RSS, so conservative defaults apply. Apple
+Silicon CoreML behavior is unchanged. **Note:** the Linux Docker image runs `/proc`
++ cgroup paths normally even on Apple Silicon hosts (the probe sees the Docker VM,
+not the macOS host), so the scope limitation only affects the native macOS binary.
 
 ## Docker
 
@@ -209,3 +211,5 @@ To release: bump version in `Cargo.toml`, commit, push to `main`. The workflow h
 - `BGE_M3_MODEL=fp16` loads a smaller ONNX file into ORT, but CoreML compiles it to a FP32 compute graph internally; the memory saving (~1.08 GB vs ~2.16 GB) reflects ORT session weight loading only, not CoreML runtime precision
 - **`BGE_M3_ONNX_BATCH_SIZE` is deprecated.** If set, a `WARN` is logged and the value is translated to a workspace ceiling via `BGE_M3_TOKEN_BUDGET`. Remove from all deployments and use `BGE_M3_DISABLE_AUTO_BUDGET=1` + `BGE_M3_TOKEN_BUDGET` if you need to pin a specific budget.
 - **Xenova FP16/INT8 long-context:** the Xenova/bge-m3 FP16 and INT8 ONNX exports at the pinned revision may have been exported with `max_position_embeddings=512`. The startup probe tests `(1, MAX_SEQ_LENGTH)` inference and fails fast with a clear error if the model cannot support the configured length. Use `BGE_M3_MODEL=fp32` or lower `BGE_M3_MAX_SEQ_LENGTH` in that case.
+- **Local Docker testing on Apple Silicon:** the published image is multi-arch, so `docker build` / `docker run` on macOS picks the native `linux/arm64` variant by default. Inside the Linux container there is no CoreML EP available — only ORT's MLAS CPU path — so probe times at `MAX_SEQ_LENGTH=8192` are several minutes (vs. ~60 s on amd64 Fargate). Forcing `--platform linux/amd64` runs under Rosetta 2 and pushes probe time to 15–20 minutes; only do that to validate the amd64 build path. For fast dev-loop iteration use `BGE_M3_DISABLE_AUTO_BUDGET=1` to skip the probe entirely; for production-realistic workspace tuning, use the native LaunchAgent install instead.
+- **`Dockerfile` builder image:** the builder stage is `ubuntu:24.04` (not `rust:slim-bookworm`) because the prebuilt ORT binary downloaded by `ort-sys` requires glibc ≥ 2.38 (`__isoc23_strtoul` and friends). Debian Bookworm ships glibc 2.36 and fails to link with `undefined symbol: __isoc23_strtoul`. Ubuntu 24.04 has glibc 2.39 which satisfies this. Rust is installed via `rustup-init` downloaded to a file with SHA-256 verification — never `curl | sh` (supply-chain rule).

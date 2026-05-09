@@ -278,6 +278,39 @@ The container includes a built-in `HEALTHCHECK` that polls `GET /health` every 1
 The start period is 120 seconds to allow time for model download, ONNX initialization, and
 the startup probe.
 
+### Local testing on Apple Silicon
+
+The published image is multi-arch (`linux/amd64` + `linux/arm64`), so on Apple Silicon
+hosts Docker pulls the native arm64 variant by default — no `--platform` flag needed.
+
+**Important caveat:** the probe is calibrated for a production amd64 Fargate target,
+where it completes in well under a minute. Local Apple Silicon runs are slower for two
+reasons:
+
+- **Native arm64 in Docker** uses ORT's MLAS CPU EP only — there is no CoreML inside
+  Linux containers. Probe time at the default `BGE_M3_MAX_SEQ_LENGTH=8192` is several
+  minutes (vs. ~60 s on amd64 Fargate). Functional, just slow.
+- **`--platform linux/amd64` under Rosetta 2** is dramatically slower — the probe can
+  take 15–20 minutes. Avoid this path unless you specifically need to validate the
+  amd64 build.
+
+For fast dev-loop iteration on macOS, skip the probe entirely:
+
+```bash
+docker run --rm \
+  -p 8081:8081 \
+  -v /path/to/model-cache:/cache \
+  -e BGE_M3_DISABLE_AUTO_BUDGET=1 \
+  bge-m3-embedding-server
+```
+
+This uses conservative cost-model defaults (matches the legacy `BGE_M3_ONNX_BATCH_SIZE=16`
+behavior) and leaves the server ready a few seconds after model load. Production deploys
+should leave the probe enabled so the auto-derived `tuning` data is reported in `/health`.
+
+For native CoreML-accelerated workloads on macOS, use the LaunchAgent install path
+instead — see [Apple Silicon (macOS)](#apple-silicon-macos) below.
+
 ## Apple Silicon (macOS)
 
 The `scripts/` directory contains scripts for deploying the server as a persistent macOS LaunchAgent
