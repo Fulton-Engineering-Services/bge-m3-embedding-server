@@ -15,6 +15,21 @@ use tokio::task::JoinHandle;
 use tracing::{info, info_span, Instrument};
 
 // ---------------------------------------------------------------------------
+// Error helpers
+// ---------------------------------------------------------------------------
+
+/// Converts an ort error to an anyhow error by formatting it as a string.
+///
+/// `ort::Error` became generic in rc.12 (`ort::Error<T>`) and its variants gained
+/// `NonNull<>` pointer fields that are `!Send + !Sync`, preventing direct
+/// `?`-propagation into `anyhow::Error` (which requires `Send + Sync + 'static`).
+/// Accepting `impl Display` makes this helper work for all instantiations
+/// (`ort::Error<()>`, `ort::Error<SessionBuilder>`, etc.) without naming the type.
+fn ort_err(e: impl std::fmt::Display) -> anyhow::Error {
+    anyhow::anyhow!("{e}")
+}
+
+// ---------------------------------------------------------------------------
 // Public types
 // ---------------------------------------------------------------------------
 
@@ -157,14 +172,17 @@ fn load_session(
     model_path: &Path,
     eps: Vec<ort::ep::ExecutionProviderDispatch>,
 ) -> Result<ort::session::Session> {
-    let mut builder = ort::session::Session::builder()?;
+    let mut builder = ort::session::Session::builder().map_err(ort_err)?;
     if !eps.is_empty() {
-        builder = builder.with_execution_providers(eps)?;
+        builder = builder.with_execution_providers(eps).map_err(ort_err)?;
     }
     let session = builder
-        .with_optimization_level(ort::session::builder::GraphOptimizationLevel::Level3)?
-        .with_intra_threads(1)?
-        .commit_from_file(model_path)?;
+        .with_optimization_level(ort::session::builder::GraphOptimizationLevel::Level3)
+        .map_err(ort_err)?
+        .with_intra_threads(1)
+        .map_err(ort_err)?
+        .commit_from_file(model_path)
+        .map_err(ort_err)?;
     Ok(session)
 }
 
@@ -309,22 +327,27 @@ fn embed_dense(
         let (ids_array, mask_array) = build_chunk_arrays(&encodings, chunk_indices, chunk_max)?;
         let batch_len = ids_array.nrows();
 
-        let ids_tensor = TensorRef::from_array_view(ids_array.view())?;
-        let mask_tensor = TensorRef::from_array_view(mask_array.view())?;
+        let ids_tensor = TensorRef::from_array_view(ids_array.view()).map_err(ort_err)?;
+        let mask_tensor = TensorRef::from_array_view(mask_array.view()).map_err(ort_err)?;
 
-        let outputs = session.run(ort::inputs! {
-            "input_ids" => ids_tensor,
-            "attention_mask" => mask_tensor,
-        })?;
+        let outputs = session
+            .run(ort::inputs! {
+                "input_ids" => ids_tensor,
+                "attention_mask" => mask_tensor,
+            })
+            .map_err(ort_err)?;
 
         // FP32: sentence_embedding [batch, 1024] — pre-pooled CLS output.
         // FP16/INT8: last_hidden_state [batch, seq, 1024] — CLS token at position 0.
         let emb: ndarray::ArrayD<f32> = match model_variant {
             ModelVariant::Fp32 => outputs["sentence_embedding"]
-                .try_extract_array::<f32>()?
+                .try_extract_array::<f32>()
+                .map_err(ort_err)?
                 .to_owned(),
             ModelVariant::Fp16 | ModelVariant::Int8 => {
-                let lhs = outputs["last_hidden_state"].try_extract_array::<f32>()?;
+                let lhs = outputs["last_hidden_state"]
+                    .try_extract_array::<f32>()
+                    .map_err(ort_err)?;
                 lhs.index_axis(ndarray::Axis(1), 0).to_owned()
             }
         };
@@ -376,21 +399,25 @@ fn embed_sparse(
 
         let (ids_array, mask_array) = build_chunk_arrays(&encodings, chunk_indices, chunk_max)?;
 
-        let ids_tensor = TensorRef::from_array_view(ids_array.view())?;
-        let mask_tensor = TensorRef::from_array_view(mask_array.view())?;
+        let ids_tensor = TensorRef::from_array_view(ids_array.view()).map_err(ort_err)?;
+        let mask_tensor = TensorRef::from_array_view(mask_array.view()).map_err(ort_err)?;
 
-        let outputs = session.run(ort::inputs! {
-            "input_ids" => ids_tensor,
-            "attention_mask" => mask_tensor,
-        })?;
+        let outputs = session
+            .run(ort::inputs! {
+                "input_ids" => ids_tensor,
+                "attention_mask" => mask_tensor,
+            })
+            .map_err(ort_err)?;
 
         // FP32: token_embeddings [batch, seq, 1024].
         // FP16/INT8: last_hidden_state [batch, seq, 1024] — same shape, different key.
         let token_emb = match model_variant {
-            ModelVariant::Fp32 => outputs["token_embeddings"].try_extract_array::<f32>()?,
-            ModelVariant::Fp16 | ModelVariant::Int8 => {
-                outputs["last_hidden_state"].try_extract_array::<f32>()?
-            }
+            ModelVariant::Fp32 => outputs["token_embeddings"]
+                .try_extract_array::<f32>()
+                .map_err(ort_err)?,
+            ModelVariant::Fp16 | ModelVariant::Int8 => outputs["last_hidden_state"]
+                .try_extract_array::<f32>()
+                .map_err(ort_err)?,
         };
 
         for (chunk_pos, &orig_idx) in chunk_indices.iter().enumerate() {
@@ -432,14 +459,16 @@ pub(crate) fn probe_run_dense(
 ) -> Result<ProbeResult> {
     let rss_before = sysinfo::read_process_rss_bytes().unwrap_or(0);
 
-    let ids_tensor = TensorRef::from_array_view(ids_array.view())?;
-    let mask_tensor = TensorRef::from_array_view(mask_array.view())?;
+    let ids_tensor = TensorRef::from_array_view(ids_array.view()).map_err(ort_err)?;
+    let mask_tensor = TensorRef::from_array_view(mask_array.view()).map_err(ort_err)?;
 
     // Run inference (output discarded — we only care about RSS).
-    let _outputs = session.run(ort::inputs! {
-        "input_ids" => ids_tensor,
-        "attention_mask" => mask_tensor,
-    })?;
+    let _outputs = session
+        .run(ort::inputs! {
+            "input_ids" => ids_tensor,
+            "attention_mask" => mask_tensor,
+        })
+        .map_err(ort_err)?;
 
     let rss_after = sysinfo::read_process_rss_bytes().unwrap_or(rss_before);
 
