@@ -63,7 +63,10 @@ pub(crate) struct MemoryReading {
 pub(crate) fn detect_available_memory() -> MemoryReading {
     // --- step 1: explicit override ---
     if let Some(bytes) = env_override() {
-        return MemoryReading { available_bytes: bytes, source: MemorySource::Override };
+        return MemoryReading {
+            available_bytes: bytes,
+            source: MemorySource::Override,
+        };
     }
 
     // --- step 2 / 3: Linux cgroup ---
@@ -74,7 +77,10 @@ pub(crate) fn detect_available_memory() -> MemoryReading {
 
     // --- step 4 / 5: OS-level RAM ---
     if let Some(bytes) = host_ram() {
-        return MemoryReading { available_bytes: bytes, source: MemorySource::HostRam };
+        return MemoryReading {
+            available_bytes: bytes,
+            source: MemorySource::HostRam,
+        };
     }
 
     // --- fallback ---
@@ -84,7 +90,10 @@ pub(crate) fn detect_available_memory() -> MemoryReading {
         "Memory detection failed on all paths; using 4 GiB fallback. \
          Set BGE_M3_AVAILABLE_MEMORY_BYTES to override."
     );
-    MemoryReading { available_bytes: fallback, source: MemorySource::HostRam }
+    MemoryReading {
+        available_bytes: fallback,
+        source: MemorySource::HostRam,
+    }
 }
 
 /// Returns the current process's RSS (Resident Set Size) in bytes, or `None`
@@ -176,11 +185,7 @@ fn linux_meminfo_available() -> Option<usize> {
     let content = std::fs::read_to_string("/proc/meminfo").ok()?;
     for line in content.lines() {
         if line.starts_with("MemAvailable:") {
-            let kb: usize = line
-                .split_whitespace()
-                .nth(1)?
-                .parse()
-                .ok()?;
+            let kb: usize = line.split_whitespace().nth(1)?.parse().ok()?;
             return Some(kb * 1024);
         }
     }

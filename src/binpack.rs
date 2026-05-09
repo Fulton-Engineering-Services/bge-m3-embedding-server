@@ -156,7 +156,11 @@ mod tests {
     use super::*;
 
     fn model(a: f64, b: f64, max_bytes: usize) -> CostModel {
-        CostModel { a, b, max_workspace_bytes: max_bytes }
+        CostModel {
+            a,
+            b,
+            max_workspace_bytes: max_bytes,
+        }
     }
 
     // Simple model with no quadratic term; maps budget/count = max_tokens_per_chunk.
@@ -290,11 +294,11 @@ mod tests {
         // cast_precision_loss: chunk counts are small (≤ 300), far within f64
         //   precision; the assertion only checks an order-of-magnitude ratio (5×).
         #[allow(clippy::cast_precision_loss)]
-        let avg_short: f64 = short_chunks.iter().map(Vec::len).sum::<usize>() as f64
-            / short_chunks.len() as f64;
+        let avg_short: f64 =
+            short_chunks.iter().map(Vec::len).sum::<usize>() as f64 / short_chunks.len() as f64;
         #[allow(clippy::cast_precision_loss)]
-        let avg_long: f64 = long_chunks.iter().map(Vec::len).sum::<usize>() as f64
-            / long_chunks.len() as f64;
+        let avg_long: f64 =
+            long_chunks.iter().map(Vec::len).sum::<usize>() as f64 / long_chunks.len() as f64;
 
         assert!(
             avg_short > avg_long * 5.0,

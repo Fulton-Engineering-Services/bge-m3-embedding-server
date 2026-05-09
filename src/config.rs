@@ -118,7 +118,6 @@ pub struct Config {
     pub model_variant: ModelVariant,
 
     // --- auto-budget and cost-model knobs ---
-
     /// Fraction of estimated available workspace to actually use per worker.
     ///
     /// Set with `BGE_M3_MEMORY_SAFETY_FACTOR`. Defaults to `0.7` (30% headroom
@@ -271,15 +270,18 @@ fn resolve_cost_model_override<F: Fn(&str) -> Option<String>>(
     }
 
     // 3. Explicit coefficient override — requires A, B, AND available memory.
-    if let (Some(a_str), Some(b_str)) = (
-        lookup("BGE_M3_COST_MODEL_A"),
-        lookup("BGE_M3_COST_MODEL_B"),
-    ) {
+    if let (Some(a_str), Some(b_str)) =
+        (lookup("BGE_M3_COST_MODEL_A"), lookup("BGE_M3_COST_MODEL_B"))
+    {
         if let (Ok(a), Ok(b)) = (a_str.parse::<f64>(), b_str.parse::<f64>()) {
             let max_workspace = lookup("BGE_M3_AVAILABLE_MEMORY_BYTES")
                 .and_then(|v| v.parse::<usize>().ok())
                 .unwrap_or(CostModel::DEFAULT_MAX_WORKSPACE);
-            return Some(CostModel { a, b, max_workspace_bytes: max_workspace });
+            return Some(CostModel {
+                a,
+                b,
+                max_workspace_bytes: max_workspace,
+            });
         }
     }
 
@@ -309,7 +311,10 @@ mod tests {
         assert_eq!(cfg.idle_timeout, Some(Duration::from_secs(300)));
         assert_eq!(cfg.model_variant, ModelVariant::Fp16);
         assert!((cfg.memory_safety_factor - 0.7).abs() < 1e-9);
-        assert!(cfg.cost_model_override.is_none(), "probe should run by default");
+        assert!(
+            cfg.cost_model_override.is_none(),
+            "probe should run by default"
+        );
     }
 
     #[test]

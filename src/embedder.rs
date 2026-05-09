@@ -125,15 +125,15 @@ fn download_model_files(
         .get("tokenizer.json")
         .map_err(|e| anyhow::anyhow!("Failed to get tokenizer.json: {e}"))?;
 
-    Ok(ModelFiles { onnx_path, tokenizer_path })
+    Ok(ModelFiles {
+        onnx_path,
+        tokenizer_path,
+    })
 }
 
 /// Loads and configures the BGE-M3 tokenizer with truncation at `max_seq_length`
 /// but **no** padding. Padding is applied per-chunk in [`build_chunk_arrays`].
-fn load_tokenizer(
-    tokenizer_path: &Path,
-    max_seq_length: usize,
-) -> Result<tokenizers::Tokenizer> {
+fn load_tokenizer(tokenizer_path: &Path, max_seq_length: usize) -> Result<tokenizers::Tokenizer> {
     let mut tokenizer = tokenizers::Tokenizer::from_file(tokenizer_path)
         .map_err(|e| anyhow::anyhow!("Failed to load tokenizer: {e}"))?;
 
@@ -443,7 +443,10 @@ pub(crate) fn probe_run_dense(
 
     let rss_after = sysinfo::read_process_rss_bytes().unwrap_or(rss_before);
 
-    Ok(ProbeResult { rss_before, rss_after })
+    Ok(ProbeResult {
+        rss_before,
+        rss_after,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -784,7 +787,11 @@ impl EmbedPool {
         );
 
         (
-            Self { tx, live_workers, loaded_workers },
+            Self {
+                tx,
+                live_workers,
+                loaded_workers,
+            },
             init_handle,
         )
     }
@@ -792,7 +799,10 @@ impl EmbedPool {
     pub async fn dense(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.tx
-            .send(EmbedRequest::Dense { texts, reply: reply_tx })
+            .send(EmbedRequest::Dense {
+                texts,
+                reply: reply_tx,
+            })
             .await
             .map_err(|_| anyhow::anyhow!("EmbedPool channel closed"))?;
         reply_rx
@@ -803,7 +813,10 @@ impl EmbedPool {
     pub async fn sparse(&self, texts: Vec<String>) -> Result<Vec<SparseEmbedding>> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.tx
-            .send(EmbedRequest::Sparse { texts, reply: reply_tx })
+            .send(EmbedRequest::Sparse {
+                texts,
+                reply: reply_tx,
+            })
             .await
             .map_err(|_| anyhow::anyhow!("EmbedPool channel closed"))?;
         reply_rx
@@ -816,7 +829,10 @@ impl EmbedPool {
     pub(crate) async fn probe(&self, texts: Vec<String>) -> Result<ProbeResult> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.tx
-            .send(EmbedRequest::Probe { texts, reply: reply_tx })
+            .send(EmbedRequest::Probe {
+                texts,
+                reply: reply_tx,
+            })
             .await
             .map_err(|_| anyhow::anyhow!("EmbedPool channel closed"))?;
         reply_rx
@@ -928,7 +944,10 @@ mod tests {
             .expect("init_handle should resolve quickly, not hang")
             .expect("JoinHandle should not panic");
 
-        assert!(result.is_err(), "init should return Err on leader load failure");
+        assert!(
+            result.is_err(),
+            "init should return Err on leader load failure"
+        );
         let msg = result.unwrap_err().to_string();
         assert!(
             msg.contains("failed to load"),
@@ -956,7 +975,10 @@ mod tests {
             .expect("init_handle should resolve quickly, not hang")
             .expect("JoinHandle should not panic");
 
-        assert!(result.is_err(), "init should fail without spawning followers");
+        assert!(
+            result.is_err(),
+            "init should fail without spawning followers"
+        );
         assert_eq!(pool.loaded_worker_count(), 0);
     }
 
@@ -1029,7 +1051,10 @@ mod tests {
     fn normalize_l2_sign_preservation() {
         let mut v = vec![-3.0, 4.0];
         normalize_l2(&mut v);
-        assert!((v[0] - (-0.6)).abs() < 1e-6, "negative sign must be preserved");
+        assert!(
+            (v[0] - (-0.6)).abs() < 1e-6,
+            "negative sign must be preserved"
+        );
         assert!((v[1] - 0.8).abs() < 1e-6);
     }
 
@@ -1049,7 +1074,10 @@ mod tests {
         let mut v = vec![1.0, 2.0, 3.0, 4.0, 5.0];
         normalize_l2(&mut v);
         let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
-        assert!((norm - 1.0).abs() < 1e-6, "output norm must equal 1.0, got {norm}");
+        assert!(
+            (norm - 1.0).abs() < 1e-6,
+            "output norm must equal 1.0, got {norm}"
+        );
     }
 
     #[test]
@@ -1065,7 +1093,10 @@ mod tests {
         let weight = ndarray::array![1.0, 1.0];
         let hidden = [-5.0, -5.0];
         let score = sparse_project(&hidden, &weight.view(), 0.0);
-        assert!(score.abs() < 1e-6, "negative scores should be clamped to zero");
+        assert!(
+            score.abs() < 1e-6,
+            "negative scores should be clamped to zero"
+        );
     }
 
     #[test]
@@ -1222,7 +1253,10 @@ mod tests {
             serde_json::from_str(&content).expect("corpus.json must be valid JSON");
 
         assert!(corpus.get("metadata").is_some(), "must have 'metadata' key");
-        assert!(corpus.get("scenarios").is_some(), "must have 'scenarios' key");
+        assert!(
+            corpus.get("scenarios").is_some(),
+            "must have 'scenarios' key"
+        );
 
         let sources = &corpus["metadata"]["sources"];
         assert_eq!(sources["knowledgebase_chunks"]["count"], 50);
@@ -1230,7 +1264,9 @@ mod tests {
         assert_eq!(sources["codekeeper_symbols"]["count"], 50);
         assert_eq!(sources["boundary_cases"]["count"], 9);
 
-        let scenarios = corpus["scenarios"].as_object().expect("scenarios must be object");
+        let scenarios = corpus["scenarios"]
+            .as_object()
+            .expect("scenarios must be object");
         let expected: &[(&str, usize)] = &[
             ("document_chunks", 50),
             ("tool_descriptions", 75),

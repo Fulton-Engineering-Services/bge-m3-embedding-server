@@ -86,7 +86,10 @@ fn manifest_exists_and_has_expected_fields() {
         serde_json::from_str(&raw).expect("manifest.json should be valid JSON");
 
     assert!(
-        manifest.get("model_revision").and_then(|v| v.as_str()).is_some(),
+        manifest
+            .get("model_revision")
+            .and_then(|v| v.as_str())
+            .is_some(),
         "manifest must have 'model_revision'"
     );
     assert!(
@@ -118,10 +121,9 @@ fn manifest_revision_matches_server_repo_revision() {
 
     // Extract REPO_REVISION from embedder.rs at compile time via a constant.
     // The string is found via the same extraction logic used in embedder.rs tests.
-    let embedder_src = std::fs::read_to_string(
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("src/embedder.rs"),
-    )
-    .expect("src/embedder.rs should be readable");
+    let embedder_src =
+        std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/embedder.rs"))
+            .expect("src/embedder.rs should be readable");
 
     let revision = extract_const_str(&embedder_src, "REPO_REVISION");
 
@@ -284,15 +286,12 @@ fn onnx_positional_embedding_supports_configured_max_seq() {
     input_ids[0] = 0; // CLS
     let attention_mask: Vec<i64> = vec![1i64; max_seq];
 
-    let ids_arr =
-        ndarray::Array2::from_shape_vec((1, max_seq), input_ids).expect("array shape");
+    let ids_arr = ndarray::Array2::from_shape_vec((1, max_seq), input_ids).expect("array shape");
     let mask_arr =
         ndarray::Array2::from_shape_vec((1, max_seq), attention_mask).expect("array shape");
 
-    let ids_tensor =
-        ort::value::TensorRef::from_array_view(ids_arr.view()).expect("ids tensor");
-    let mask_tensor =
-        ort::value::TensorRef::from_array_view(mask_arr.view()).expect("mask tensor");
+    let ids_tensor = ort::value::TensorRef::from_array_view(ids_arr.view()).expect("ids tensor");
+    let mask_tensor = ort::value::TensorRef::from_array_view(mask_arr.view()).expect("mask tensor");
 
     let result = sess.run(ort::inputs! {
         "input_ids" => ids_tensor,
@@ -325,9 +324,18 @@ struct Tolerances {
 
 fn cosine_tolerances_for(model: &str) -> Tolerances {
     match model {
-        "int8" => Tolerances { mean_cosine: 0.95, p5_cosine: 0.93 },
-        "fp16" => Tolerances { mean_cosine: 0.98, p5_cosine: 0.96 },
-        _ => Tolerances { mean_cosine: 0.99, p5_cosine: 0.97 }, // fp32 or unknown
+        "int8" => Tolerances {
+            mean_cosine: 0.95,
+            p5_cosine: 0.93,
+        },
+        "fp16" => Tolerances {
+            mean_cosine: 0.98,
+            p5_cosine: 0.96,
+        },
+        _ => Tolerances {
+            mean_cosine: 0.99,
+            p5_cosine: 0.97,
+        }, // fp32 or unknown
     }
 }
 
@@ -370,11 +378,10 @@ fn run_equivalence_for_seq(seq: usize, model_str: &str, tolerances: &Tolerances)
     // Tokenize using the HuggingFace tokenizer (pure Rust via `tokenizers` crate).
     // Note: we use tokenizers directly here to stay in Rust — no Python needed
     // for the test itself. The tokenizer.json is downloaded along with the model.
-    let tokenizer_path = locate_tokenizer(&cache_dir, model_str)
-        .expect("Could not locate tokenizer.json");
+    let tokenizer_path =
+        locate_tokenizer(&cache_dir, model_str).expect("Could not locate tokenizer.json");
 
-    let mut tokenizer = tokenizers::Tokenizer::from_file(&tokenizer_path)
-        .expect("tokenizer load");
+    let mut tokenizer = tokenizers::Tokenizer::from_file(&tokenizer_path).expect("tokenizer load");
     tokenizer
         .with_truncation(Some(tokenizers::TruncationParams {
             max_length: seq,
@@ -386,9 +393,15 @@ fn run_equivalence_for_seq(seq: usize, model_str: &str, tolerances: &Tolerances)
     tokenizer.with_padding(None);
 
     let str_refs: Vec<&str> = texts.iter().map(String::as_str).collect();
-    let encodings = tokenizer.encode_batch_fast(str_refs, true).expect("tokenize");
+    let encodings = tokenizer
+        .encode_batch_fast(str_refs, true)
+        .expect("tokenize");
 
-    let pad_to = encodings.iter().map(|e| e.get_ids().len()).max().unwrap_or(1);
+    let pad_to = encodings
+        .iter()
+        .map(|e| e.get_ids().len())
+        .max()
+        .unwrap_or(1);
     let mut ids_flat: Vec<i64> = Vec::with_capacity(n * pad_to);
     let mut mask_flat: Vec<i64> = Vec::with_capacity(n * pad_to);
     for enc in &encodings {
@@ -407,8 +420,7 @@ fn run_equivalence_for_seq(seq: usize, model_str: &str, tolerances: &Tolerances)
 
     eprintln!("  Running inference at shape ({n}, {pad_to})...");
     let ids_tensor = ort::value::TensorRef::from_array_view(ids_arr.view()).expect("ids tensor");
-    let mask_tensor =
-        ort::value::TensorRef::from_array_view(mask_arr.view()).expect("mask tensor");
+    let mask_tensor = ort::value::TensorRef::from_array_view(mask_arr.view()).expect("mask tensor");
 
     let outputs = sess
         .run(ort::inputs! {
@@ -553,10 +565,9 @@ fn load_npy_f32(path: &Path) -> Vec<f32> {
 fn locate_model_file(cache_dir: &str, model_str: &str) -> Option<std::path::PathBuf> {
     // REPO_REVISION from src/embedder.rs is baked in at test compile time via
     // the extract_const_str utility also used in drift detection tests.
-    let embedder_src = std::fs::read_to_string(
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("src/embedder.rs"),
-    )
-    .ok()?;
+    let embedder_src =
+        std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/embedder.rs"))
+            .ok()?;
 
     let (repo_org, model_name, revision, onnx_file) = match model_str {
         "fp16" => {
@@ -590,10 +601,9 @@ fn locate_model_file(cache_dir: &str, model_str: &str) -> Option<std::path::Path
 
 /// Locates the tokenizer.json file in the `HuggingFace` cache.
 fn locate_tokenizer(cache_dir: &str, model_str: &str) -> Option<std::path::PathBuf> {
-    let embedder_src = std::fs::read_to_string(
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("src/embedder.rs"),
-    )
-    .ok()?;
+    let embedder_src =
+        std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/embedder.rs"))
+            .ok()?;
 
     let (repo_org, model_name, revision) = match model_str {
         "fp16" | "int8" => {
@@ -626,7 +636,9 @@ fn extract_const_str(src: &str, const_name: &str) -> String {
         let trimmed = line.trim();
         if trimmed.starts_with(&prefix) {
             let start = trimmed.find('"').expect("missing opening quote");
-            let end = trimmed[start + 1..].find('"').expect("missing closing quote");
+            let end = trimmed[start + 1..]
+                .find('"')
+                .expect("missing closing quote");
             return trimmed[start + 1..start + 1 + end].to_string();
         }
     }

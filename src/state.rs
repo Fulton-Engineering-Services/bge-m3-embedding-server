@@ -47,11 +47,7 @@ pub struct TuningInfo {
 }
 
 impl TuningInfo {
-    pub fn new(
-        cost_model: &CostModel,
-        mem: &MemoryReading,
-        model_rss_per_worker: usize,
-    ) -> Self {
+    pub fn new(cost_model: &CostModel, mem: &MemoryReading, model_rss_per_worker: usize) -> Self {
         Self {
             a_bytes_per_token: cost_model.a,
             b_bytes_per_token_sq: cost_model.b,

@@ -71,11 +71,7 @@ struct DataPoint {
 ///
 /// `Ok((a, b))` where `a` and `b` are the fitted cost-model coefficients.
 /// Returns conservative defaults and logs a warning on any failure.
-pub(crate) async fn run_probe(
-    pool: &EmbedPool,
-    max_seq: usize,
-    rss_ceiling: usize,
-) -> (f64, f64) {
+pub(crate) async fn run_probe(pool: &EmbedPool, max_seq: usize, rss_ceiling: usize) -> (f64, f64) {
     info!(
         max_seq,
         rss_ceiling_mb = rss_ceiling / (1024 * 1024),
@@ -108,8 +104,7 @@ pub(crate) async fn run_probe(
         if !conservative.fits(batch, seq) {
             info!(
                 batch,
-                seq,
-                "Probe: skipping shape (estimated to exceed rss_ceiling)"
+                seq, "Probe: skipping shape (estimated to exceed rss_ceiling)"
             );
             continue;
         }
@@ -129,7 +124,11 @@ pub(crate) async fn run_probe(
                     rss_delta_mb = delta / (1024 * 1024),
                     "Probe shape measured"
                 );
-                data.push(DataPoint { batch, seq, rss_delta: delta });
+                data.push(DataPoint {
+                    batch,
+                    seq,
+                    rss_delta: delta,
+                });
             }
             Err(e) => {
                 if seq == max_seq {
@@ -142,9 +141,7 @@ pub(crate) async fn run_probe(
                          variant may not support this sequence length"
                     );
                     // Propagate as warning; caller converts to startup failure.
-                    warn!(
-                        "Falling back to conservative cost model after capability check failure"
-                    );
+                    warn!("Falling back to conservative cost model after capability check failure");
                     return (CostModel::CONSERVATIVE_A, CostModel::CONSERVATIVE_B);
                 }
                 warn!(batch, seq, error = %e, "Probe shape failed; skipping");
@@ -295,7 +292,10 @@ fn load_probe_texts() -> Vec<String> {
         }
     }
     // Fallback: minimal probe text.
-    vec!["The embedding server startup probe synthesizes texts to measure workspace cost.".to_string()]
+    vec![
+        "The embedding server startup probe synthesizes texts to measure workspace cost."
+            .to_string(),
+    ]
 }
 
 /// Synthesizes `batch` texts each of approximately `target_seq` tokens.
@@ -333,10 +333,26 @@ mod tests {
         // hand-crafted data: batch=1,seq=64 → 8 MB; batch=1,seq=512 → 100 MB.
         // Expect a reasonable (a,b) pair.
         let data = vec![
-            DataPoint { batch: 1, seq: 64, rss_delta: 8_000_000 },
-            DataPoint { batch: 1, seq: 512, rss_delta: 100_000_000 },
-            DataPoint { batch: 4, seq: 64, rss_delta: 30_000_000 },
-            DataPoint { batch: 4, seq: 256, rss_delta: 80_000_000 },
+            DataPoint {
+                batch: 1,
+                seq: 64,
+                rss_delta: 8_000_000,
+            },
+            DataPoint {
+                batch: 1,
+                seq: 512,
+                rss_delta: 100_000_000,
+            },
+            DataPoint {
+                batch: 4,
+                seq: 64,
+                rss_delta: 30_000_000,
+            },
+            DataPoint {
+                batch: 4,
+                seq: 256,
+                rss_delta: 80_000_000,
+            },
         ];
         let result = fit_cost_model(&data);
         assert!(result.is_some(), "should produce a valid fit");
@@ -347,7 +363,11 @@ mod tests {
 
     #[test]
     fn fit_cost_model_single_point_returns_none() {
-        let data = vec![DataPoint { batch: 1, seq: 128, rss_delta: 5_000_000 }];
+        let data = vec![DataPoint {
+            batch: 1,
+            seq: 128,
+            rss_delta: 5_000_000,
+        }];
         assert!(fit_cost_model(&data).is_none(), "need >= 2 points");
     }
 
@@ -355,8 +375,16 @@ mod tests {
     fn fit_cost_model_singular_system_returns_none() {
         // All points on the same line through the origin in one variable — singular.
         let data = vec![
-            DataPoint { batch: 1, seq: 128, rss_delta: 1_000_000 },
-            DataPoint { batch: 1, seq: 128, rss_delta: 1_000_000 },
+            DataPoint {
+                batch: 1,
+                seq: 128,
+                rss_delta: 1_000_000,
+            },
+            DataPoint {
+                batch: 1,
+                seq: 128,
+                rss_delta: 1_000_000,
+            },
         ];
         // x2 = x1 * seq = same for both → singular (columns are linearly dependent).
         assert!(
@@ -370,10 +398,26 @@ mod tests {
         // Construct data that forces a negative coefficient — artificially small
         // rss at high seq relative to low seq.
         let data = vec![
-            DataPoint { batch: 16, seq: 64, rss_delta: 10_000_000 },
-            DataPoint { batch: 1, seq: 8192, rss_delta: 1 }, // pathological
-            DataPoint { batch: 8, seq: 256, rss_delta: 5_000_000 },
-            DataPoint { batch: 4, seq: 1024, rss_delta: 2_000_000 },
+            DataPoint {
+                batch: 16,
+                seq: 64,
+                rss_delta: 10_000_000,
+            },
+            DataPoint {
+                batch: 1,
+                seq: 8192,
+                rss_delta: 1,
+            }, // pathological
+            DataPoint {
+                batch: 8,
+                seq: 256,
+                rss_delta: 5_000_000,
+            },
+            DataPoint {
+                batch: 4,
+                seq: 1024,
+                rss_delta: 2_000_000,
+            },
         ];
         // May or may not produce a valid fit; just assert it doesn't panic.
         let _ = fit_cost_model(&data);
@@ -410,7 +454,10 @@ mod tests {
             let positions = b * s;
             // Not required to be strictly ascending (table has duplicates at same
             // token count but different (b,s) combos), just check no zeros.
-            assert!(positions > 0, "probe shape ({b},{s}) has zero token positions");
+            assert!(
+                positions > 0,
+                "probe shape ({b},{s}) has zero token positions"
+            );
             let _ = prev;
             prev = positions;
         }

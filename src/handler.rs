@@ -171,8 +171,7 @@ pub async fn health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     });
 
     if let Some(tuning) = state.tuning.get() {
-        body["tuning"] = serde_json::to_value(tuning)
-            .unwrap_or(serde_json::Value::Null);
+        body["tuning"] = serde_json::to_value(tuning).unwrap_or(serde_json::Value::Null);
     }
 
     (StatusCode::OK, Json(body)).into_response()
@@ -316,12 +315,15 @@ mod tests {
 
     #[tokio::test]
     async fn health_ok_includes_max_seq_length() {
-        use crate::state::TuningInfo;
         use crate::binpack::CostModel;
+        use crate::state::TuningInfo;
         use crate::sysinfo::{MemoryReading, MemorySource};
 
         let cm = CostModel::conservative(1024 * 1024 * 1024);
-        let mem = MemoryReading { available_bytes: 8_000_000_000, source: MemorySource::CgroupV2 };
+        let mem = MemoryReading {
+            available_bytes: 8_000_000_000,
+            source: MemorySource::CgroupV2,
+        };
         let tuning = TuningInfo::new(&cm, &mem, 500_000_000);
 
         let tuning_lock = std::sync::OnceLock::new();
@@ -437,7 +439,9 @@ mod tests {
         let state = make_state(true, 256);
         let response = models(State(state)).await.into_response();
         assert_eq!(response.status(), StatusCode::OK);
-        let bytes = to_bytes(response.into_body(), usize::MAX).await.expect("body readable");
+        let bytes = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body readable");
         let body: serde_json::Value = serde_json::from_slice(&bytes).expect("valid json");
         assert_eq!(body["object"], "list");
         assert_eq!(body["data"][0]["id"], "bge-m3");
@@ -614,7 +618,10 @@ mod tests {
             input: TextInput(vec!["hello".into()]),
         };
         let result = sparse_embeddings(State(state), Json(req)).await;
-        assert!(result.is_ok(), "expected Ok but got error from sparse handler");
+        assert!(
+            result.is_ok(),
+            "expected Ok but got error from sparse handler"
+        );
         let Json(resp) = result.expect("sparse_embeddings should succeed");
         assert_eq!(resp.data.len(), 1);
         assert_eq!(resp.data[0].sparse_values.indices, vec![42u32]);

@@ -61,7 +61,11 @@ pub(crate) fn build_router(state: Arc<AppState>) -> Router {
 //   sub-byte fractions is intentional and harmless.
 // cast_sign_loss: total_workspace is derived from saturating_sub so it is always
 //   ≥ 0 before the float multiplication.
-#[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss
+)]
 async fn run_readiness_probe(
     init_handle: tokio::task::JoinHandle<anyhow::Result<()>>,
     state: Arc<AppState>,
@@ -497,7 +501,12 @@ mod tests {
             .expect("request should build");
         let resp: Response = app.oneshot(req).await.expect("router should respond");
         assert_eq!(resp.status(), StatusCode::OK);
-        let body = resp.into_body().collect().await.expect("body readable").to_bytes();
+        let body = resp
+            .into_body()
+            .collect()
+            .await
+            .expect("body readable")
+            .to_bytes();
         let json: serde_json::Value = serde_json::from_slice(&body).expect("valid json");
         assert_eq!(json["data"][0]["id"], "bge-m3");
     }
@@ -525,7 +534,9 @@ mod tests {
             .expect("request should build");
         let resp: Response = app.oneshot(req).await.expect("router should respond");
         assert_eq!(
-            resp.headers().get("x-request-id").and_then(|v| v.to_str().ok()),
+            resp.headers()
+                .get("x-request-id")
+                .and_then(|v| v.to_str().ok()),
             Some("test-id-12345")
         );
     }
@@ -534,18 +545,19 @@ mod tests {
     async fn readiness_probe_fails_when_init_returns_error() {
         let state = make_test_state(false, 256);
         let handle = tokio::spawn(async { Err::<(), _>(anyhow::anyhow!("init failed")) });
-        let result =
-            run_readiness_probe(handle, state, 8192, 2, 0.7, None).await;
+        let result = run_readiness_probe(handle, state, 8192, 2, 0.7, None).await;
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("initialization failed"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("initialization failed"));
     }
 
     #[tokio::test]
     async fn readiness_probe_fails_when_init_panics() {
         let state = make_test_state(false, 256);
         let handle = tokio::spawn(async { panic!("worker panic") });
-        let result =
-            run_readiness_probe(handle, state, 8192, 2, 0.7, None).await;
+        let result = run_readiness_probe(handle, state, 8192, 2, 0.7, None).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("panicked"));
     }
@@ -554,8 +566,7 @@ mod tests {
     async fn readiness_probe_fails_when_dense_probe_fails() {
         let state = make_test_state(false, 256);
         let handle = tokio::spawn(async { Ok::<(), anyhow::Error>(()) });
-        let result =
-            run_readiness_probe(handle, state, 8192, 2, 0.7, None).await;
+        let result = run_readiness_probe(handle, state, 8192, 2, 0.7, None).await;
         assert!(result.is_err());
     }
 
