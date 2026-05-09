@@ -122,19 +122,25 @@ paths:
 
         **Why a single forward pass matters**
 
-        BGE-M3 has a unified transformer backbone with two output heads baked
-        into the same ONNX graph. The dense embedding is derived from the CLS
-        token hidden state (L2-normalized), while the sparse weights are derived
-        by projecting all token hidden states through a linear layer, applying
-        ReLU, and max-pooling. Both heads consume the **same transformer output**
-        — so the transformer computation happens exactly once per chunk regardless
-        of whether you need one representation or both.
+        BGE-M3 has a unified transformer backbone where both embedding
+        representations emerge from the same encoder run, regardless of which
+        ONNX variant is loaded:
 
-        With `BGE_M3_MODEL=fp32` (the BAAI/bge-m3 FP32 export), this architecture
-        is directly expressed in the ONNX graph: a single `session.run()` returns
-        both the pooled dense output tensor and the token-level hidden states for
-        sparse projection. There is no second model invocation, no second HTTP
-        roundtrip, and no extra memory copy.
+        - **FP32 (`BAAI/bge-m3`):** The ONNX graph has two explicit named
+          output heads — `sentence_embedding` [batch, 1024] for the pooled
+          dense vector, and `token_embeddings` [batch, seq, 1024] for
+          token-level hidden states. One `session.run()` emits both tensors
+          simultaneously.
+        - **FP16 / INT8 (`Xenova/bge-m3`):** The ONNX graph exposes a single
+          `last_hidden_state` [batch, seq, 1024] output. One `session.run()`
+          emits it; the server derives the dense vector by slicing the CLS
+          position (index 0) and the sparse base from all token positions
+          of the same tensor. Still one forward pass — the transformer runs
+          once and both representations are extracted in Rust.
+
+        In all three variants the transformer executes exactly once per chunk.
+        The compute savings compared to two separate calls are equivalent
+        regardless of the model variant chosen.
 
         This is a meaningful differentiation from typical hybrid retrieval
         infrastructure, where producing both representations requires either:

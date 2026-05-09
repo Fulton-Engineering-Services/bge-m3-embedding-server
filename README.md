@@ -11,7 +11,7 @@ Key capabilities:
 - **Long-context embeddings** — supports up to 8192 tokens (BGE-M3's full positional range), configurable via `BGE_M3_MAX_SEQ_LENGTH`.
 - **Memory-aware auto-tuning** — detects container/cgroup memory at startup, runs a workspace probe, and derives a safe workspace budget automatically. No manual `ONNX_BATCH_SIZE` knob needed.
 - **Length-aware bin-packing** — tokens within each `session.run()` call are padded only to the longest sequence in that chunk, not the global maximum. Short-text batches pack densely; long-text batches split appropriately.
-- **Single-pass dual embeddings** — `/v1/embeddings:both` produces dense and sparse vectors in one ONNX `session.run()`. BGE-M3's transformer backbone is shared: the CLS token yields the dense vector while the same token-level hidden states feed the sparse projection head. Both representations emerge from a single forward pass at no additional transformer cost — unlike hybrid retrieval setups that run a separate dense encoder and a sparse model in sequence.
+- **Single-pass dual embeddings** — `/v1/embeddings:both` produces dense and sparse vectors in one ONNX `session.run()` on all three model variants. BGE-M3's transformer runs once per chunk and both representations are derived from its output — unlike hybrid retrieval setups that run a separate dense encoder and a sparse model in sequence.
 
 ## Quick Start
 
@@ -205,22 +205,28 @@ Produces both dense and sparse embeddings for each input in a single ONNX forwar
 
 **Why this matters — BGE-M3's unified backbone**
 
-BGE-M3 is architecturally distinct from most hybrid-retrieval setups. Its ONNX model has a
-single transformer encoder whose output branches into two projection heads:
+BGE-M3 achieves single-pass dual embeddings on all three model variants, though
+the ONNX graph topology differs:
 
-- **Dense head:** the CLS token hidden state is L2-normalized to produce the 1024-dimensional dense vector.
-- **Sparse head:** all token-level hidden states are projected through a linear layer, ReLU-activated, and max-pooled to produce SPLADE-style sparse token weights.
+- **FP32 (`BAAI/bge-m3`, `BGE_M3_MODEL=fp32`):** The ONNX graph has two explicit
+  named output heads — `sentence_embedding` [batch, 1024] for the pooled dense
+  vector, and `token_embeddings` [batch, seq, 1024] for token-level hidden states.
+  One `session.run()` emits both tensors; the server extracts dense and sparse
+  base directly from their respective named outputs.
+- **FP16 / INT8 (`Xenova/bge-m3`, default and quantized):** The ONNX graph
+  exposes a single `last_hidden_state` [batch, seq, 1024] output. One
+  `session.run()` emits it; the server derives the dense vector from the CLS token
+  at position 0, and the sparse base from all token positions of the same tensor.
+  Still one forward pass — the transformer runs exactly once per chunk.
 
-Because both heads consume the same transformer output, calling this endpoint runs the
-transformer **once** per chunk — the cost of producing both representations is nearly identical
-to producing just one. With `BGE_M3_MODEL=fp32` (the BAAI/bge-m3 FP32 ONNX export), this
-architecture is most directly expressed: the original BAAI graph has both output heads baked in
-and a single `session.run()` yields both tensors with zero redundancy.
+In all three cases the transformer executes once per chunk. The cost of producing
+both representations is nearly identical to producing just one.
 
-Contrast this with common alternatives: running a dense-only model alongside BM25, pairing an
-OpenAI embedding call with a separate sparse encoder, or sequentially calling `/v1/embeddings`
-and `/v1/sparse-embeddings` — all of which require two model invocations. For ingestion
-pipelines that index both representations, this endpoint halves transformer compute.
+Contrast this with common alternatives: running a dense-only model alongside BM25,
+pairing an OpenAI embedding call with a separate sparse encoder, or sequentially
+calling `/v1/embeddings` and `/v1/sparse-embeddings` — all of which require two
+model invocations. For ingestion pipelines that index both representations, this
+endpoint halves transformer compute.
 
 The colon (`:`) in the path follows [AIP-136](https://google.aip.dev/136) custom-verb convention.
 
@@ -462,7 +468,7 @@ flowchart TD
 - **Tokenize-once, bin-pack:** each request tokenizes all input texts in a single pass (no padding), then `binpack::bin_pack()` groups them into `session.run()` calls where each chunk is padded only to its own longest sequence. This eliminates the "one long text pads the whole batch" inefficiency.
 - **Quadratic cost model:** workspace per `session.run()` call is estimated as `a × (batch × seq) + b × (batch × seq²)`. At `MAX_SEQ_LENGTH=8192`, the quadratic attention term dominates; the bin-packer automatically assigns fewer texts per chunk for long sequences.
 - **Memory-aware startup probe (Linux):** after the leader worker loads its model, the server sweeps 18 `(batch, seq)` shapes, measures peak RSS deltas, and fits cost-model coefficients `a` and `b` via least squares. Conservative defaults apply when the probe cannot run.
-- **Single forward pass for dual embeddings:** BGE-M3's ONNX graph has a shared transformer encoder with two output heads. `session.run()` yields both the CLS-token dense vector and the token-level hidden states for sparse projection simultaneously. The `/v1/embeddings:both` handler exploits this: one `session.run()` per chunk produces both representations at no extra transformer cost.
+- **Single forward pass for dual embeddings:** BGE-M3's ONNX graph exposes the data needed for both dense and sparse embeddings from one `session.run()`. For fp32, the graph has explicit named output heads (`sentence_embedding` + `token_embeddings`). For fp16/int8, both are derived from the single `last_hidden_state` output — dense from the CLS position, sparse base from all token positions. In both cases the transformer executes once per chunk for the `/v1/embeddings:both` handler.
 - Each worker runs on a Tokio `spawn_blocking` thread, loading its own ORT session and tokenizer.
 - The shared `Arc<Mutex<Receiver>>` provides natural load balancing without a separate dispatcher.
 - An `AtomicBool` readiness flag is set only after all workers have loaded **and** a warm-up probe completes. The `/health` endpoint returns `503 loading` until then.
