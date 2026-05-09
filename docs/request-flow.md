@@ -32,7 +32,7 @@ sequenceDiagram
     end
 
     Handler->>Handler: validate_input(texts, max_batch)
-    Note right of Handler: Check: non-empty,<br/>≤ max_batch texts,<br/>each ≤ 8192 chars
+    Note right of Handler: Check: non-empty,<br/>≤ max_batch texts,<br/>each ≤ 32768 chars
 
     alt Validation fails
         Handler-->>Client: 400 Bad Request
@@ -47,7 +47,13 @@ sequenceDiagram
         Note right of Worker: ~10–30 s reload
     end
 
-    Worker->>Worker: embed_dense(&session, &tokenizer, texts, batch_size)
+    Worker->>Worker: tokenize_no_pad(all texts)
+    Worker->>Worker: bin_pack(seq_lens, cost_model)
+    loop For each chunk
+        Worker->>Worker: build_chunk_arrays — pad to chunk-local max
+        Worker->>Worker: session.run(input_ids, attention_mask)
+        Worker->>Worker: scatter results → original slots
+    end
     Worker-->>Pool: reply_tx.send(Ok(embeddings))
     Pool-->>Handler: await reply_rx
 
@@ -59,11 +65,12 @@ sequenceDiagram
 
 The sparse path is structurally identical. The differences are:
 
-- Sends `EmbedRequest::Sparse` through the channel
+- Sends `EmbedRequest::Sparse` through the channel.
 - Worker invokes `embed_sparse()` instead of `embed_dense()` — both use
-  the same single ORT session; only the output tensor and post-processing differ
+  the same single ORT session; only the output tensor and post-processing differ.
+- Sparse post-processing: per-token hidden states → sparse-linear projection → ReLU → max-pool by token ID.
 - Response body uses `SparseResponse` with `indices` + `values` per
-  embedding instead of a flat `f32` vector
+  embedding instead of a flat `f32` vector.
 
 ```mermaid
 sequenceDiagram
@@ -79,8 +86,14 @@ sequenceDiagram
     Handler->>Pool: pool.sparse(texts)
     Pool->>Worker: EmbedRequest::Sparse { texts, reply_tx }
 
-    Worker->>Worker: embed_sparse(&session, &tokenizer, texts, batch_size)
-    Worker-->>Handler: Vec<SparseEmbedding>
+    Worker->>Worker: tokenize_no_pad(all texts)
+    Worker->>Worker: bin_pack(seq_lens, cost_model)
+    loop For each chunk
+        Worker->>Worker: session.run()
+        Worker->>Worker: sparse_project → ReLU → max-pool per token ID
+        Worker->>Worker: scatter → original slots
+    end
+    Worker-->>Handler: Vec~SparseEmbedding~
 
     Handler->>Handler: Map indices (usize → u32)<br/>Build SparseResponse
     Handler-->>Client: 200 OK + JSON
@@ -110,7 +123,7 @@ graph TD
     Ready -->|"OK"| Validate
     Validate -->|"Invalid"| R400b["400 Bad Request"]
     Validate -->|"OK"| Pool
-    Pool --> Inference["Worker Inference"]
+    Pool --> Inference["Worker Inference<br/>(tokenize-once + bin-pack)"]
 
     classDef errorNode fill:#f96,stroke:#333,stroke-width:2px
     class R413,R400a,R503,R400b errorNode
@@ -124,7 +137,30 @@ graph TD
 | JSON parse | Axum extractor | Valid JSON + expected shape | 400/422 |
 | Readiness | `check_ready()` | `ready == true` AND `live_workers > 0` | 503 |
 | Batch size | `validate_input()` | `1..=BGE_M3_MAX_BATCH` | 400 |
-| String length | `validate_input()` | `≤ 8192` chars per text | 400 |
+| String length | `validate_input()` | `≤ 32768` chars per text | 400 |
+
+Note: `BGE_M3_MAX_SEQ_LENGTH` (default 8192 tokens) caps how many tokens
+are actually embedded — the tokenizer silently truncates any text that
+tokenizes to more than that many tokens.
+
+## Bin-Pack Chunk Dispatch
+
+Within a worker, texts are not chunked into a static `batch_size`. Instead,
+the `bin_pack()` function partitions them into workspace-safe groups using
+the quadratic cost model:
+
+```
+workspace_per_chunk ≈ a × (count × max_seq) + b × (count × max_seq²)
+```
+
+A chunk closes when adding the next text would exceed `max_workspace_bytes`.
+Each chunk is then padded only to its own longest sequence and passed to
+`session.run()`. Results are scattered back to the original input positions.
+
+This means:
+- A batch of 256 short texts (e.g., 60 tokens each) may fit in a single `session.run()`.
+- A batch of 256 long texts (e.g., 8192 tokens each) becomes 256 single-text calls.
+- Mixed batches pack short texts together while long texts get their own chunks.
 
 ## Channel Dispatch Detail
 
@@ -150,7 +186,7 @@ graph LR
     H -->|"2. Send EmbedRequest<br/>(texts + reply_tx)"| TX
     TX --> MutexRX
     MutexRX -->|"3. lock() → recv()"| W
-    W -->|"4. ONNX inference"| W
+    W -->|"4. tokenize-once + bin-pack + ONNX"| W
     W -->|"5. reply_tx.send(result)"| TX_one
     TX_one --> RX_one
     RX_one -->|"6. await result"| H

@@ -38,6 +38,12 @@ use ndarray::ArrayView1;
 use ort::value::TensorRef;
 use serde::Deserialize;
 
+// ── Error helpers ───────────────────────────────────────────────────────
+
+fn ort_err(e: impl std::fmt::Display) -> anyhow::Error {
+    anyhow::anyhow!("{e}")
+}
+
 // ── Corpus (shared with benches/coreml.rs) ──────────────────────────────
 
 #[derive(Deserialize)]
@@ -62,7 +68,8 @@ fn load_corpus() -> Result<Corpus> {
 
 const REPO_ID: &str = "BAAI/bge-m3";
 const REPO_REVISION: &str = "5617a9f61b028005a4858fdac845db406aefb181";
-const MAX_SEQ_LENGTH: usize = 512;
+/// Default eval sequence length. Set `BGE_M3_MAX_SEQ_LENGTH` env var to override at runtime.
+const MAX_SEQ_LENGTH: usize = 8192;
 const SPECIAL_TOKENS: [u32; 4] = [0, 1, 2, 3];
 
 // ── Sparse weight loading (bundled safetensors) ─────────────────────────
@@ -143,10 +150,14 @@ fn load_tokenizer(path: &Path) -> Result<tokenizers::Tokenizer> {
 }
 
 fn load_session(model_path: &Path) -> Result<ort::session::Session> {
-    let session = ort::session::Session::builder()?
-        .with_optimization_level(ort::session::builder::GraphOptimizationLevel::Level3)?
-        .with_intra_threads(1)?
-        .commit_from_file(model_path)?;
+    let session = ort::session::Session::builder()
+        .map_err(ort_err)?
+        .with_optimization_level(ort::session::builder::GraphOptimizationLevel::Level3)
+        .map_err(ort_err)?
+        .with_intra_threads(1)
+        .map_err(ort_err)?
+        .commit_from_file(model_path)
+        .map_err(ort_err)?;
     Ok(session)
 }
 
@@ -180,17 +191,21 @@ fn embed_dense(
     let ids_array = ndarray::Array2::from_shape_vec((batch_len, seq_len), ids_flat)?;
     let mask_array = ndarray::Array2::from_shape_vec((batch_len, seq_len), mask_flat)?;
 
-    let ids_t = TensorRef::from_array_view(ids_array.view())?;
-    let mask_t = TensorRef::from_array_view(mask_array.view())?;
+    let ids_t = TensorRef::from_array_view(ids_array.view()).map_err(ort_err)?;
+    let mask_t = TensorRef::from_array_view(mask_array.view()).map_err(ort_err)?;
 
-    let outputs = session.run(ort::inputs! {
-        "input_ids" => ids_t,
-        "attention_mask" => mask_t,
-    })?;
+    let outputs = session
+        .run(ort::inputs! {
+            "input_ids" => ids_t,
+            "attention_mask" => mask_t,
+        })
+        .map_err(ort_err)?;
 
     // Xenova/bge-m3 FP16 exports last_hidden_state [batch, seq, 1024].
     // CLS-pool by selecting position 0 along the sequence axis.
-    let lhs = outputs["last_hidden_state"].try_extract_array::<f32>()?;
+    let lhs = outputs["last_hidden_state"]
+        .try_extract_array::<f32>()
+        .map_err(ort_err)?;
     let emb = lhs.index_axis(ndarray::Axis(1), 0);
 
     let mut result = Vec::with_capacity(batch_len);
@@ -235,13 +250,15 @@ fn embed_sparse(
         let ids_array = ndarray::Array2::from_shape_vec((1, seq_len), input_ids.clone())?;
         let mask_array = ndarray::Array2::from_shape_vec((1, seq_len), attention_mask.clone())?;
 
-        let ids_t = TensorRef::from_array_view(ids_array.view())?;
-        let mask_t = TensorRef::from_array_view(mask_array.view())?;
+        let ids_t = TensorRef::from_array_view(ids_array.view()).map_err(ort_err)?;
+        let mask_t = TensorRef::from_array_view(mask_array.view()).map_err(ort_err)?;
 
-        let outputs = session.run(ort::inputs! {
-            "input_ids" => ids_t,
-            "attention_mask" => mask_t,
-        })?;
+        let outputs = session
+            .run(ort::inputs! {
+                "input_ids" => ids_t,
+                "attention_mask" => mask_t,
+            })
+            .map_err(ort_err)?;
 
         // The output name depends on the model variant:
         // - BAAI/bge-m3: "token_embeddings"
@@ -255,7 +272,9 @@ fn embed_sparse(
         let token_emb = if let Ok(t) = outputs["token_embeddings"].try_extract_array::<f32>() {
             t
         } else {
-            outputs["last_hidden_state"].try_extract_array::<f32>()?
+            outputs["last_hidden_state"]
+                .try_extract_array::<f32>()
+                .map_err(ort_err)?
         };
 
         let mut token_weights: HashMap<usize, f32> = HashMap::new();

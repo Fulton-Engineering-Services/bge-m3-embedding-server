@@ -1,6 +1,6 @@
 [package]
 name = "bge-m3-embedding-server"
-version = "0.13.0"
+version = "0.14.0"
 edition = "2021"
 license = "Apache-2.0"
 description = "Axum HTTP server serving BGE-M3 dense and sparse embeddings via ONNX Runtime"
@@ -15,7 +15,7 @@ axum = "0.8"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "time"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-ort = { version = "=2.0.0-rc.11", features = ["coreml", "ndarray", "std", "download-binaries", "tls-rustls"], default-features = false }
+ort = { version = "=2.0.0-rc.12", features = ["coreml", "ndarray", "std", "api-24", "download-binaries", "tls-rustls"], default-features = false }
 hf-hub = "0.5"
 tokenizers = { version = "0.22", default-features = false, features = ["onig"] }
 safetensors = "0.7"
@@ -46,7 +46,7 @@ tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 proptest = "1"
 criterion = { version = "0.8", features = ["html_reports"] }
-sha2 = "0.10"
+sha2 = "0.11"
 
 [[bench]]
 name = "embeddings"

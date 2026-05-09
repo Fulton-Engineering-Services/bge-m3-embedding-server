@@ -2,36 +2,54 @@
 
 ## 1. Overview
 
-The server supports two selectable model variants via the `BGE_M3_MODEL` environment variable:
+The server supports three selectable model variants via the `BGE_M3_MODEL` environment variable:
 
-- **FP32** (`BAAI/bge-m3`) — compiled-in default. Loads `model.onnx` + `model.onnx_data`, approximately 2.16 GB per session.
-- **FP16** (`Xenova/bge-m3`, `model_fp16.onnx`) — recommended for Apple Silicon. Halves per-session memory (~1.08 GB vs ~2.16 GB) and has been evaluated as suitable for production.
+| Setting | Model | Per-session size | Notes |
+|---------|-------|-----------------|-------|
+| `BGE_M3_MODEL=fp16` **(default)** | `Xenova/bge-m3` (`model_fp16.onnx`) | ~1.08 GB | Fleet default. Best memory/quality balance. On macOS CoreML, 6–10× slower than fp32 — use fp32 there instead. |
+| `BGE_M3_MODEL=fp32` | `BAAI/bge-m3` (`model.onnx`) | ~2.16 GB | Full-precision. Recommended for Apple Silicon CoreML deployments. Required if the Xenova export lacks 8192-position embeddings. |
+| `BGE_M3_MODEL=int8` | `Xenova/bge-m3` (`model_int8.onnx`) | ~568 MB | Weights-only INT8 quantization. ~74% memory reduction vs fp32. Use MLAS (CPU EP) only — DequantizeLinear nodes fragment CoreML. |
 
-INT8, INT4, and Q4F16 quantized variants are available on Hugging Face Hub but are not selectable via `BGE_M3_MODEL` in the current implementation. Switching to these variants requires direct code changes.
+## 2. Selecting a Variant
 
-## 2. Available Variants
+Set the `BGE_M3_MODEL` environment variable at startup:
 
-All quantized variants below are from `Xenova/bge-m3` on Hugging Face Hub.
+```bash
+# FP16 (default — fleet standard on Linux/MLAS)
+BGE_M3_MODEL=fp16 cargo run --release
 
-| Variant | File | Size | Notes |
-|---------|------|------|-------|
-| FP32 | `model.onnx` + `model.onnx_data` | ~2,162 MB | Default (`BAAI/bge-m3`) |
-| FP16 | `model_fp16.onnx` | ~1,082 MB | Recommended for Apple Silicon (`Xenova/bge-m3`) |
-| INT4 (Q4) | `model_q4.onnx` | ~1,190 MB | Block-quantized 4-bit |
-| Q4F16 | `model_q4f16.onnx` | ~668 MB | INT4 weights + FP16 activations |
-| INT8 | `model_quantized.onnx` | ~543 MB | Dynamic INT8 |
-| UINT8 | `model_uint8.onnx` | ~542 MB | Static unsigned INT8 |
+# FP32 (Apple Silicon CoreML, or when Xenova exports lack long context)
+BGE_M3_MODEL=fp32 cargo run --release
 
-## 3. Selecting a Variant
+# INT8 (memory-constrained Linux deployments)
+BGE_M3_MODEL=int8 cargo run --release
+```
 
-| Setting | Model loaded | Per-session memory |
-|---------|-------------|-------------------|
-| `BGE_M3_MODEL=fp32` (default) | `BAAI/bge-m3` | ~2.16 GB |
-| `BGE_M3_MODEL=fp16` | `Xenova/bge-m3` (`model_fp16.onnx`) | ~1.08 GB |
+On Apple Silicon LaunchAgent deployments, `scripts/ai.bge-m3.server.plist` sets
+`BGE_M3_MODEL=fp16` by default.
 
-INT8, INT4, and Q4F16 variants are not supported via the environment variable in the current implementation. Using them requires modifying the model loading code directly.
+## 3. Long-Context Behavior by Variant
 
-On Apple Silicon LaunchAgent deployments, `scripts/ai.bge-m3.server.plist` sets `BGE_M3_MODEL=fp16` by default. FP16 is the production default on Apple Silicon.
+The server defaults to `BGE_M3_MAX_SEQ_LENGTH=8192` (BGE-M3's published maximum).
+Variant compatibility at long context differs:
+
+| Variant | Long-context (> 512 tokens) | Notes |
+|---------|-----------------------------|-------|
+| **fp32** | Supported | BAAI/bge-m3 ships positional embeddings to 8192. |
+| **fp16** | Needs verification | Xenova re-export may cap at 512. Run the startup probe — it tests `(1, MAX_SEQ_LENGTH)` and fails fast with an actionable message if the model rejects it. |
+| **int8** | Needs verification | Same as fp16 — same Xenova revision. |
+
+If a Xenova variant fails at your configured `MAX_SEQ_LENGTH`, the server logs:
+```
+Probe: model failed at configured max_seq_length — variant may not support this sequence length
+Set BGE_M3_MODEL=fp32 or lower BGE_M3_MAX_SEQ_LENGTH
+```
+
+To confirm long-context correctness on any variant, run the equivalence suite:
+```bash
+BGE_M3_EQUIVALENCE_TEST=1 BGE_M3_CACHE_DIR=/tmp/bge-m3-cache \
+  cargo test --test equivalence -- --ignored --nocapture
+```
 
 ## 4. FP16 Precision Evaluation
 
@@ -46,8 +64,6 @@ FP16 model:  FP16 model → FP16 embedding → halfvec storage     → cosine se
 
 The stored vectors are already quantized to FP16 at rest. The only difference between the two paths is whether quantization happens inside the model or at the database boundary. This significantly de-risks FP16 — precision at search time is already FP16 regardless of which model variant is used.
 
-After a clean re-index, both the query path and the stored corpus use FP16 embeddings. There is no mixed-precision scenario to evaluate.
-
 ### 4b. Retrieval Context
 
 Both consumers use rank-based retrieval, not raw similarity scores:
@@ -59,8 +75,6 @@ Both consumers use rank-based retrieval, not raw similarity scores:
 
 The critical question is whether FP16 preserves rank order, not whether raw cosine similarity shifts by 0.001.
 
-`dpos-coordinator` uses similarity thresholds of 0.5 (memory search) and 0.2 (tool search). Because the system can be fully re-indexed, any systematic score shift from FP16 applies uniformly to both query and corpus vectors and largely cancels out in the cosine computation. Threshold sensitivity at these values is low risk.
-
 ### 4c. Evaluation Setup
 
 Embeddings were generated for all 175 texts in `benches/fixtures/corpus.json` using both FP32 and FP16 models. The corpus covers all three production scenarios: `document_chunks`, `tool_descriptions`, and `code_symbols`.
@@ -68,18 +82,9 @@ Embeddings were generated for all 175 texts in `benches/fixtures/corpus.json` us
 - **FP32 baseline**: `BAAI/bge-m3` (`model.onnx` + `model.onnx_data`, ~2,162 MB)
 - **FP16 test**: `Xenova/bge-m3` (`model_fp16.onnx`, ~1,082 MB)
 
-**Output name difference**: the BAAI FP32 model exports `sentence_embedding` and `token_embeddings` output names; the Xenova FP16 model exports `last_hidden_state`. Both contain equivalent hidden states for the dense embedding. The sparse projection path reads per-token hidden states in both cases.
+**Output name difference**: the BAAI FP32 model exports `sentence_embedding` and `token_embeddings` output names; the Xenova FP16 and INT8 models export `last_hidden_state`. The server handles both paths automatically based on `ModelVariant`.
 
-### 4d. Metrics
-
-| Metric | Target | What it tells you |
-|--------|--------|-------------------|
-| **Cosine similarity** (dense, per-text FP32 vs FP16) | > 0.999 | Raw vector alignment — near-1.0 = effectively lossless |
-| **Max absolute difference** (dense, worst-case per-dimension) | < 0.01 | Worst-case per-element drift |
-| **Jaccard similarity** (sparse, non-zero index overlap) | > 0.95 | Token activation agreement — 1.0 = identical active token sets |
-| **Weight correlation** (sparse, Pearson r on shared non-zero weights) | > 0.99 | Weight magnitude agreement for activated tokens |
-
-### 4e. Per-Scenario Results
+### 4d. Per-Scenario Results (FP16 vs FP32)
 
 | Scenario | Dense cosine (min / mean / max) | Dense max abs diff (min / mean / max) | Sparse Jaccard (min / mean / max) | Sparse weight corr (min / mean / max) |
 |----------|-------------------------------|---------------------------------------|----------------------------------|--------------------------------------|
@@ -87,7 +92,7 @@ Embeddings were generated for all 175 texts in `benches/fixtures/corpus.json` us
 | document_chunks (50×) | 0.999914 / 0.999998 / 1.000000 | 0.000044 / 0.000126 / 0.001541 | 0.921053 / 0.991573 / 1.000000 | 0.978678 / 0.998145 / 1.000000 |
 | tool_descriptions (75×) | 1.000000 / 1.000000 / 1.000000 | 0.000037 / 0.000051 / 0.000070 | 1.000000 / 1.000000 / 1.000000 | 0.999998 / 1.000000 / 1.000000 |
 
-### 4f. Overall Results
+### 4e. Overall Results (FP16 vs FP32)
 
 | Metric | Min | Mean | Max | Target | Result |
 |--------|-----|------|-----|--------|--------|
@@ -100,63 +105,65 @@ Embeddings were generated for all 175 texts in `benches/fixtures/corpus.json` us
 
 The sparse FAIL values are minimum outliers concentrated in `document_chunks` (long texts, many tokens) and one `code_symbols` entry. The outliers occur at the ReLU activation boundary: tokens whose hidden-state projections land very close to zero can flip above or below the threshold due to FP16 quantization noise. These boundary tokens carry near-zero weights and contribute negligibly to sparse dot-product scores.
 
-The mean metrics tell the real story: mean Jaccard is 0.997 and mean weight correlation is 0.999 — the FAIL values are worst-case outliers, not typical behavior.
+The mean metrics tell the real story: mean Jaccard is 0.997 and mean weight correlation is 0.999.
 
-For `tool_descriptions` (the `dpos-coordinator` workload), both metrics are 1.000000 across all 75 texts — FP16 is effectively bit-identical for short structured text.
+**Verdict: FP16 is suitable for production use.**
 
-Both consumers use rank-based fusion (RRF or hybrid merge). A sparse Jaccard of 0.91 on the worst text means the sparse leg's contribution to final ranking is minimally affected. The dense leg, which is effectively lossless (worst-case cosine 0.999914), dominates retrieval quality.
+## 5. INT8 Precision Evaluation
 
-**Verdict: FP16 is suitable for production use.** Dense fidelity is excellent. Sparse fidelity is very high with marginal boundary outliers that do not affect rank-based retrieval.
+INT8 uses weights-only quantization (`model_int8.onnx` from Xenova/bge-m3). ORT dequantizes to f32 internally, so activations remain f32.
 
-## 5. ANE Dispatch Implications of FP16
+| Metric | Min | Mean | Notes |
+|--------|-----|------|-------|
+| Dense cosine similarity (vs FP32) | 0.963 | 0.976 | Validated against the 184-text production corpus |
 
-The Apple Neural Engine (ANE) operates natively in FP16. With an FP32 model, CoreML inserts FP32→FP16 casts for ANE-eligible ops, and some ops may fall back to CPU when the cast introduces precision concerns. With an FP16 model:
+Dense cosine similarity ≥ 0.963 at minimum means INT8 is suitable for ANN search and semantic ranking where embeddings are consistently indexed and queried with the same variant. Avoid INT8 for applications requiring ranking precision within very small similarity margins (< 0.05 apart).
 
-- No casts are needed — every op is already in the ANE's native format.
-- More ops may be eligible for ANE dispatch (the `coreml-profile` feature flag reveals per-op dispatch decisions at model load).
-- The compiled CoreML model cache file is smaller because the weights are stored in FP16.
+## 6. Variant Latency Comparison
 
-With the FP16 model, `ProfileComputePlan` confirms that an `ios18.cast` op
-dispatches to `MLNeuralEngineComputeDevice` — boundary cast operations are
-ANE-eligible even with dynamic inputs. Shape-dependent compute ops (MatMul,
-attention) require fully static shapes for ANE compilation and remain on the
-GPU. See [coreml-ep.md](coreml-ep.md) for the full dispatch analysis.
+| EP | FP32 | FP16 | INT8 |
+|----|------|------|------|
+| MLAS (CPU, Linux/Intel) | baseline | ~6–9× slower | near-FP32 (-9% to +22% vs FP32) |
+| CoreML (Apple Silicon GPU) | 20–61% faster than MLAS | 6–10× slower than FP32+CoreML | 42–79% slower than INT8+MLAS |
 
-## 6. Sparse Embedding Stability
+**Summary:**
+- **Linux production:** FP16 for memory efficiency; INT8 for memory-constrained hosts. Both use MLAS.
+- **Apple Silicon:** FP32 for best latency via CoreML GPU dispatch. FP16 and INT8 fragment the CoreML execution graph due to Cast/DequantizeLinear nodes.
 
-The sparse projection weights (`sparse_linear.safetensors`, 4 KB) are loaded independently of the main ONNX model. These weights stay at their loaded precision regardless of whether `BGE_M3_MODEL=fp32` or `BGE_M3_MODEL=fp16` is set. The sparse projection is not part of the ONNX model file.
-
-FP16 quantization affects the hidden states fed into the sparse linear layer, not the projection weights themselves. The key stability metrics are:
-
-- **Activation agreement** (Jaccard similarity of non-zero sparse indices): whether the same tokens activate above zero.
-- **Weight magnitude correlation** (Pearson r on shared non-zero weights): whether activated tokens have consistent weights.
-
-Outliers in these metrics occur at the ReLU boundary where tokens with near-zero hidden-state projections are sensitive to FP16 quantization noise. These marginal activations carry near-zero weight and have negligible impact on retrieval scores.
+See [coreml-ep.md](coreml-ep.md) for the full CoreML dispatch analysis.
 
 ## 7. Memory Projections by Configuration
 
-The table below shows estimated total memory for common configurations. All estimates assume CoreML EP. See [performance.md](performance.md) for full RAM reduction options.
+| Configuration | Workers | Model size/session | Estimated total |
+|--------------|---------|-------------------|----------------|
+| FP32 + Linux (MLAS) | 7 | ~2.16 GB | ~15–18 GB |
+| FP16 + Linux (MLAS) | 7 | ~1.08 GB | ~8–10 GB |
+| INT8 + Linux (MLAS) | 7 | ~568 MB | ~5–6 GB |
+| FP32 + CoreML | 2 | ~2.16 GB | ~25–44 GB |
+| FP16 + CoreML | 1 | ~1.08 GB | ~10–18 GB |
 
-| Configuration | Workers | Sessions | Model size/session | Total (projected) |
-|--------------|---------|----------|-------------------|------------------|
-| FP32 + CoreML | 2 | 2 | ~2.16 GB | ~25–44 GB |
-| FP32 + CoreML | 1 | 1 | ~2.16 GB | ~12–22 GB |
-| FP16 + CoreML | 1 | 1 | ~1.08 GB | ~10–18 GB |
-| FP16 + CoreML, no FastPrediction | 1 | 1 | ~1.08 GB | ~8–12 GB |
+At `BGE_M3_MAX_SEQ_LENGTH=8192`, each individual `session.run()` call at a single text
+uses ~671 MB of intermediate workspace (conservative estimate). The bin-packer ensures
+no single call exceeds `max_workspace_bytes` — see [docs/decisions/long-context-security.md](decisions/long-context-security.md).
 
-Projected totals include ORT session overhead, CoreML compiled model cache, and (where applicable) MLProgram FastPrediction workspace pre-allocation. See [performance.md](performance.md) for full breakdown.
+## 8. Sparse Embedding Stability
 
-## 8. Migration Notes
+The sparse projection weights (`sparse_linear.safetensors`, 4 KB) are loaded independently
+of the main ONNX model and stay at their loaded precision regardless of model variant.
 
-The system is in early development. All persisted embeddings in PostgreSQL databases (`knowledgebase.chunks` and `coordinator.vector_store`) can be discarded and re-indexed from source. This eliminates any mixed-precision migration concern.
+FP16/INT8 quantization affects the hidden states fed into the sparse linear layer, not the
+projection weights themselves. Marginal activations at the ReLU boundary are sensitive to
+quantization noise but carry near-zero weight — their impact on rank-based retrieval scores
+is negligible.
 
-**Switching to FP16:**
+## 9. Migration Notes
 
-1. Set `BGE_M3_MODEL=fp16`.
-2. Clear the model cache directory (`BGE_M3_CACHE_DIR`) so the Xenova FP16 model is downloaded fresh.
+The system supports full re-indexing from source. Switching variants requires:
+
+1. Set `BGE_M3_MODEL=<new variant>`.
+2. Clear the model cache directory (`BGE_M3_CACHE_DIR`) so the new model is downloaded.
 3. Restart the server.
-4. Re-index all documents.
+4. Re-index all documents (no mixed-precision migration required — fresh embeddings supersede all prior vectors).
 
-No mixed-precision migration is required — a clean re-index after switching models is the correct approach.
-
-On Apple Silicon LaunchAgent deployments, `BGE_M3_MODEL=fp16` is already set in `scripts/ai.bge-m3.server.plist`. No migration step is needed for new installations.
+On Apple Silicon LaunchAgent deployments, `BGE_M3_MODEL=fp16` is already set in
+`scripts/ai.bge-m3.server.plist`. No migration step is needed for new installations.

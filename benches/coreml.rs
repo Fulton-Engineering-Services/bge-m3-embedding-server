@@ -132,7 +132,10 @@ const XENOVA_REPO_ID: &str = "Xenova/bge-m3";
 /// Must match `XENOVA_REPO_REVISION` in src/embedder.rs.
 const XENOVA_REPO_REVISION: &str = "4de13258303883538bd53b696b452bf8099f0858";
 
-const MAX_SEQ_LENGTH: usize = 512;
+/// Default bench sequence length. Set `BGE_M3_MAX_SEQ_LENGTH` to override.
+/// Unlike the server binary, this const is used for bench harness sizing only;
+/// the bench reads the env var at runtime so it can be overridden per run.
+const MAX_SEQ_LENGTH: usize = 8192;
 const SPECIAL_TOKENS: [u32; 4] = [0, 1, 2, 3];
 
 struct BenchModels {

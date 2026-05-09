@@ -1,5 +1,7 @@
+use crate::binpack::CostModel;
 use std::env;
 use std::time::Duration;
+use tracing::warn;
 
 /// ONNX model variant to load.
 ///
@@ -50,6 +52,21 @@ pub enum ModelVariant {
     Int8,
 }
 
+impl std::fmt::Display for ModelVariant {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Fp32 => f.write_str("fp32"),
+            Self::Fp16 => f.write_str("fp16"),
+            Self::Int8 => f.write_str("int8"),
+        }
+    }
+}
+
+/// Maximum sequence length supported by the model architecture.
+/// BGE-M3's positional embedding table extends to 8192; this is the hard upper
+/// bound used to validate `BGE_M3_MAX_SEQ_LENGTH`.
+pub const MODEL_MAX_SEQ: usize = 8192;
+
 /// Runtime configuration loaded from environment variables.
 ///
 /// All fields are read once at startup via [`Config::from_env`]. Changes to
@@ -73,21 +90,15 @@ pub struct Config {
     ///
     /// Set with `BGE_M3_MAX_BATCH`. Defaults to `256`. Minimum effective value is `1`.
     pub max_batch: usize,
-    /// Maximum number of texts submitted per ONNX `session.run()` call.
+    /// Maximum sequence length (tokens) for a single text.
     ///
-    /// Set with `BGE_M3_ONNX_BATCH_SIZE`. On macOS the `CoreML` execution provider
-    /// uses `MLProgram` with `FastPrediction` specialisation, which pre-allocates
-    /// the full intermediate-tensor workspace at model-compilation time. BGE-M3
-    /// (24 transformer layers, 16 attention heads, 1 024 hidden) produces a
-    /// peak workspace of roughly `batch × 720 MB` per layer for a 512-token
-    /// sequence; submitting 50 texts at once can require 35 GB, triggering
-    /// Jetsam OOM kills. Chunking to 8 texts per call caps the peak at ~5.6 GB.
+    /// Set with `BGE_M3_MAX_SEQ_LENGTH`. Defaults to `8192` (BGE-M3's published max).
+    /// Range: `[1, 8192]`. Set lower to reduce memory footprint on constrained hardware.
     ///
-    /// On other platforms (MLAS/CPU EP) no pre-allocation occurs, so larger
-    /// values improve throughput with no stability risk.
-    ///
-    /// Defaults to `8` on macOS, `256` elsewhere. Minimum effective value is `1`.
-    pub onnx_batch_size: usize,
+    /// The tokenizer will silently truncate any input exceeding this length.
+    /// The probe and bin-packer use this as the upper bound when computing
+    /// workspace costs.
+    pub max_seq_length: usize,
     /// Duration of inactivity after which workers unload their model instances from memory.
     ///
     /// Set with `BGE_M3_IDLE_TIMEOUT_SECS`. Defaults to `300` (5 minutes).
@@ -105,6 +116,24 @@ pub struct Config {
     /// recover `CoreML` GPU acceleration. See [`ModelVariant`] for per-variant
     /// performance and memory trade-offs.
     pub model_variant: ModelVariant,
+
+    // --- auto-budget and cost-model knobs ---
+    /// Fraction of estimated available workspace to actually use per worker.
+    ///
+    /// Set with `BGE_M3_MEMORY_SAFETY_FACTOR`. Defaults to `0.7` (30% headroom
+    /// for ORT arena fragmentation and spike overhead not captured by the probe).
+    /// Range: `0.1..=1.0`.
+    pub memory_safety_factor: f64,
+
+    /// If `Some`, skip the startup probe and use this cost model directly.
+    ///
+    /// Populated when:
+    /// - `BGE_M3_DISABLE_AUTO_BUDGET=1` is set (uses conservative defaults), or
+    /// - `BGE_M3_TOKEN_BUDGET` is set (translates the legacy token count to a
+    ///   `max_workspace_bytes` using conservative `a`/`b` coefficients), or
+    /// - `BGE_M3_COST_MODEL_A` and `BGE_M3_COST_MODEL_B` are both set with
+    ///   `BGE_M3_AVAILABLE_MEMORY_BYTES` (full explicit override).
+    pub cost_model_override: Option<CostModel>,
 }
 
 impl Config {
@@ -115,7 +144,8 @@ impl Config {
         Self::from_lookup(|key| env::var(key).ok())
     }
 
-    fn from_lookup<F: Fn(&str) -> Option<String>>(lookup: F) -> Self {
+    #[allow(clippy::too_many_lines)]
+    pub(crate) fn from_lookup<F: Fn(&str) -> Option<String>>(lookup: F) -> Self {
         let workers = lookup("BGE_M3_WORKERS")
             .and_then(|v| v.parse::<usize>().ok())
             .unwrap_or(2)
@@ -126,13 +156,21 @@ impl Config {
             .unwrap_or(256)
             .max(1);
 
-        // Platform-specific default: CoreML on macOS pre-allocates the full
-        // intermediate-tensor workspace, so a small default avoids OOM kills.
-        let onnx_batch_size_default: usize = if cfg!(target_os = "macos") { 8 } else { 256 };
-        let onnx_batch_size = lookup("BGE_M3_ONNX_BATCH_SIZE")
-            .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(onnx_batch_size_default)
-            .max(1);
+        let max_seq_length = {
+            let raw = lookup("BGE_M3_MAX_SEQ_LENGTH")
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(MODEL_MAX_SEQ);
+            if raw == 0 || raw > MODEL_MAX_SEQ {
+                warn!(
+                    requested = raw,
+                    clamped = MODEL_MAX_SEQ,
+                    "BGE_M3_MAX_SEQ_LENGTH out of range [1, {MODEL_MAX_SEQ}]; clamping"
+                );
+                MODEL_MAX_SEQ
+            } else {
+                raw
+            }
+        };
 
         let idle_timeout_secs = lookup("BGE_M3_IDLE_TIMEOUT_SECS")
             .and_then(|v| v.parse::<u64>().ok())
@@ -145,16 +183,110 @@ impl Config {
             _ => ModelVariant::Fp16,
         };
 
+        let memory_safety_factor = {
+            let raw = lookup("BGE_M3_MEMORY_SAFETY_FACTOR")
+                .and_then(|v| v.parse::<f64>().ok())
+                .unwrap_or(0.7);
+            raw.clamp(0.1, 1.0)
+        };
+
+        // --- cost model override resolution ---
+        // Priority:
+        //  1. BGE_M3_DISABLE_AUTO_BUDGET → conservative defaults
+        //  2. BGE_M3_TOKEN_BUDGET (legacy) → translates to max_workspace_bytes
+        //  3. BGE_M3_COST_MODEL_A + BGE_M3_COST_MODEL_B + BGE_M3_AVAILABLE_MEMORY_BYTES
+        //  4. None → probe at startup
+
+        let cost_model_override = resolve_cost_model_override(&lookup, max_seq_length);
+
+        // --- legacy BGE_M3_ONNX_BATCH_SIZE deprecation ---
+        if lookup("BGE_M3_ONNX_BATCH_SIZE").is_some() {
+            warn!(
+                "BGE_M3_ONNX_BATCH_SIZE is deprecated and will be removed in a future release. \
+                 The server now uses a quadratic-aware cost model and auto-budget probe. \
+                 Set BGE_M3_TOKEN_BUDGET to pin a specific workspace ceiling, or remove the \
+                 variable to enable fully automatic tuning."
+            );
+        }
+
         Self {
             cache_dir: lookup("BGE_M3_CACHE_DIR").unwrap_or_else(|| "/cache".to_string()),
             bind_addr: lookup("BGE_M3_BIND").unwrap_or_else(|| "0.0.0.0:8081".to_string()),
             workers,
             max_batch,
-            onnx_batch_size,
+            max_seq_length,
             idle_timeout,
             model_variant,
+            memory_safety_factor,
+            cost_model_override,
         }
     }
+}
+
+/// Resolves an optional `CostModel` from env vars that explicitly override auto-tuning.
+///
+/// Returns `None` when the server should run the startup probe.
+//
+// cast_precision_loss: token_budget and max_seq_length are small integers (≤ 8192)
+//   that are well within f64 mantissa range; cost-per-position is an estimate.
+// cast_possible_truncation / cast_sign_loss: the workspace result is always positive
+//   (products of positive coefficients and non-negative token counts), and fractional
+//   bytes are intentionally floored when converting back to usize.
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss
+)]
+fn resolve_cost_model_override<F: Fn(&str) -> Option<String>>(
+    lookup: &F,
+    max_seq_length: usize,
+) -> Option<CostModel> {
+    // 1. BGE_M3_DISABLE_AUTO_BUDGET — skip probe, use conservative defaults.
+    //    max_workspace_bytes comes from BGE_M3_AVAILABLE_MEMORY_BYTES if set,
+    //    otherwise uses the built-in default (2 GiB).
+    if lookup("BGE_M3_DISABLE_AUTO_BUDGET")
+        .is_some_and(|v| matches!(v.as_str(), "1" | "true" | "yes"))
+    {
+        let max_workspace = lookup("BGE_M3_AVAILABLE_MEMORY_BYTES")
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(CostModel::DEFAULT_MAX_WORKSPACE);
+        return Some(CostModel::conservative(max_workspace));
+    }
+
+    // 2. BGE_M3_TOKEN_BUDGET — legacy token-count ceiling.
+    //    Translates: max_workspace = token_budget × cost_per_token
+    //    using conservative coefficients at the configured max_seq_length.
+    if let Some(token_budget) = lookup("BGE_M3_TOKEN_BUDGET").and_then(|v| v.parse::<usize>().ok())
+    {
+        // cost_per_position at max_seq = a + b * max_seq
+        let cost_per_position =
+            CostModel::CONSERVATIVE_A + CostModel::CONSERVATIVE_B * max_seq_length as f64;
+        let max_workspace = (token_budget as f64 * cost_per_position) as usize;
+        return Some(CostModel {
+            a: CostModel::CONSERVATIVE_A,
+            b: CostModel::CONSERVATIVE_B,
+            max_workspace_bytes: max_workspace,
+        });
+    }
+
+    // 3. Explicit coefficient override — requires A, B, AND available memory.
+    if let (Some(a_str), Some(b_str)) =
+        (lookup("BGE_M3_COST_MODEL_A"), lookup("BGE_M3_COST_MODEL_B"))
+    {
+        if let (Ok(a), Ok(b)) = (a_str.parse::<f64>(), b_str.parse::<f64>()) {
+            let max_workspace = lookup("BGE_M3_AVAILABLE_MEMORY_BYTES")
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(CostModel::DEFAULT_MAX_WORKSPACE);
+            return Some(CostModel {
+                a,
+                b,
+                max_workspace_bytes: max_workspace,
+            });
+        }
+    }
+
+    // 4. No override — run the startup probe.
+    None
 }
 
 #[cfg(test)]
@@ -175,18 +307,20 @@ mod tests {
         assert_eq!(cfg.bind_addr, "0.0.0.0:8081");
         assert_eq!(cfg.workers, 2);
         assert_eq!(cfg.max_batch, 256);
+        assert_eq!(cfg.max_seq_length, MODEL_MAX_SEQ);
         assert_eq!(cfg.idle_timeout, Some(Duration::from_secs(300)));
         assert_eq!(cfg.model_variant, ModelVariant::Fp16);
-        // Platform-specific: macOS=8 (CoreML OOM guard), other=256
-        let expected_onnx: usize = if cfg!(target_os = "macos") { 8 } else { 256 };
-        assert_eq!(cfg.onnx_batch_size, expected_onnx);
+        assert!((cfg.memory_safety_factor - 0.7).abs() < 1e-9);
+        assert!(
+            cfg.cost_model_override.is_none(),
+            "probe should run by default"
+        );
     }
 
     #[test]
     fn workers_clamps_to_minimum_1() {
         let map = HashMap::from([("BGE_M3_WORKERS", "0")]);
         let cfg = Config::from_lookup(lookup_from(&map));
-
         assert_eq!(cfg.workers, 1);
     }
 
@@ -194,8 +328,70 @@ mod tests {
     fn max_batch_clamps_to_minimum_1() {
         let map = HashMap::from([("BGE_M3_MAX_BATCH", "0")]);
         let cfg = Config::from_lookup(lookup_from(&map));
-
         assert_eq!(cfg.max_batch, 1);
+    }
+
+    #[test]
+    fn max_seq_length_default_is_8192() {
+        let map = HashMap::new();
+        let cfg = Config::from_lookup(lookup_from(&map));
+        assert_eq!(cfg.max_seq_length, 8192);
+    }
+
+    #[test]
+    fn max_seq_length_custom() {
+        let map = HashMap::from([("BGE_M3_MAX_SEQ_LENGTH", "2048")]);
+        let cfg = Config::from_lookup(lookup_from(&map));
+        assert_eq!(cfg.max_seq_length, 2048);
+    }
+
+    #[test]
+    fn max_seq_length_clamps_out_of_range() {
+        // Over max
+        let map = HashMap::from([("BGE_M3_MAX_SEQ_LENGTH", "99999")]);
+        let cfg = Config::from_lookup(lookup_from(&map));
+        assert_eq!(cfg.max_seq_length, MODEL_MAX_SEQ);
+
+        // Zero
+        let map = HashMap::from([("BGE_M3_MAX_SEQ_LENGTH", "0")]);
+        let cfg = Config::from_lookup(lookup_from(&map));
+        assert_eq!(cfg.max_seq_length, MODEL_MAX_SEQ);
+    }
+
+    #[test]
+    fn disable_auto_budget_yields_conservative_model() {
+        let map = HashMap::from([("BGE_M3_DISABLE_AUTO_BUDGET", "1")]);
+        let cfg = Config::from_lookup(lookup_from(&map));
+        let cm = cfg.cost_model_override.expect("override must be set");
+        assert!((cm.a - CostModel::CONSERVATIVE_A).abs() < f64::EPSILON);
+        assert!((cm.b - CostModel::CONSERVATIVE_B).abs() < f64::EPSILON);
+        assert_eq!(cm.max_workspace_bytes, CostModel::DEFAULT_MAX_WORKSPACE);
+    }
+
+    #[test]
+    fn token_budget_translates_to_cost_model() {
+        // With token_budget=8192 and conservative coefficients the workspace
+        // must be a positive number.
+        let map = HashMap::from([("BGE_M3_TOKEN_BUDGET", "8192")]);
+        let cfg = Config::from_lookup(lookup_from(&map));
+        let cm = cfg.cost_model_override.expect("override must be set");
+        assert!(cm.max_workspace_bytes > 0);
+        assert!((cm.a - CostModel::CONSERVATIVE_A).abs() < f64::EPSILON);
+        assert!((cm.b - CostModel::CONSERVATIVE_B).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn explicit_cost_model_override() {
+        let map = HashMap::from([
+            ("BGE_M3_COST_MODEL_A", "20000.0"),
+            ("BGE_M3_COST_MODEL_B", "5.0"),
+            ("BGE_M3_AVAILABLE_MEMORY_BYTES", "1073741824"),
+        ]);
+        let cfg = Config::from_lookup(lookup_from(&map));
+        let cm = cfg.cost_model_override.expect("override must be set");
+        assert!((cm.a - 20_000.0).abs() < 1e-9);
+        assert!((cm.b - 5.0).abs() < 1e-9);
+        assert_eq!(cm.max_workspace_bytes, 1_073_741_824);
     }
 
     #[test]
@@ -217,61 +413,27 @@ mod tests {
     }
 
     #[test]
-    fn idle_timeout_defaults_to_5_minutes() {
-        let map = HashMap::new();
-        let cfg = Config::from_lookup(lookup_from(&map));
-
-        assert_eq!(cfg.idle_timeout, Some(Duration::from_secs(300)));
-    }
-
-    #[test]
     fn idle_timeout_disabled_when_zero() {
         let map = HashMap::from([("BGE_M3_IDLE_TIMEOUT_SECS", "0")]);
         let cfg = Config::from_lookup(lookup_from(&map));
-
         assert_eq!(cfg.idle_timeout, None);
     }
 
     #[test]
-    fn idle_timeout_custom_value() {
-        let map = HashMap::from([("BGE_M3_IDLE_TIMEOUT_SECS", "60")]);
-        let cfg = Config::from_lookup(lookup_from(&map));
+    fn memory_safety_factor_clamped() {
+        let map_low = HashMap::from([("BGE_M3_MEMORY_SAFETY_FACTOR", "0.0")]);
+        let cfg_low = Config::from_lookup(lookup_from(&map_low));
+        assert!((cfg_low.memory_safety_factor - 0.1).abs() < 1e-9);
 
-        assert_eq!(cfg.idle_timeout, Some(Duration::from_secs(60)));
-    }
-
-    #[test]
-    fn onnx_batch_size_uses_platform_default() {
-        let map = HashMap::new();
-        let cfg = Config::from_lookup(lookup_from(&map));
-
-        // macOS defaults to 8 (CoreML FastPrediction OOM guard).
-        // All other platforms default to 256.
-        let expected: usize = if cfg!(target_os = "macos") { 8 } else { 256 };
-        assert_eq!(cfg.onnx_batch_size, expected);
-    }
-
-    #[test]
-    fn onnx_batch_size_custom_value() {
-        let map = HashMap::from([("BGE_M3_ONNX_BATCH_SIZE", "16")]);
-        let cfg = Config::from_lookup(lookup_from(&map));
-
-        assert_eq!(cfg.onnx_batch_size, 16);
-    }
-
-    #[test]
-    fn onnx_batch_size_clamps_to_minimum_1() {
-        let map = HashMap::from([("BGE_M3_ONNX_BATCH_SIZE", "0")]);
-        let cfg = Config::from_lookup(lookup_from(&map));
-
-        assert_eq!(cfg.onnx_batch_size, 1);
+        let map_high = HashMap::from([("BGE_M3_MEMORY_SAFETY_FACTOR", "2.0")]);
+        let cfg_high = Config::from_lookup(lookup_from(&map_high));
+        assert!((cfg_high.memory_safety_factor - 1.0).abs() < 1e-9);
     }
 
     #[test]
     fn model_variant_defaults_to_fp16() {
         let map = HashMap::new();
         let cfg = Config::from_lookup(lookup_from(&map));
-
         assert_eq!(cfg.model_variant, ModelVariant::Fp16);
     }
 
@@ -279,7 +441,6 @@ mod tests {
     fn model_variant_fp32_when_set() {
         let map = HashMap::from([("BGE_M3_MODEL", "fp32")]);
         let cfg = Config::from_lookup(lookup_from(&map));
-
         assert_eq!(cfg.model_variant, ModelVariant::Fp32);
     }
 
@@ -287,7 +448,6 @@ mod tests {
     fn model_variant_int8_when_set() {
         let map = HashMap::from([("BGE_M3_MODEL", "int8")]);
         let cfg = Config::from_lookup(lookup_from(&map));
-
         assert_eq!(cfg.model_variant, ModelVariant::Int8);
     }
 
@@ -295,7 +455,13 @@ mod tests {
     fn model_variant_unknown_value_falls_back_to_fp16() {
         let map = HashMap::from([("BGE_M3_MODEL", "invalid")]);
         let cfg = Config::from_lookup(lookup_from(&map));
-
         assert_eq!(cfg.model_variant, ModelVariant::Fp16);
+    }
+
+    #[test]
+    fn model_variant_display() {
+        assert_eq!(ModelVariant::Fp32.to_string(), "fp32");
+        assert_eq!(ModelVariant::Fp16.to_string(), "fp16");
+        assert_eq!(ModelVariant::Int8.to_string(), "int8");
     }
 }

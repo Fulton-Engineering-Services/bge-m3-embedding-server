@@ -29,5 +29,7 @@
 - All public API surface is minimal — use `pub(crate)` where possible
 
 ## Important Gotchas
-- `fastembed::SparseEmbedding` does not implement `Debug` → use `.err().expect(msg)` not `.unwrap_err()` on Results containing it
+- `tokenize_no_pad` is the tokenization path — do NOT add padding to the tokenizer config (it's set to `None`); padding is applied per-chunk in `build_chunk_arrays`
+- `proptest` is a dev-dependency — used in `binpack.rs` for bin-packer property tests
 - Always run `cargo fmt --all` before pushing — CI enforces `cargo fmt --all --check`
+- `EmbedRequest::Probe` is crate-internal — workers handle it during init before `ready=true`; it should never appear in handler paths
