@@ -9,8 +9,9 @@ SPLADE-style sparse token weights.
 
 Key capabilities:
 - **Long-context embeddings** — supports up to 8192 tokens (BGE-M3's full positional range), configurable via `BGE_M3_MAX_SEQ_LENGTH`.
-- **Memory-aware auto-tuning** — detects container/cgroup memory at startup, runs a workspace probe, and derives a safe batch size automatically. No manual `ONNX_BATCH_SIZE` knob needed.
+- **Memory-aware auto-tuning** — detects container/cgroup memory at startup, runs a workspace probe, and derives a safe workspace budget automatically. No manual `ONNX_BATCH_SIZE` knob needed.
 - **Length-aware bin-packing** — tokens within each `session.run()` call are padded only to the longest sequence in that chunk, not the global maximum. Short-text batches pack densely; long-text batches split appropriately.
+- **Single-pass dual embeddings** — `/v1/embeddings:both` produces dense and sparse vectors in one ONNX `session.run()`. BGE-M3's transformer backbone is shared: the CLS token yields the dense vector while the same token-level hidden states feed the sparse projection head. Both representations emerge from a single forward pass at no additional transformer cost — unlike hybrid retrieval setups that run a separate dense encoder and a sparse model in sequence.
 
 ## Quick Start
 
@@ -46,6 +47,11 @@ curl -s http://localhost:8081/v1/embeddings \
 curl -s http://localhost:8081/v1/sparse-embeddings \
   -H "Content-Type: application/json" \
   -d '{"input": ["what is Rust?"]}' | jq .
+
+# Dense + sparse in one forward pass (preferred for ingestion pipelines)
+curl -s http://localhost:8081/v1/embeddings:both \
+  -H "Content-Type: application/json" \
+  -d '{"input": "passage: what is Rust?", "model": "bge-m3"}' | jq .
 ```
 
 ## API Reference
@@ -56,6 +62,7 @@ Full OpenAPI 3.1 specification: [`openapi.yaml`](./openapi.yaml)
 |----------|--------|-------------|
 | `/v1/embeddings` | `POST` | Dense embeddings — OpenAI-compatible |
 | `/v1/sparse-embeddings` | `POST` | Sparse embeddings — BGE-M3 SPLADE-style |
+| `/v1/embeddings:both` | `POST` | Dense + sparse in a single forward pass |
 | `/v1/models` | `GET` | Fleet discovery — returns the `bge-m3` model entry |
 | `/health` | `GET` | Readiness probe with worker pool status and tuning data |
 
@@ -192,7 +199,75 @@ Each entry in `data` corresponds to one input string. `indices` are vocabulary t
 
 ---
 
-## Configuration
+### `POST /v1/embeddings:both`
+
+Produces both dense and sparse embeddings for each input in a single ONNX forward pass.
+
+**Why this matters — BGE-M3's unified backbone**
+
+BGE-M3 is architecturally distinct from most hybrid-retrieval setups. Its ONNX model has a
+single transformer encoder whose output branches into two projection heads:
+
+- **Dense head:** the CLS token hidden state is L2-normalized to produce the 1024-dimensional dense vector.
+- **Sparse head:** all token-level hidden states are projected through a linear layer, ReLU-activated, and max-pooled to produce SPLADE-style sparse token weights.
+
+Because both heads consume the same transformer output, calling this endpoint runs the
+transformer **once** per chunk — the cost of producing both representations is nearly identical
+to producing just one. With `BGE_M3_MODEL=fp32` (the BAAI/bge-m3 FP32 ONNX export), this
+architecture is most directly expressed: the original BAAI graph has both output heads baked in
+and a single `session.run()` yields both tensors with zero redundancy.
+
+Contrast this with common alternatives: running a dense-only model alongside BM25, pairing an
+OpenAI embedding call with a separate sparse encoder, or sequentially calling `/v1/embeddings`
+and `/v1/sparse-embeddings` — all of which require two model invocations. For ingestion
+pipelines that index both representations, this endpoint halves transformer compute.
+
+The colon (`:`) in the path follows [AIP-136](https://google.aip.dev/136) custom-verb convention.
+
+**Request**
+
+```bash
+curl -s http://localhost:8081/v1/embeddings:both \
+  -H "Content-Type: application/json" \
+  -d '{
+    "input": ["passage: Rust is a systems programming language.", "passage: Axum is a web framework."],
+    "model": "bge-m3"
+  }'
+```
+
+`input` accepts a single string or an array of strings. Prefix passage inputs with `"passage: "`
+and query inputs with `"query: "` for best retrieval quality.
+
+**Response**
+
+```json
+{
+  "object": "list",
+  "model": "bge-m3",
+  "data": [
+    {
+      "index": 0,
+      "embedding": [0.0123, -0.0456, 0.0789],
+      "sparse_values": {
+        "indices": [42, 100, 3527],
+        "values": [0.5, 0.8, 0.3]
+      }
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 7,
+    "total_tokens": 7
+  }
+}
+```
+
+Each entry in `data` carries the 1024-dimensional `embedding` (L2-normalized) and the
+`sparse_values` map (`indices` are vocabulary token IDs, `values` are the corresponding
+SPLADE weights) for the same input string.
+
+---
+
+
 
 All configuration is via environment variables. The server reads them once at startup; changes
 require a restart.
@@ -387,6 +462,7 @@ flowchart TD
 - **Tokenize-once, bin-pack:** each request tokenizes all input texts in a single pass (no padding), then `binpack::bin_pack()` groups them into `session.run()` calls where each chunk is padded only to its own longest sequence. This eliminates the "one long text pads the whole batch" inefficiency.
 - **Quadratic cost model:** workspace per `session.run()` call is estimated as `a × (batch × seq) + b × (batch × seq²)`. At `MAX_SEQ_LENGTH=8192`, the quadratic attention term dominates; the bin-packer automatically assigns fewer texts per chunk for long sequences.
 - **Memory-aware startup probe (Linux):** after the leader worker loads its model, the server sweeps 18 `(batch, seq)` shapes, measures peak RSS deltas, and fits cost-model coefficients `a` and `b` via least squares. Conservative defaults apply when the probe cannot run.
+- **Single forward pass for dual embeddings:** BGE-M3's ONNX graph has a shared transformer encoder with two output heads. `session.run()` yields both the CLS-token dense vector and the token-level hidden states for sparse projection simultaneously. The `/v1/embeddings:both` handler exploits this: one `session.run()` per chunk produces both representations at no extra transformer cost.
 - Each worker runs on a Tokio `spawn_blocking` thread, loading its own ORT session and tokenizer.
 - The shared `Arc<Mutex<Receiver>>` provides natural load balancing without a separate dispatcher.
 - An `AtomicBool` readiness flag is set only after all workers have loaded **and** a warm-up probe completes. The `/health` endpoint returns `503 loading` until then.

@@ -5,6 +5,7 @@ Axum HTTP server serving BGE-M3 dense and sparse embeddings via direct ONNX Runt
 ## Use Cases
 
 - Document indexing and hybrid search via the `/v1/embeddings` (dense) and `/v1/sparse-embeddings` (SPLADE-style) endpoints
+- **Hybrid ingestion pipelines** via `/v1/embeddings:both` — produces both representations in one forward pass; BGE-M3's shared transformer backbone means both output heads run at no additional transformer cost (preferred over two separate calls)
 - Semantic memory retrieval for agent / RAG workloads via the OpenAI-compatible `/v1/embeddings` endpoint
 - Drop-in replacement for hosted embedding APIs when local inference, data residency, or BGE-M3-specific sparse vectors are required
 
@@ -63,6 +64,7 @@ Set `BGE_M3_DISABLE_AUTO_BUDGET=1` to skip the probe (uses conservative defaults
 |--------|------|-------------|
 | `POST` | `/v1/embeddings` | Dense embeddings (OpenAI-compatible) |
 | `POST` | `/v1/sparse-embeddings` | Sparse embeddings (BGE-M3 SPLADE-style) |
+| `POST` | `/v1/embeddings:both` | Dense + sparse in a single forward pass — both output heads share the same transformer computation; halves model cost vs. two separate calls |
 | `GET` | `/health` | Readiness probe — `200 OK` when ready, `503` while loading; see health states below |
 | `GET` | `/v1/models` | Fleet discovery — returns `{"object":"list","data":[{"id":"bge-m3","object":"model","type":"bge-m3"}]}` |
 

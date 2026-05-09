@@ -118,14 +118,35 @@ paths:
       description: |
         Accepts one or more text strings and returns both the dense
         1024-dimensional vector and the BGE-M3 SPLADE-style sparse token
-        weights for each input. Internally runs **one** ONNX `session.run()`
-        per chunk and projects both outputs from the same forward pass — so
-        callers that need both representations (e.g. hybrid retrieval
-        ingestion pipelines) avoid a second model invocation.
+        weights for each input in a single ONNX `session.run()` call.
 
-        The numerical outputs are equivalent to calling `/v1/embeddings` and
-        `/v1/sparse-embeddings` separately on the same input, within FP
-        rounding tolerance.
+        **Why a single forward pass matters**
+
+        BGE-M3 has a unified transformer backbone with two output heads baked
+        into the same ONNX graph. The dense embedding is derived from the CLS
+        token hidden state (L2-normalized), while the sparse weights are derived
+        by projecting all token hidden states through a linear layer, applying
+        ReLU, and max-pooling. Both heads consume the **same transformer output**
+        — so the transformer computation happens exactly once per chunk regardless
+        of whether you need one representation or both.
+
+        With `BGE_M3_MODEL=fp32` (the BAAI/bge-m3 FP32 export), this architecture
+        is directly expressed in the ONNX graph: a single `session.run()` returns
+        both the pooled dense output tensor and the token-level hidden states for
+        sparse projection. There is no second model invocation, no second HTTP
+        roundtrip, and no extra memory copy.
+
+        This is a meaningful differentiation from typical hybrid retrieval
+        infrastructure, where producing both representations requires either:
+        - Two separate model calls (e.g., an OpenAI embedding + a SPLADE encoder), or
+        - Two sequential requests to this server's individual endpoints.
+
+        For ingestion pipelines that index both the dense and sparse representations
+        of every document, this endpoint halves transformer compute compared to
+        calling `/v1/embeddings` and `/v1/sparse-embeddings` separately.
+
+        The numerical outputs are equivalent to calling the two individual endpoints
+        on the same input, within FP rounding tolerance.
 
         The colon (`:`) in the path follows the AIP-136 "custom verb" convention
         used by Google Cloud APIs for non-standard operations on a resource.
