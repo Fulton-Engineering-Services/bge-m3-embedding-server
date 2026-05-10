@@ -222,6 +222,7 @@ pub(crate) async fn run_probe(pool: &EmbedPool, max_seq: usize, rss_ceiling: usi
     // Sort by ascending total token-positions so we grow load gradually.
     shapes.sort_by_key(|&(b, s)| b * s);
 
+    let probe_start = std::time::Instant::now();
     let mut data: Vec<DataPoint> = Vec::with_capacity(shapes.len());
     let conservative = CostModel::conservative(rss_ceiling);
 
@@ -248,13 +249,17 @@ pub(crate) async fn run_probe(pool: &EmbedPool, max_seq: usize, rss_ceiling: usi
         // At a rough 4 chars/token, a `seq`-token input is ~4*seq characters.
         let texts = synthesize_texts(&corpus_texts, batch, seq);
 
+        let shape_start = std::time::Instant::now();
         match pool.probe(texts).await {
             Ok(result) => {
+                let elapsed_ms =
+                    u64::try_from(shape_start.elapsed().as_millis()).unwrap_or(u64::MAX);
                 let delta = result.rss_after.saturating_sub(result.rss_before);
                 info!(
                     batch,
                     seq,
                     rss_delta_mb = delta / (1024 * 1024),
+                    elapsed_ms,
                     "Probe shape measured"
                 );
                 data.push(DataPoint {
@@ -264,11 +269,14 @@ pub(crate) async fn run_probe(pool: &EmbedPool, max_seq: usize, rss_ceiling: usi
                 });
             }
             Err(e) => {
+                let elapsed_ms =
+                    u64::try_from(shape_start.elapsed().as_millis()).unwrap_or(u64::MAX);
                 if seq == max_seq {
                     // The max_seq capability check failed — fail fast.
                     tracing::error!(
                         error = %e,
                         seq = max_seq,
+                        elapsed_ms,
                         model_hint = "Set BGE_M3_MODEL=fp32 or lower BGE_M3_MAX_SEQ_LENGTH",
                         "Probe: model failed at configured max_seq_length — \
                          variant may not support this sequence length"
@@ -277,7 +285,7 @@ pub(crate) async fn run_probe(pool: &EmbedPool, max_seq: usize, rss_ceiling: usi
                     warn!("Falling back to conservative cost model after capability check failure");
                     return (CostModel::CONSERVATIVE_A, CostModel::CONSERVATIVE_B);
                 }
-                warn!(batch, seq, error = %e, "Probe shape failed; skipping");
+                warn!(batch, seq, elapsed_ms, error = %e, "Probe shape failed; skipping");
             }
         }
     }
@@ -291,10 +299,13 @@ pub(crate) async fn run_probe(pool: &EmbedPool, max_seq: usize, rss_ceiling: usi
     }
 
     if let Some((a, b)) = fit_cost_model(&data) {
+        let total_elapsed_ms =
+            u64::try_from(probe_start.elapsed().as_millis()).unwrap_or(u64::MAX);
         info!(
             a = format!("{a:.0}"),
             b = format!("{b:.4}"),
             data_points = data.len(),
+            total_elapsed_ms,
             "Probe: fitted cost model"
         );
         (a, b)

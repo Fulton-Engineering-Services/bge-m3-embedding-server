@@ -110,6 +110,46 @@ When `status=ok`, the `/health` response also includes:
 | `BGE_M3_IDLE_TIMEOUT_SECS` | `300` | Seconds of inactivity before models are unloaded; `0` disables idle unloading |
 | `BGE_M3_MODEL` | `fp16` | Model variant: `fp32` = `BAAI/bge-m3` (~2.16 GB/session); `fp16` = `Xenova/bge-m3` (~1.08 GB/session); `int8` = `Xenova/bge-m3` quantized (~568 MB/session). See model variant notes below. |
 
+### Logging and Observability
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `BGE_M3_LOG_FORMAT` | auto | Log format. `json` = structured JSON (default in non-TTY / container environments); `text` or `pretty` = human-readable; unset = auto-detect via TTY check. **CloudWatch Logs Insights requires JSON.** |
+| `BGE_M3_HEARTBEAT_SECS` | `60` | Interval between periodic heartbeat log events. Each event logs RSS, live/loaded workers, queue depth, available permits, and probe status. Set `0` to disable. |
+| `RUST_LOG` | `info` | Standard tracing filter. Examples: `info`, `debug`, `bge_m3_embedding_server=debug`, `bge_m3_embedding_server::binpack=trace`. |
+
+**What gets logged at INFO by default:**
+- Build banner on startup (version, git SHA, arch, OS, profile)
+- Full startup sequence (memory detection, workspace budget, probe per-shape, model load per-worker)
+- Per-request completion event with `route`, `batch_size`, `prompt_tokens`, `chunks`, `max_chunk_seq`, `total_token_positions`, `tokenize_ms`, `inference_ms`, `total_ms`
+- Worker-level completion event with the same timing fields plus `worker_id`
+- HTTP access log via `TraceLayer` (method, URI, status, latency) — `/health` and `/v1/models` are logged at DEBUG to suppress load-balancer noise
+- Periodic heartbeat with `rss_mb`, `live_workers`, `loaded_workers`, `queue_depth`, `available_permits`, `probe_status`
+
+**Upgrading CloudWatch Insights queries:**
+```
+# p99 request latency by route
+fields route, total_ms
+| filter ispresent(route) and @message like "embedding request complete"
+| stats pct(total_ms, 99) as p99_ms by route
+| sort p99_ms desc
+
+# Slow requests (> 5 s total)
+fields @timestamp, route, batch_size, chunks, max_chunk_seq, inference_ms, total_ms
+| filter total_ms > 5000
+| sort @timestamp desc
+
+# Worker utilization — queue saturation
+fields @timestamp, queue_depth, live_workers, loaded_workers, available_permits
+| filter @message like "heartbeat"
+| filter queue_depth > 0
+| sort @timestamp desc
+
+# bin_pack chunk splits (DEBUG level required: RUST_LOG=bge_m3_embedding_server::binpack=debug)
+fields @timestamp, chunk_idx, batch, max_seq, estimated_workspace_mb
+| filter @message like "bin_pack chunk decided"
+```
+
 ### Auto-Budget Tuning (Linux only)
 
 | Variable | Default | Description |
@@ -147,7 +187,9 @@ The server uses a **worker pool** pattern to handle concurrent embedding request
 - **Cold-start ordering**: worker 0 (the "leader") is spawned and awaited first to ensure the model cache is warm before followers start. This prevents `hf-hub` file-lock contention when `BGE_M3_WORKERS > 1` and the cache is empty.
 - **Idle unloading**: after `BGE_M3_IDLE_TIMEOUT_SECS` of no requests, workers drop their model instances. On the next request, models are reloaded transparently (~10–30 s from cache). Workers never exit during idle.
 - **Sparse projection**: computed by projecting token hidden states through a bundled `sparse_linear.safetensors` weight vector (4 KB), then applying ReLU and max-pooling.
-- HTTP observability via `tower-http::TraceLayer`.
+- **HTTP observability** via customized `tower-http::TraceLayer`: spans at INFO for embedding routes, DEBUG for `/health` and `/v1/models` to suppress load-balancer noise. Each request handler emits one structured INFO event with full timing breakdown (`tokenize_ms`, `inference_ms`, `total_ms`, chunk count, max sequence length).
+- **Per-request `EmbedStats`**: each worker captures tokenization time, per-chunk inference time, chunk count, and max sequence length, then forwards these via the `EmbedRequest` reply channel so the handler layer can log a fully-correlated completion record without a second RPC.
+- **Heartbeat task**: a configurable background task logs process RSS and pool state every `BGE_M3_HEARTBEAT_SECS` seconds.
 
 ## Long-Context Support
 

@@ -19,12 +19,14 @@ use axum::{routing::get, routing::post, Router};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::Semaphore;
 use tower_http::request_id::{
     MakeRequestId, PropagateRequestIdLayer, RequestId, SetRequestIdLayer,
 };
-use tower_http::trace::TraceLayer;
+use tower_http::trace::{DefaultOnFailure, DefaultOnResponse, MakeSpan, TraceLayer};
 use tracing::info;
+use tracing::Level;
 
 use config::Config;
 
@@ -38,6 +40,37 @@ impl MakeRequestId for UuidRequestId {
     }
 }
 
+/// Selects the tracing level for HTTP spans based on path.
+///
+/// `/health` and `/v1/models` are polled frequently by load balancers and the
+/// Docker `HEALTHCHECK`. Logging them at DEBUG rather than INFO keeps
+/// `CloudWatch` free of ~8,640 health-check records per container per day.
+#[derive(Clone)]
+struct RouteAwareSpan;
+
+impl<B> MakeSpan<B> for RouteAwareSpan {
+    fn make_span(&mut self, request: &axum::http::Request<B>) -> tracing::Span {
+        let path = request.uri().path();
+        let is_noisy = matches!(path, "/health" | "/v1/models");
+        let method = request.method().as_str();
+        if is_noisy {
+            tracing::debug_span!(
+                "http_request",
+                method = method,
+                uri = %request.uri(),
+                version = ?request.version(),
+            )
+        } else {
+            tracing::info_span!(
+                "http_request",
+                method = method,
+                uri = %request.uri(),
+                version = ?request.version(),
+            )
+        }
+    }
+}
+
 pub(crate) fn build_router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/v1/embeddings", post(handler::dense_embeddings))
@@ -47,7 +80,16 @@ pub(crate) fn build_router(state: Arc<AppState>) -> Router {
         .route("/health", get(handler::health))
         .layer(DefaultBodyLimit::max(2_097_152))
         .layer(PropagateRequestIdLayer::x_request_id())
-        .layer(TraceLayer::new_for_http())
+        .layer(
+            TraceLayer::new_for_http()
+                .make_span_with(RouteAwareSpan)
+                .on_response(
+                    DefaultOnResponse::new()
+                        .level(Level::INFO)
+                        .latency_unit(tower_http::LatencyUnit::Millis),
+                )
+                .on_failure(DefaultOnFailure::new().level(Level::ERROR)),
+        )
         .layer(SetRequestIdLayer::x_request_id(UuidRequestId))
         .with_state(state)
 }
@@ -290,11 +332,20 @@ async fn run_readiness_probe(
 }
 
 #[tokio::main]
+#[allow(clippy::too_many_lines)]
 async fn main() -> anyhow::Result<()> {
-    let log_format = std::env::var("BGE_M3_LOG_FORMAT").unwrap_or_default();
     let env_filter =
         tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into());
-    if log_format.eq_ignore_ascii_case("json") {
+    let log_format = std::env::var("BGE_M3_LOG_FORMAT").ok();
+    // JSON by default in non-TTY environments (Docker/Fargate/CloudWatch).
+    // Force pretty with BGE_M3_LOG_FORMAT=text or BGE_M3_LOG_FORMAT=pretty.
+    // Force JSON with BGE_M3_LOG_FORMAT=json.
+    let want_json = match log_format.as_deref() {
+        Some("text" | "pretty") => false,
+        Some("json") => true,
+        _ => !std::io::IsTerminal::is_terminal(&std::io::stdout()),
+    };
+    if want_json {
         tracing_subscriber::fmt()
             .json()
             .with_env_filter(env_filter)
@@ -306,6 +357,15 @@ async fn main() -> anyhow::Result<()> {
             .try_init()
             .ok();
     }
+
+    info!(
+        version = env!("CARGO_PKG_VERSION"),
+        git_sha = env!("BGE_M3_GIT_SHA"),
+        target_arch = std::env::consts::ARCH,
+        target_os = std::env::consts::OS,
+        profile = if cfg!(debug_assertions) { "debug" } else { "release" },
+        "bge-m3-embedding-server build info"
+    );
 
     let cfg = Config::from_env();
 
@@ -397,6 +457,36 @@ async fn main() -> anyhow::Result<()> {
             std::process::exit(1);
         }
     });
+
+    // Periodic heartbeat — logs RSS, worker counts, queue depth, and permits
+    // at a fixed interval so dashboards can detect slow leaks or saturation.
+    let heartbeat_secs = cfg.heartbeat_secs;
+    if heartbeat_secs > 0 {
+        let state_hb = Arc::clone(&state);
+        tokio::spawn(async move {
+            let mut tick =
+                tokio::time::interval(Duration::from_secs(heartbeat_secs));
+            // Skip the first (immediate) tick so we don't log at t=0 before
+            // the server has finished starting up.
+            tick.tick().await;
+            loop {
+                tick.tick().await;
+                let rss_mb = sysinfo::read_process_rss_bytes().unwrap_or(0) / (1024 * 1024);
+                info!(
+                    rss_mb,
+                    live_workers = state_hb.pool.live_worker_count(),
+                    loaded_workers = state_hb.pool.loaded_worker_count(),
+                    queue_depth = state_hb.pool.queue_depth(),
+                    available_permits = state_hb.request_permits.available_permits(),
+                    probe_status = ProbeStatus::from_u8(
+                        state_hb.probe_status.load(Ordering::Acquire)
+                    )
+                    .as_str(),
+                    "heartbeat"
+                );
+            }
+        });
+    }
 
     axum::serve(listener, app).await?;
     Ok(())

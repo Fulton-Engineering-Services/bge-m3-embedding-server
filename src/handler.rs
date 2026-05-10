@@ -1,5 +1,6 @@
 use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
 use std::sync::{atomic::Ordering, Arc};
+use std::time::Instant;
 
 use crate::error::AppError;
 use crate::models::{
@@ -63,7 +64,7 @@ fn check_ready(state: &AppState) -> Result<(), AppError> {
 // Public handlers
 // ---------------------------------------------------------------------------
 
-#[tracing::instrument(skip(state, req), fields(batch_size))]
+#[tracing::instrument(skip(state, req), fields(batch_size, prompt_tokens, chunks, max_chunk_seq, tokenize_ms, inference_ms, total_ms))]
 pub async fn dense_embeddings(
     State(state): State<Arc<AppState>>,
     Json(req): Json<DenseRequest>,
@@ -72,9 +73,13 @@ pub async fn dense_embeddings(
     let texts = req.input.0;
     drop(req.model);
     validate_input(&texts, state.max_batch)?;
-    tracing::Span::current().record("batch_size", texts.len());
+    let batch_size = texts.len();
+    tracing::Span::current().record("batch_size", batch_size);
 
     let prompt_tokens: usize = texts.iter().map(|t| t.chars().count() / 4 + 1).sum();
+    tracing::Span::current().record("prompt_tokens", prompt_tokens);
+
+    let t0 = Instant::now();
 
     // Acquire a concurrency permit before dispatching to the worker pool.
     // This is released on drop when the handler returns (success or error).
@@ -83,7 +88,27 @@ pub async fn dense_embeddings(
         .await
         .expect("request semaphore is never closed");
 
-    let embeddings = state.pool.dense(texts).await?;
+    let (embeddings, embed_stats) = state.pool.dense(texts).await?;
+
+    let total_ms = u64::try_from(t0.elapsed().as_millis()).unwrap_or(u64::MAX);
+    tracing::Span::current()
+        .record("chunks", embed_stats.chunks)
+        .record("max_chunk_seq", embed_stats.max_chunk_seq)
+        .record("tokenize_ms", embed_stats.tokenize_ms)
+        .record("inference_ms", embed_stats.inference_ms)
+        .record("total_ms", total_ms);
+    tracing::info!(
+        route = "dense",
+        batch_size,
+        prompt_tokens,
+        chunks = embed_stats.chunks,
+        max_chunk_seq = embed_stats.max_chunk_seq,
+        total_token_positions = embed_stats.total_token_positions,
+        tokenize_ms = embed_stats.tokenize_ms,
+        inference_ms = embed_stats.inference_ms,
+        total_ms,
+        "embedding request complete"
+    );
 
     let data = embeddings
         .into_iter()
@@ -107,7 +132,7 @@ pub async fn dense_embeddings(
 }
 
 #[allow(clippy::cast_possible_truncation)]
-#[tracing::instrument(skip(state, req), fields(batch_size))]
+#[tracing::instrument(skip(state, req), fields(batch_size, chunks, max_chunk_seq, tokenize_ms, inference_ms, total_ms))]
 pub async fn sparse_embeddings(
     State(state): State<Arc<AppState>>,
     Json(req): Json<SparseRequest>,
@@ -115,14 +140,36 @@ pub async fn sparse_embeddings(
     check_ready(&state)?;
     let texts = req.input.0;
     validate_input(&texts, state.max_batch)?;
-    tracing::Span::current().record("batch_size", texts.len());
+    let batch_size = texts.len();
+    tracing::Span::current().record("batch_size", batch_size);
+
+    let t0 = Instant::now();
 
     let _permit = Arc::clone(&state.request_permits)
         .acquire_owned()
         .await
         .expect("request semaphore is never closed");
 
-    let embeddings = state.pool.sparse(texts).await?;
+    let (embeddings, embed_stats) = state.pool.sparse(texts).await?;
+
+    let total_ms = u64::try_from(t0.elapsed().as_millis()).unwrap_or(u64::MAX);
+    tracing::Span::current()
+        .record("chunks", embed_stats.chunks)
+        .record("max_chunk_seq", embed_stats.max_chunk_seq)
+        .record("tokenize_ms", embed_stats.tokenize_ms)
+        .record("inference_ms", embed_stats.inference_ms)
+        .record("total_ms", total_ms);
+    tracing::info!(
+        route = "sparse",
+        batch_size,
+        chunks = embed_stats.chunks,
+        max_chunk_seq = embed_stats.max_chunk_seq,
+        total_token_positions = embed_stats.total_token_positions,
+        tokenize_ms = embed_stats.tokenize_ms,
+        inference_ms = embed_stats.inference_ms,
+        total_ms,
+        "embedding request complete"
+    );
 
     let data = embeddings
         .into_iter()
@@ -140,7 +187,7 @@ pub async fn sparse_embeddings(
 }
 
 #[allow(clippy::cast_possible_truncation)]
-#[tracing::instrument(skip(state, req), fields(batch_size))]
+#[tracing::instrument(skip(state, req), fields(batch_size, prompt_tokens, chunks, max_chunk_seq, tokenize_ms, inference_ms, total_ms))]
 pub async fn both_embeddings(
     State(state): State<Arc<AppState>>,
     Json(req): Json<DualRequest>,
@@ -149,16 +196,40 @@ pub async fn both_embeddings(
     let texts = req.input.0;
     drop(req.model);
     validate_input(&texts, state.max_batch)?;
-    tracing::Span::current().record("batch_size", texts.len());
+    let batch_size = texts.len();
+    tracing::Span::current().record("batch_size", batch_size);
 
     let prompt_tokens: usize = texts.iter().map(|t| t.chars().count() / 4 + 1).sum();
+    tracing::Span::current().record("prompt_tokens", prompt_tokens);
+
+    let t0 = Instant::now();
 
     let _permit = Arc::clone(&state.request_permits)
         .acquire_owned()
         .await
         .expect("request semaphore is never closed");
 
-    let pairs = state.pool.both(texts).await?;
+    let (pairs, embed_stats) = state.pool.both(texts).await?;
+
+    let total_ms = u64::try_from(t0.elapsed().as_millis()).unwrap_or(u64::MAX);
+    tracing::Span::current()
+        .record("chunks", embed_stats.chunks)
+        .record("max_chunk_seq", embed_stats.max_chunk_seq)
+        .record("tokenize_ms", embed_stats.tokenize_ms)
+        .record("inference_ms", embed_stats.inference_ms)
+        .record("total_ms", total_ms);
+    tracing::info!(
+        route = "both",
+        batch_size,
+        prompt_tokens,
+        chunks = embed_stats.chunks,
+        max_chunk_seq = embed_stats.max_chunk_seq,
+        total_token_positions = embed_stats.total_token_positions,
+        tokenize_ms = embed_stats.tokenize_ms,
+        inference_ms = embed_stats.inference_ms,
+        total_ms,
+        "embedding request complete"
+    );
 
     let data = pairs
         .into_iter()

@@ -52,19 +52,35 @@ pub struct DualEmbedding {
 /// per-worker workspace.
 pub(crate) const OS_HEADROOM_BYTES: usize = 256 * 1024 * 1024; // 256 MiB
 
+/// Per-request diagnostic statistics captured inside the worker and forwarded
+/// to the handler layer for inclusion in the completion log event.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct EmbedStats {
+    /// Number of bin-packed chunks the batch was split into.
+    pub chunks: usize,
+    /// Maximum tokenized sequence length across all chunks.
+    pub max_chunk_seq: usize,
+    /// Total token-positions processed (sum of `seq_len` for all inputs).
+    pub total_token_positions: usize,
+    /// Time spent tokenizing all inputs (milliseconds).
+    pub tokenize_ms: u64,
+    /// Total time spent in ORT `session.run()` across all chunks (milliseconds).
+    pub inference_ms: u64,
+}
+
 pub enum EmbedRequest {
     Dense {
         texts: Vec<String>,
-        reply: oneshot::Sender<Result<Vec<Vec<f32>>>>,
+        reply: oneshot::Sender<Result<(Vec<Vec<f32>>, EmbedStats)>>,
     },
     Sparse {
         texts: Vec<String>,
-        reply: oneshot::Sender<Result<Vec<SparseEmbedding>>>,
+        reply: oneshot::Sender<Result<(Vec<SparseEmbedding>, EmbedStats)>>,
     },
     /// Computes dense and sparse embeddings from a single forward pass per chunk.
     Both {
         texts: Vec<String>,
-        reply: oneshot::Sender<Result<Vec<DualEmbedding>>>,
+        reply: oneshot::Sender<Result<(Vec<DualEmbedding>, EmbedStats)>>,
     },
     /// Internal: used during startup probe to run a single batch and measure
     /// peak RSS delta. Workers only process this before `ready` is set.
@@ -107,17 +123,19 @@ struct ModelFiles {
     tokenizer_path: PathBuf,
 }
 
-/// Downloads BGE-M3 model files from Hugging Face Hub (or returns cached paths).
 /// Returns `true` when the primary ONNX model file already exists in the
 /// hf-hub snapshot cache, meaning `repo.get()` will return immediately
 /// without fetching from the network.
 ///
-/// hf-hub 0.5.x cache layout:
-/// `{cache_dir}/hub/models--{owner}--{name}/snapshots/{revision}/{filename}`
+/// hf-hub 0.5.x layout when constructed with `ApiBuilder::with_cache_dir(p)`:
+/// `{p}/models--{owner}--{name}/snapshots/{revision}/{filename}`
+///
+/// Note: this differs from Python `huggingface_hub`, which appends a `hub/`
+/// segment when `HF_HOME` is set. The Rust crate treats `with_cache_dir`
+/// as `HF_HUB_CACHE` directly — no `hub/` subdirectory is added.
 fn is_model_cached(cache_dir: &Path, repo_id: &str, revision: &str, onnx_filename: &str) -> bool {
     let repo_dir = format!("models--{}", repo_id.replace('/', "--"));
     cache_dir
-        .join("hub")
         .join(repo_dir)
         .join("snapshots")
         .join(revision)
@@ -362,16 +380,22 @@ fn embed_dense(
     texts: &[String],
     cost_model: &CostModel,
     model_variant: ModelVariant,
-) -> Result<Vec<Vec<f32>>> {
+) -> Result<(Vec<Vec<f32>>, EmbedStats)> {
+    let tokenize_start = std::time::Instant::now();
     let encodings = tokenize_no_pad(tokenizer, texts)?;
     let seq_lens: Vec<usize> = encodings.iter().map(|e| e.get_ids().len()).collect();
+    let tokenize_ms = u64::try_from(tokenize_start.elapsed().as_millis()).unwrap_or(u64::MAX);
 
+    let total_token_positions: usize = seq_lens.iter().sum();
     let chunks = bin_pack(&seq_lens, cost_model);
 
     // Pre-allocate output slots (one per input text, filled below).
     let mut all_embeddings: Vec<Vec<f32>> = (0..texts.len()).map(|_| Vec::new()).collect();
 
-    for chunk_indices in &chunks {
+    let mut max_chunk_seq: usize = 0;
+    let mut inference_ms: u64 = 0;
+
+    for (chunk_idx, chunk_indices) in chunks.iter().enumerate() {
         let chunk_max = chunk_indices
             .iter()
             .map(|&i| seq_lens[i])
@@ -379,18 +403,39 @@ fn embed_dense(
             .unwrap_or(1)
             .max(1); // guard: at least 1 to avoid 0-dim tensors
 
+        max_chunk_seq = max_chunk_seq.max(chunk_max);
+
         let (ids_array, mask_array) = build_chunk_arrays(&encodings, chunk_indices, chunk_max)?;
         let batch_len = ids_array.nrows();
 
         let ids_tensor = TensorRef::from_array_view(ids_array.view()).map_err(ort_err)?;
         let mask_tensor = TensorRef::from_array_view(mask_array.view()).map_err(ort_err)?;
 
-        let outputs = session
-            .run(ort::inputs! {
-                "input_ids" => ids_tensor,
-                "attention_mask" => mask_tensor,
-            })
-            .map_err(ort_err)?;
+        let chunk_start = std::time::Instant::now();
+        let outputs = {
+            let _span = tracing::debug_span!(
+                "chunk",
+                chunk_idx,
+                batch = chunk_indices.len(),
+                max_seq = chunk_max
+            )
+            .entered();
+            session
+                .run(ort::inputs! {
+                    "input_ids" => ids_tensor,
+                    "attention_mask" => mask_tensor,
+                })
+                .map_err(ort_err)?
+        };
+        let chunk_ms = u64::try_from(chunk_start.elapsed().as_millis()).unwrap_or(u64::MAX);
+        inference_ms = inference_ms.saturating_add(chunk_ms);
+        tracing::debug!(
+            chunk_idx,
+            batch = chunk_indices.len(),
+            max_seq = chunk_max,
+            elapsed_ms = chunk_ms,
+            "dense chunk inference complete"
+        );
 
         // FP32: sentence_embedding [batch, 1024] — pre-pooled CLS output.
         // FP16/INT8: last_hidden_state [batch, seq, 1024] — CLS token at position 0.
@@ -419,7 +464,15 @@ fn embed_dense(
         }
     }
 
-    Ok(all_embeddings)
+    let stats = EmbedStats {
+        chunks: chunks.len(),
+        max_chunk_seq,
+        total_token_positions,
+        tokenize_ms,
+        inference_ms,
+    };
+
+    Ok((all_embeddings, stats))
 }
 
 /// Produces sparse embeddings via the BGE-M3 sparse-linear projection.
@@ -433,18 +486,24 @@ fn embed_sparse(
     texts: &[String],
     cost_model: &CostModel,
     model_variant: ModelVariant,
-) -> Result<Vec<SparseEmbedding>> {
+) -> Result<(Vec<SparseEmbedding>, EmbedStats)> {
     let (weight, bias) = crate::weights::sparse_linear();
     let weight_view = weight.view();
 
+    let tokenize_start = std::time::Instant::now();
     let encodings = tokenize_no_pad(tokenizer, texts)?;
     let seq_lens: Vec<usize> = encodings.iter().map(|e| e.get_ids().len()).collect();
+    let tokenize_ms = u64::try_from(tokenize_start.elapsed().as_millis()).unwrap_or(u64::MAX);
 
+    let total_token_positions: usize = seq_lens.iter().sum();
     let chunks = bin_pack(&seq_lens, cost_model);
 
     let mut all_sparse: Vec<Option<SparseEmbedding>> = (0..texts.len()).map(|_| None).collect();
 
-    for chunk_indices in &chunks {
+    let mut max_chunk_seq: usize = 0;
+    let mut inference_ms: u64 = 0;
+
+    for (chunk_idx, chunk_indices) in chunks.iter().enumerate() {
         let chunk_max = chunk_indices
             .iter()
             .map(|&i| seq_lens[i])
@@ -452,17 +511,38 @@ fn embed_sparse(
             .unwrap_or(1)
             .max(1);
 
+        max_chunk_seq = max_chunk_seq.max(chunk_max);
+
         let (ids_array, mask_array) = build_chunk_arrays(&encodings, chunk_indices, chunk_max)?;
 
         let ids_tensor = TensorRef::from_array_view(ids_array.view()).map_err(ort_err)?;
         let mask_tensor = TensorRef::from_array_view(mask_array.view()).map_err(ort_err)?;
 
-        let outputs = session
-            .run(ort::inputs! {
-                "input_ids" => ids_tensor,
-                "attention_mask" => mask_tensor,
-            })
-            .map_err(ort_err)?;
+        let chunk_start = std::time::Instant::now();
+        let outputs = {
+            let _span = tracing::debug_span!(
+                "chunk",
+                chunk_idx,
+                batch = chunk_indices.len(),
+                max_seq = chunk_max
+            )
+            .entered();
+            session
+                .run(ort::inputs! {
+                    "input_ids" => ids_tensor,
+                    "attention_mask" => mask_tensor,
+                })
+                .map_err(ort_err)?
+        };
+        let chunk_ms = u64::try_from(chunk_start.elapsed().as_millis()).unwrap_or(u64::MAX);
+        inference_ms = inference_ms.saturating_add(chunk_ms);
+        tracing::debug!(
+            chunk_idx,
+            batch = chunk_indices.len(),
+            max_seq = chunk_max,
+            elapsed_ms = chunk_ms,
+            "sparse chunk inference complete"
+        );
 
         // FP32: token_embeddings [batch, seq, 1024].
         // FP16/INT8: last_hidden_state [batch, seq, 1024] — same shape, different key.
@@ -496,10 +576,21 @@ fn embed_sparse(
         }
     }
 
-    Ok(all_sparse
-        .into_iter()
-        .map(|s| s.expect("every slot must be filled"))
-        .collect())
+    let stats = EmbedStats {
+        chunks: chunks.len(),
+        max_chunk_seq,
+        total_token_positions,
+        tokenize_ms,
+        inference_ms,
+    };
+
+    Ok((
+        all_sparse
+            .into_iter()
+            .map(|s| s.expect("every slot must be filled"))
+            .collect(),
+        stats,
+    ))
 }
 
 /// Produces paired dense + sparse embeddings using **one** `session.run()` per chunk.
@@ -513,25 +604,31 @@ fn embed_sparse(
 ///
 /// Numerically equivalent to calling [`embed_dense`] and [`embed_sparse`]
 /// separately, within FP rounding tolerance.
-#[allow(clippy::cast_possible_truncation)]
+#[allow(clippy::cast_possible_truncation, clippy::too_many_lines)]
 fn embed_both(
     session: &mut ort::session::Session,
     tokenizer: &tokenizers::Tokenizer,
     texts: &[String],
     cost_model: &CostModel,
     model_variant: ModelVariant,
-) -> Result<Vec<DualEmbedding>> {
+) -> Result<(Vec<DualEmbedding>, EmbedStats)> {
     let (weight, bias) = crate::weights::sparse_linear();
     let weight_view = weight.view();
 
+    let tokenize_start = std::time::Instant::now();
     let encodings = tokenize_no_pad(tokenizer, texts)?;
     let seq_lens: Vec<usize> = encodings.iter().map(|e| e.get_ids().len()).collect();
+    let tokenize_ms = u64::try_from(tokenize_start.elapsed().as_millis()).unwrap_or(u64::MAX);
 
+    let total_token_positions: usize = seq_lens.iter().sum();
     let chunks = bin_pack(&seq_lens, cost_model);
 
     let mut all_dual: Vec<Option<DualEmbedding>> = (0..texts.len()).map(|_| None).collect();
 
-    for chunk_indices in &chunks {
+    let mut max_chunk_seq: usize = 0;
+    let mut inference_ms: u64 = 0;
+
+    for (chunk_idx, chunk_indices) in chunks.iter().enumerate() {
         let chunk_max = chunk_indices
             .iter()
             .map(|&i| seq_lens[i])
@@ -539,17 +636,38 @@ fn embed_both(
             .unwrap_or(1)
             .max(1);
 
+        max_chunk_seq = max_chunk_seq.max(chunk_max);
+
         let (ids_array, mask_array) = build_chunk_arrays(&encodings, chunk_indices, chunk_max)?;
 
         let ids_tensor = TensorRef::from_array_view(ids_array.view()).map_err(ort_err)?;
         let mask_tensor = TensorRef::from_array_view(mask_array.view()).map_err(ort_err)?;
 
-        let outputs = session
-            .run(ort::inputs! {
-                "input_ids" => ids_tensor,
-                "attention_mask" => mask_tensor,
-            })
-            .map_err(ort_err)?;
+        let chunk_start = std::time::Instant::now();
+        let outputs = {
+            let _span = tracing::debug_span!(
+                "chunk",
+                chunk_idx,
+                batch = chunk_indices.len(),
+                max_seq = chunk_max
+            )
+            .entered();
+            session
+                .run(ort::inputs! {
+                    "input_ids" => ids_tensor,
+                    "attention_mask" => mask_tensor,
+                })
+                .map_err(ort_err)?
+        };
+        let chunk_ms = u64::try_from(chunk_start.elapsed().as_millis()).unwrap_or(u64::MAX);
+        inference_ms = inference_ms.saturating_add(chunk_ms);
+        tracing::debug!(
+            chunk_idx,
+            batch = chunk_indices.len(),
+            max_seq = chunk_max,
+            elapsed_ms = chunk_ms,
+            "both chunk inference complete"
+        );
 
         // Extract dense + token-level hidden states from the same outputs.
         // FP32: separate sentence_embedding + token_embeddings outputs.
@@ -610,10 +728,21 @@ fn embed_both(
         }
     }
 
-    Ok(all_dual
-        .into_iter()
-        .map(|d| d.expect("every slot must be filled"))
-        .collect())
+    let stats = EmbedStats {
+        chunks: chunks.len(),
+        max_chunk_seq,
+        total_token_positions,
+        tokenize_ms,
+        inference_ms,
+    };
+
+    Ok((
+        all_dual
+            .into_iter()
+            .map(|d| d.expect("every slot must be filled"))
+            .collect(),
+        stats,
+    ))
 }
 
 /// Runs a single `session.run()` for the probe, measuring RSS before and after.
@@ -862,6 +991,17 @@ fn run_worker(
                             config.model_variant,
                         )
                         .map_err(|e| anyhow::anyhow!("Dense embed error: {e}"));
+                        if let Ok((_, ref stats)) = result {
+                            tracing::info!(
+                                worker_id = id,
+                                chunks = stats.chunks,
+                                max_chunk_seq = stats.max_chunk_seq,
+                                total_token_positions = stats.total_token_positions,
+                                tokenize_ms = stats.tokenize_ms,
+                                inference_ms = stats.inference_ms,
+                                "worker: dense embed complete"
+                            );
+                        }
                         let _ = reply.send(result);
                     }
                     EmbedRequest::Sparse { texts, reply } => {
@@ -874,6 +1014,17 @@ fn run_worker(
                             config.model_variant,
                         )
                         .map_err(|e| anyhow::anyhow!("Sparse embed error: {e}"));
+                        if let Ok((_, ref stats)) = result {
+                            tracing::info!(
+                                worker_id = id,
+                                chunks = stats.chunks,
+                                max_chunk_seq = stats.max_chunk_seq,
+                                total_token_positions = stats.total_token_positions,
+                                tokenize_ms = stats.tokenize_ms,
+                                inference_ms = stats.inference_ms,
+                                "worker: sparse embed complete"
+                            );
+                        }
                         let _ = reply.send(result);
                     }
                     EmbedRequest::Both { texts, reply } => {
@@ -881,6 +1032,17 @@ fn run_worker(
                         let result =
                             embed_both(session, tokenizer, &texts, &cm_guard, config.model_variant)
                                 .map_err(|e| anyhow::anyhow!("Dual embed error: {e}"));
+                        if let Ok((_, ref stats)) = result {
+                            tracing::info!(
+                                worker_id = id,
+                                chunks = stats.chunks,
+                                max_chunk_seq = stats.max_chunk_seq,
+                                total_token_positions = stats.total_token_positions,
+                                tokenize_ms = stats.tokenize_ms,
+                                inference_ms = stats.inference_ms,
+                                "worker: both embed complete"
+                            );
+                        }
                         let _ = reply.send(result);
                     }
                     EmbedRequest::Probe { texts, reply } => {
@@ -1053,7 +1215,7 @@ impl EmbedPool {
         )
     }
 
-    pub async fn dense(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>> {
+    pub async fn dense(&self, texts: Vec<String>) -> Result<(Vec<Vec<f32>>, EmbedStats)> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.tx
             .send(EmbedRequest::Dense {
@@ -1067,7 +1229,7 @@ impl EmbedPool {
             .map_err(|_| anyhow::anyhow!("Worker dropped reply sender"))?
     }
 
-    pub async fn sparse(&self, texts: Vec<String>) -> Result<Vec<SparseEmbedding>> {
+    pub async fn sparse(&self, texts: Vec<String>) -> Result<(Vec<SparseEmbedding>, EmbedStats)> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.tx
             .send(EmbedRequest::Sparse {
@@ -1086,7 +1248,7 @@ impl EmbedPool {
     /// Equivalent to calling [`Self::dense`] and [`Self::sparse`] back-to-back,
     /// but uses one `session.run()` per chunk instead of two — at near-zero
     /// marginal GPU cost.
-    pub async fn both(&self, texts: Vec<String>) -> Result<Vec<DualEmbedding>> {
+    pub async fn both(&self, texts: Vec<String>) -> Result<(Vec<DualEmbedding>, EmbedStats)> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.tx
             .send(EmbedRequest::Both {
@@ -1124,6 +1286,13 @@ impl EmbedPool {
     #[must_use]
     pub fn loaded_worker_count(&self) -> usize {
         self.loaded_workers.load(Ordering::Acquire)
+    }
+
+    /// Returns the number of requests currently queued but not yet picked up
+    /// by a worker. Uses the channel's current vs max capacity.
+    #[must_use]
+    pub fn queue_depth(&self) -> usize {
+        self.tx.max_capacity().saturating_sub(self.tx.capacity())
     }
 
     /// Returns the maximum RSS delta (bytes) observed across all workers during
@@ -1169,10 +1338,10 @@ impl EmbedPool {
             while let Some(req) = rx.recv().await {
                 match req {
                     EmbedRequest::Dense { reply, .. } => {
-                        let _ = reply.send(Ok((*dense).clone()));
+                        let _ = reply.send(Ok(((*dense).clone(), EmbedStats::default())));
                     }
                     EmbedRequest::Sparse { reply, .. } => {
-                        let _ = reply.send(Ok((*sparse).clone()));
+                        let _ = reply.send(Ok(((*sparse).clone(), EmbedStats::default())));
                     }
                     EmbedRequest::Both { reply, .. } => {
                         // Pair dense_fixture[i] with sparse_fixture[i] elementwise.
@@ -1186,7 +1355,7 @@ impl EmbedPool {
                                 sparse: s.clone(),
                             })
                             .collect();
-                        let _ = reply.send(Ok(pairs));
+                        let _ = reply.send(Ok((pairs, EmbedStats::default())));
                     }
                     EmbedRequest::Probe { reply, .. } => {
                         let _ = reply.send(Ok(ProbeResult {
@@ -1329,7 +1498,7 @@ mod tests {
             },
         ];
         let pool = EmbedPool::with_fixed_responses(dense_fixture.clone(), sparse_fixture.clone());
-        let result = pool
+        let (result, _stats) = pool
             .both(vec!["a".into(), "b".into()])
             .await
             .expect("both should succeed against fixture pool");
@@ -1654,5 +1823,45 @@ mod tests {
             .filter_map(|s| s.get("texts").and_then(|t| t.as_array()).map(Vec::len))
             .sum();
         assert_eq!(total, 184, "total corpus texts should be 184");
+    }
+
+    // -----------------------------------------------------------------------
+    // EmbedStats and queue_depth
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn embed_stats_default_is_all_zero() {
+        let stats = EmbedStats::default();
+        assert_eq!(stats.chunks, 0);
+        assert_eq!(stats.max_chunk_seq, 0);
+        assert_eq!(stats.total_token_positions, 0);
+        assert_eq!(stats.tokenize_ms, 0);
+        assert_eq!(stats.inference_ms, 0);
+    }
+
+    #[tokio::test]
+    async fn fixture_pool_returns_default_embed_stats() {
+        let pool = EmbedPool::with_fixed_responses(vec![vec![0.1f32]], vec![]);
+        let (_embeddings, stats) = pool
+            .dense(vec!["hello".into()])
+            .await
+            .expect("fixture pool should succeed");
+        // Fixture always returns EmbedStats::default() — all zero.
+        assert_eq!(stats.chunks, 0, "fixture pool stats should be default zeros");
+        assert_eq!(stats.inference_ms, 0);
+    }
+
+    #[tokio::test]
+    async fn queue_depth_is_zero_when_idle() {
+        let pool = EmbedPool::with_fixed_responses(vec![], vec![]);
+        // No requests in flight — queue should be empty.
+        assert_eq!(pool.queue_depth(), 0);
+    }
+
+    #[test]
+    fn queue_depth_is_zero_for_closed_pool() {
+        let pool = EmbedPool::closed_for_test();
+        // Closed pool has a dropped receiver; capacity reports max - 0 pending = 0.
+        assert_eq!(pool.queue_depth(), 0);
     }
 }

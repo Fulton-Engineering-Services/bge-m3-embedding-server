@@ -134,6 +134,15 @@ pub struct Config {
     /// - `BGE_M3_COST_MODEL_A` and `BGE_M3_COST_MODEL_B` are both set with
     ///   `BGE_M3_AVAILABLE_MEMORY_BYTES` (full explicit override).
     pub cost_model_override: Option<CostModel>,
+    /// Interval (seconds) between periodic heartbeat log events.
+    ///
+    /// Set with `BGE_M3_HEARTBEAT_SECS`. Defaults to `60`.
+    /// Set to `0` to disable heartbeat logging entirely.
+    ///
+    /// Heartbeat events log RSS, live/loaded worker counts, queue depth,
+    /// available request permits, and current probe status — useful for
+    /// detecting slow memory leaks or queue saturation between requests.
+    pub heartbeat_secs: u64,
 }
 
 impl Config {
@@ -209,6 +218,10 @@ impl Config {
             );
         }
 
+        let heartbeat_secs = lookup("BGE_M3_HEARTBEAT_SECS")
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(60);
+
         Self {
             cache_dir: lookup("BGE_M3_CACHE_DIR").unwrap_or_else(|| "/cache".to_string()),
             bind_addr: lookup("BGE_M3_BIND").unwrap_or_else(|| "0.0.0.0:8081".to_string()),
@@ -219,6 +232,7 @@ impl Config {
             model_variant,
             memory_safety_factor,
             cost_model_override,
+            heartbeat_secs,
         }
     }
 }
@@ -315,6 +329,7 @@ mod tests {
             cfg.cost_model_override.is_none(),
             "probe should run by default"
         );
+        assert_eq!(cfg.heartbeat_secs, 60);
     }
 
     #[test]
@@ -463,5 +478,33 @@ mod tests {
         assert_eq!(ModelVariant::Fp32.to_string(), "fp32");
         assert_eq!(ModelVariant::Fp16.to_string(), "fp16");
         assert_eq!(ModelVariant::Int8.to_string(), "int8");
+    }
+
+    #[test]
+    fn heartbeat_secs_defaults_to_60() {
+        let map = HashMap::new();
+        let cfg = Config::from_lookup(lookup_from(&map));
+        assert_eq!(cfg.heartbeat_secs, 60);
+    }
+
+    #[test]
+    fn heartbeat_secs_custom_value() {
+        let map = HashMap::from([("BGE_M3_HEARTBEAT_SECS", "120")]);
+        let cfg = Config::from_lookup(lookup_from(&map));
+        assert_eq!(cfg.heartbeat_secs, 120);
+    }
+
+    #[test]
+    fn heartbeat_secs_disabled_when_zero() {
+        let map = HashMap::from([("BGE_M3_HEARTBEAT_SECS", "0")]);
+        let cfg = Config::from_lookup(lookup_from(&map));
+        assert_eq!(cfg.heartbeat_secs, 0);
+    }
+
+    #[test]
+    fn heartbeat_secs_invalid_falls_back_to_default() {
+        let map = HashMap::from([("BGE_M3_HEARTBEAT_SECS", "not_a_number")]);
+        let cfg = Config::from_lookup(lookup_from(&map));
+        assert_eq!(cfg.heartbeat_secs, 60, "invalid value should fall back to default");
     }
 }
