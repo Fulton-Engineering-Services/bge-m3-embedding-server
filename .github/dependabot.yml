@@ -13,3 +13,17 @@ updates:
       interval: "weekly"
     labels:
       - "dependencies"
+
+  - package-ecosystem: "pip"
+    directory: "/tools/visuals"
+    schedule:
+      interval: "weekly"
+    labels:
+      - "dependencies"
+
+  - package-ecosystem: "pip"
+    directory: "/binder"
+    schedule:
+      interval: "weekly"
+    labels:
+      - "dependencies"
