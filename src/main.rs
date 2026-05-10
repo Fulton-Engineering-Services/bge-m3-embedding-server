@@ -1033,12 +1033,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn readiness_probe_fails_when_dense_probe_fails() {
+    async fn readiness_probe_does_not_set_ready_when_dense_check_fails() {
+        // With the serialised-probe design (v0.15.0-rc5), readiness checks
+        // run inside the spawned probe task rather than in the caller.
+        // run_readiness_probe returns Ok immediately; the readiness failure
+        // is logged and state.ready stays false.
         let state = make_test_state(false, 256);
         let handle = tokio::spawn(async { Ok::<(), anyhow::Error>(()) });
+        // disable_probe_cache=true → no override, no cache → probe spawned
         let result = run_readiness_probe(
             handle,
-            state,
+            Arc::clone(&state),
             8192,
             2,
             0.7,
@@ -1048,7 +1053,15 @@ mod tests {
             true,
         )
         .await;
-        assert!(result.is_err());
+        // run_readiness_probe returns Ok — the probe task was spawned.
+        assert!(result.is_ok(), "run_readiness_probe should return Ok (probe spawned)");
+        // Give the probe task time to run the readiness check and fail.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        // The pool is closed_for_test, so dense() fails; ready should stay false.
+        assert!(
+            !state.ready.load(std::sync::atomic::Ordering::Acquire),
+            "ready must not be set when the dense readiness check fails"
+        );
     }
 
     #[tokio::test]

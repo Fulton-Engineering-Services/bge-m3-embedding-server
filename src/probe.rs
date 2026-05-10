@@ -728,8 +728,10 @@ mod tests {
     }
 
     #[test]
-    fn fit_cost_model_recovers_known_coefficients_from_7_probe_shapes() {
-        // Verify the new 7-shape set also gives a good fit.
+    fn fit_cost_model_recovers_known_coefficients_from_5_probe_shapes() {
+        // Verify the trimmed 5-shape set (removed (1,4096) and (1,max_seq))
+        // still recovers coefficients within 5% of ground truth.
+        // This is the shape set shipped in v0.15.0-rc5.
         let a_true = 18_500.0_f64;
         let b_true = 6.5_f64;
         let data: Vec<DataPoint> = [
@@ -738,15 +740,13 @@ mod tests {
             (1, 256),
             (1, 1024),
             (1, 2048),
-            (1, 4096),
-            (1, 8192),
         ]
         .iter()
         .map(|&(b, s)| make_dp(b, s, a_true, b_true))
         .collect();
 
         let result = fit_cost_model(&data);
-        assert!(result.is_some(), "7-shape fit should succeed");
+        assert!(result.is_some(), "5-shape fit should succeed");
         let (a, b) = result.unwrap();
         assert!(
             (a - a_true).abs() < 0.05 * a_true,
@@ -928,7 +928,8 @@ mod tests {
                 ceiling_zero.chunk_cost(batch, seq)
             );
         }
-        // Also check a dynamically-added max_seq shape.
+        // Also verify that a long-context shape that might appear in future
+        // shape sets would still be rejected at zero ceiling.
         assert!(!ceiling_zero.fits(1, 8192));
     }
 
@@ -993,5 +994,14 @@ mod tests {
             !data.iter().all(|dp| dp.rss_delta == 0),
             "mixed data should not trigger the all-zero branch"
         );
+    }
+
+    /// `validate_max_seq_shape` must not panic for the full supported range.
+    #[test]
+    fn validate_max_seq_shape_does_not_panic() {
+        // All representative max_seq values must succeed without session.run().
+        for &max_seq in &[64usize, 512, 1024, 2048, 4096, 8192] {
+            validate_max_seq_shape(max_seq);
+        }
     }
 }
