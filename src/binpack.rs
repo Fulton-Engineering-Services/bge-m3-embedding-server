@@ -20,7 +20,7 @@
 /// conservatively from compile-time defaults when measurement is unavailable.
 #[derive(Clone, Copy, Debug)]
 #[cfg_attr(test, derive(PartialEq))]
-pub(crate) struct CostModel {
+pub struct CostModel {
     /// Bytes per token-position (linear term: FFN intermediates, projections).
     pub a: f64,
     /// Bytes per token-position-squared (quadratic term: attention scores).

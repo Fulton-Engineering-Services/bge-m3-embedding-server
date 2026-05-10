@@ -44,7 +44,7 @@ impl Drop for WorkerGuard {
 /// fitting.  Each worker loads the current value lock-free at the start of
 /// every `session.run()` call via `config.cost_model.load()`.
 #[derive(Clone)]
-pub(crate) struct WorkerConfig {
+pub struct WorkerConfig {
     /// Quadratic-aware workspace cost model and per-worker budget.
     ///
     /// Shared across all workers via `ArcSwap`.  The background probe updates

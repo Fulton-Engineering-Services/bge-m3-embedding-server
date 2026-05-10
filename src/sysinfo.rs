@@ -32,7 +32,7 @@ use tracing::warn;
 /// Where the available-memory reading came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(dead_code)] // CgroupV2/CgroupV1 are constructed only on Linux; macOS sees them as unused.
-pub(crate) enum MemorySource {
+pub enum MemorySource {
     /// `BGE_M3_AVAILABLE_MEMORY_BYTES` env override.
     Override,
     /// Linux cgroup v2 `memory.max`.
@@ -56,7 +56,7 @@ impl std::fmt::Display for MemorySource {
 
 /// A memory reading with its provenance.
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct MemoryReading {
+pub struct MemoryReading {
     pub available_bytes: usize,
     pub source: MemorySource,
 }

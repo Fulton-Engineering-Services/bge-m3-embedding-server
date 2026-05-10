@@ -10,6 +10,14 @@ keywords = ["embeddings", "bge-m3", "axum", "nlp", "onnxruntime"]
 categories = ["web-programming::http-server"]
 rust-version = "1.88"
 
+[lib]
+name = "bge_m3_embedding_server"
+path = "src/lib.rs"
+
+[[bin]]
+name = "bge-m3-embedding-server"
+path = "src/main.rs"
+
 [dependencies]
 axum = "0.8"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "time"] }
