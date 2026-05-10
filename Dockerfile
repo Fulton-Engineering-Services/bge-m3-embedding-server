@@ -44,7 +44,7 @@ WORKDIR /app
 # benches/ stubs are required for all [[bench]] targets because Cargo validates source
 # paths at manifest parse time, even though cargo build --release skips bench compilation.
 COPY Cargo.toml Cargo.lock build.rs ./
-RUN mkdir src && echo "fn main(){}" > src/main.rs \
+RUN mkdir src && echo "fn main(){}" > src/main.rs && touch src/lib.rs \
     && mkdir -p benches/coreml && touch benches/embeddings.rs benches/coreml/main.rs \
     && cargo build --release \
     && rm -rf src benches
