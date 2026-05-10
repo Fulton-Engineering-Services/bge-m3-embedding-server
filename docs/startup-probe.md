@@ -446,12 +446,23 @@ pub(crate) fn probe_run_dense(
 
 These per-shape deltas feed the OLS fit and determine `(a, b)`.
 
-**Layer 2 — Per-worker model-weight footprint (inside `run_worker`).**  Each worker measures its own RSS immediately *before* and *after* calling `load_models()`, inside the `spawn_blocking` thread where the ORT session is actually created:
+**Layer 2 — Per-worker model-weight + arena-baseline footprint (inside `run_worker`).**  Each worker measures its own RSS immediately *before* `load_models()` and *after* a per-worker arena-priming `session.run()`, inside the `spawn_blocking` thread where the ORT session is actually created:
 
-```700:726:src/embedder.rs
+```src/embedder.rs
     let pre_load_rss = sysinfo::read_process_rss_bytes().unwrap_or(0);
     let initial_models = match load_models(...) {
-        Ok(models) => { ... models }
+        Ok(mut models) => {
+            // rc7: prime the ORT session arena before measuring post_load_rss.
+            // ORT lazily allocates ~1 GiB of arena bookkeeping on the first
+            // session.run() per session. Including that allocation in the
+            // per-worker RSS delta makes the workspace-budget math realistic
+            // and ensures the probe sweep sees clean per-shape deltas
+            // regardless of which worker the dispatcher routes each shape to.
+            let prime_ids = ndarray::Array2::<i64>::zeros((1, 8));
+            let prime_mask = ndarray::Array2::<i64>::ones((1, 8));
+            let _ = probe_run_dense(&mut models.0, &prime_ids, &prime_mask);
+            models
+        }
         Err(e) => { ... }
     };
     let post_load_rss = sysinfo::read_process_rss_bytes().unwrap_or(pre_load_rss);
@@ -459,16 +470,14 @@ These per-shape deltas feed the OLS fit and determine `(a, b)`.
     let _ = rt.block_on(ready_tx.send(Ok(rss_delta)));
 ```
 
-The `ready_tx` channel carries `Result<usize>` (the delta in bytes). `EmbedPool::spawn` collects all worker deltas and stores the maximum via `AtomicUsize::fetch_max`. The caller reads `state.pool.model_rss_max_bytes()` to get the per-worker model footprint used in the workspace-budget formula:
+The `ready_tx` channel carries `Result<usize>` (the delta in bytes). `EmbedPool::spawn` collects all worker deltas and stores the **median** via `Arc<AtomicUsize>` (median is robust to one outlier from page-cache settling or ORT arena jitter). The caller reads `state.pool.model_rss_per_worker_bytes()` to get the per-worker model+arena footprint used in the workspace-budget formula:
 
 ```
-total_workspace = available − N×model_rss_max_bytes − OS_HEADROOM
+total_workspace = available − N×model_rss_per_worker − OS_HEADROOM
 per_worker_workspace = total_workspace × safety_factor / N
 ```
 
-Taking the *max* across workers (rather than the mean or the leader's delta alone) is conservative — it protects against the occasional noisy reading that underestimates the true footprint.
-
-**Why this matters.**  The alternative (reading RSS twice immediately after all workers have finished loading) measures near-zero because both reads happen at the same instant with the model already resident. That approach was the root cause of the 2026-05-09 OOM: with `model_rss_per_worker ≈ 0`, the workspace formula over-budgeted each worker by ~760 MB at 7 workers on a 28 GB Fargate task.
+**Why this matters.**  The alternative (reading RSS twice immediately after all workers have finished loading, OR measuring before any `session.run()`) under-counts each worker's contribution by ~1 GiB. With `model_rss_per_worker ≈ 1.4 GiB` and 4 workers on 28 GiB, the budget formula over-budgets each worker by ~1 GiB. Real `(1, 8192)` requests subsequently grow each worker's arena to its high-water mark (~5–6 GiB total per worker) — which fits the corrected budget at 4 workers but does NOT fit at 7 workers. Per-worker priming was added in v0.15.0-rc7 specifically to make the budget reflect arena baselines.
 
 `read_process_rss_bytes()` parses field 1 of `/proc/self/statm` (RSS in pages) and multiplies by the page size (4096 on Linux/x86_64 and Linux/aarch64). The delta `rss_after - rss_before` is the RSS growth attributable to the call.
 
