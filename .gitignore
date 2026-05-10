@@ -8,3 +8,7 @@
 
 # Scratch/temp work — never commit
 tmp/
+
+# Probe-visuals tool — generated PNGs and virtual environment
+tools/probe-visuals/out/
+tools/probe-visuals/.venv/

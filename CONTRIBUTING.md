@@ -1,129 +1,137 @@
 # Contributing to bge-m3-embedding-server
 
-`bge-m3-embedding-server` is open source under the Apache License 2.0.
-Contributions are welcome — bug reports, fixes, and new features alike.
+Contributions are welcome — bug reports, fixes, new features, and documentation improvements.
 
-By submitting a pull request you certify that your contribution is made under
-the [Developer Certificate of Origin (DCO)](https://developercertificate.org/)
-and the same Apache 2.0 license as the project (inbound = outbound). Every
-commit must carry a `Signed-off-by` trailer matching your author identity:
-
-```
-git commit -s -m "feat: your change"
-```
-
-To add sign-off to all commits on an existing branch:
-
-```bash
-git rebase origin/main --signoff
-git push --force-with-lease
-```
+By submitting a pull request you agree your contribution is made under the
+Apache License 2.0 (inbound = outbound), and you certify the
+[Developer Certificate of Origin](https://developercertificate.org/) by signing off
+each commit with `git commit -s`.
 
 ---
 
-## Development environment
+## Dev environment
 
-Requires Rust **1.88** or later (MSRV) and
-[cargo-nextest](https://nexte.st/) for the test suite.
+### Rust toolchain
+
+Requires **Rust 1.88** or later (MSRV). Install or update via [rustup](https://rustup.rs/):
 
 ```bash
-# Clone and enter the repo
-git clone git@github.com:Fulton-Engineering-Services/bge-m3-embedding-server.git
-cd bge-m3-embedding-server
-
-# Run the server locally (downloads model files on first run)
-BGE_M3_CACHE_DIR=/tmp/bge-m3-cache cargo run
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+rustup update stable
 ```
 
----
+### cargo nextest
 
-## Running the checks
-
-All of the following must pass before a PR is merged.
+The test suite uses [cargo-nextest](https://nexte.st/). Install it once:
 
 ```bash
-# Build
+cargo install cargo-nextest --locked
+```
+
+### Build
+
+```bash
 cargo build
+```
 
-# Lint (warnings are errors)
+---
+
+## Running checks
+
+All five commands must pass before a PR is merged.
+
+```bash
+# Lint — no warnings permitted
 cargo clippy --all-targets -- -D warnings
 
-# Format check
+# Format check (CI gate)
 cargo fmt --check
 
-# Tests (requires cargo-nextest)
+# Auto-format
+cargo fmt
+
+# Tests
 cargo nextest run --all-features --no-tests=warn
 
-# Supply chain audit (requires cargo-deny)
+# Supply-chain audit (licenses + advisories)
 cargo deny check
 
-# License header check (requires hawkeye)
+# License header check (.rs files)
 hawkeye check
 ```
 
+Install `cargo-deny` and `hawkeye` once if needed:
+
+```bash
+cargo install cargo-deny --locked
+cargo install hawkeye --locked
+```
+
 ---
 
-## Project layout
+## All checks must pass
 
+CI runs `cargo clippy`, `cargo fmt --check`, `cargo nextest run --all-features`,
+`cargo deny check`, and `hawkeye check` on every pull request. A PR will not be merged
+until all gates are green.
+
+---
+
+## Visualisation tools
+
+The `tools/probe-visuals/` directory contains Python scripts that generate the figures in
+[`docs/startup-probe.md`](docs/startup-probe.md). If you are editing that document or adding
+new figures, see [`tools/probe-visuals/README.md`](tools/probe-visuals/README.md) for
+prerequisites, quick start, and the figure index.
+
+```bash
+cd tools/probe-visuals
+uv sync
+uv run python scripts/render_all.py
 ```
-src/
-  lib.rs                    # library crate root (re-exports for tests)
-  main.rs                   # thin binary entry point
-  bootstrap.rs              # startup orchestration (router, budget, probe task, readiness)
-  bootstrap/
-    budget.rs               # workspace-budget arithmetic
-    probe_task.rs           # background probe task
-    readiness.rs            # foreground readiness probe
-    router.rs               # Axum router + middleware
-  config.rs                 # env-var configuration (Config::from_env)
-  state.rs                  # AppState, TuningInfo, ProbeStatus
-  handler.rs                # HTTP handler module (facade)
-  handler/
-    common.rs               # shared validation + readiness helpers
-    dense.rs                # POST /v1/embeddings
-    sparse.rs               # POST /v1/sparse-embeddings
-    both.rs                 # POST /v1/embeddings:both
-    health.rs               # GET /health
-    models.rs               # GET /v1/models
-  embedder.rs               # worker-pool module (facade)
-  embedder/
-    pool.rs                 # EmbedPool async wrapper
-    worker.rs               # blocking worker thread + probe wiring
-    dense.rs                # dense embedding pipeline
-    sparse.rs               # sparse embedding pipeline
-    dual.rs                 # paired dense + sparse pipeline
-    session.rs              # ORT session loading + execution providers
-    tokenize.rs             # tokenizer load + no-pad tokenization
-    math.rs                 # pure dense/sparse math helpers
-    model_files.rs          # hf-hub download / cache layout
-    types.rs                # EmbedRequest, ProbeResult, SparseEmbedding
-    error.rs                # ort::Error → anyhow::Error adapter
-  binpack.rs                # quadratic-aware workspace bin-packer + CostModel
-  probe.rs                  # cost-model probe module (facade)
-  probe/
-    runner.rs               # (batch, seq) shape-sweep driver
-    fit.rs                  # OLS cost-model fitter
-    cache.rs                # persistent EFS coefficient cache
-    corpus.rs               # probe text synthesis
-    validate.rs             # tokenizer + ndarray shape check
-  sysinfo.rs                # memory detection (cgroup v2/v1 → /proc/meminfo)
-  weights.rs                # bundled sparse_linear.safetensors weights
-  models.rs                 # request / response serde types
-  error.rs                  # AppError → HTTP status mapping
-benches/                    # Criterion benchmarks
-tests/                      # integration tests
+
+---
+
+## Commits
+
+Use [Conventional Commits](https://www.conventionalcommits.org/) titles:
+
+| Prefix | When to use |
+|--------|-------------|
+| `feat:` | New user-facing feature |
+| `fix:` | Bug fix |
+| `perf:` | Performance improvement |
+| `docs:` | Documentation only |
+| `chore:` | Build, CI, tooling, dependency bumps |
+| `refactor:` | Internal restructure, no behaviour change |
+| `test:` | Test-only change |
+
+Breaking changes: add `!` after the prefix (e.g. `feat!:`) **and** a `BREAKING CHANGE:` footer.
+
+Sign every commit with DCO:
+
+```bash
+git commit -s -m "feat: add sparse embedding batch endpoint"
 ```
+
+---
+
+## Pull requests
+
+- Target the `main` branch.
+- Reference any related issue in the PR description (`Closes #N`).
+- DCO sign-off is required on every commit — CI enforces this.
+- Keep PRs focused; split unrelated changes into separate PRs.
+- Update `CHANGELOG.md` (if present) or note changes in the PR description.
 
 ---
 
 ## Releases
 
-Releases are managed via the GitHub Actions release workflow.
+1. Bump the version string in **`Cargo.toml`**.
+2. Commit: `chore: bump version to X.Y.Z`
+3. Push to `main`.
 
-- Use [Conventional Commits](https://www.conventionalcommits.org/) on every PR:
-  `feat:`, `fix:`, `docs:`, `chore:`, `refactor:`, `perf:`, etc.
-- `feat!:` or a `BREAKING CHANGE:` footer triggers a major version bump.
-- To cut a release: bump `version` in `Cargo.toml`, commit, push to `main`.
-  The release workflow creates the git tag, builds multi-arch Docker images,
-  and publishes a GitHub Release automatically.
-- Do **not** create tags locally — let the workflow handle them.
+The Release workflow detects the version bump, creates the git tag `vX.Y.Z`, builds
+multi-arch Docker images, and publishes a GitHub Release automatically. Do **not** create
+tags locally.

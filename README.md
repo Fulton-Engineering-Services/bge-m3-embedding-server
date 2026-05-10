@@ -488,6 +488,17 @@ flowchart TD
 - After `BGE_M3_IDLE_TIMEOUT_SECS` of inactivity, workers drop their model instances to free memory. Models reload transparently on the next request (~10–30 s from cache).
 - `tower-http::TraceLayer` + `SetRequestIdLayer` provide per-request tracing and `X-Request-ID` header propagation.
 
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the full development guide.
+
+### Visualisation tools
+
+The `tools/probe-visuals/` directory contains Python scripts that generate
+the mathematical figures in [`docs/startup-probe.md`](docs/startup-probe.md).
+See [`tools/probe-visuals/README.md`](tools/probe-visuals/README.md) for
+setup and usage.
+
 ## Versioning
 
 This project uses manual semantic versioning. The version is defined in `Cargo.toml`:
