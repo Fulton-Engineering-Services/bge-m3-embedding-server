@@ -39,7 +39,8 @@ jobs:
         run: |
           pip install \
             jupyterlite-core==0.7.6 \
-            jupyterlite-pyodide-kernel==0.7.2
+            jupyterlite-pyodide-kernel==0.7.2 \
+            jupyter-server==2.15.0
 
       - name: Copy notebooks to build input
         run: |
