@@ -132,7 +132,7 @@ If Layer 2 priming is skipped, the *first* per-shape measurement in Layer 1 incl
 
 ## Reading `/proc/self/statm`
 
-`read_process_rss_bytes()` parses field 1 of `/proc/self/statm` (RSS in pages) and multiplies by the page size ($4096$ on Linux/x86_64 and Linux/aarch64). The delta `rss_after - rss_before` is the RSS growth attributable to the call.
+`read_process_rss_bytes()` parses field 1 of `/proc/self/statm` (RSS in pages) and multiplies by the page size ($4096$ on `Linux/x86_64` and `Linux/aarch64`). The delta `rss_after - rss_before` is the RSS growth attributable to the call.
 
 This is *not* the same as the peak workspace allocated during the call. RSS is a high-water mark as observed at the moment of reading; it captures pages still resident immediately after the call returns. ORT's arena allocator typically retains its high-water buffer rather than releasing pages back to the kernel, so the RSS delta is a good proxy for peak workspace on the *first* allocation at a given shape and a near-zero floor on repeat calls (the arena is already big enough).
 

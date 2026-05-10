@@ -28,7 +28,7 @@ The probe combines standard numerical-linear-algebra techniques with transformer
 
 - **POSIX atomic rename semantics.** `rename(2)` Linux manpage — the basis for the cache file's atomic-write strategy in [Cache §9](09-cache.md). The manpage guarantees that "if newpath already exists, it will be atomically replaced" — ensuring concurrent readers always see either the complete old file or the complete new file, never a half-written file.
 
-- **`/proc/self/statm` semantics.** `proc(5)` Linux manpage, "/proc/[pid]/statm" section. Field 1 is *resident set size* in pages; multiplied by the page size ($4096$ on Linux/x86_64 and Linux/aarch64) it gives RSS in bytes. This is the basis for `read_process_rss_bytes()` in [Measurement §7](07-measurement.md).
+- **`/proc/self/statm` semantics.** `proc(5)` Linux manpage, "/proc/[pid]/statm" section. Field 1 is *resident set size* in pages; multiplied by the page size ($4096$ on `Linux/x86_64` and `Linux/aarch64`) it gives RSS in bytes. This is the basis for `read_process_rss_bytes()` in [Measurement §7](07-measurement.md).
 
 - **cgroup memory accounting.** [Linux Kernel cgroup-v2 documentation, "Memory Controller" section](https://www.kernel.org/doc/html/latest/admin-guide/cgroup-v2.html#memory). The probe walks `/sys/fs/cgroup/memory.max` and falls back to cgroup-v1 paths when v2 is unavailable. See `src/sysinfo.rs` for the path-walk implementation.
 

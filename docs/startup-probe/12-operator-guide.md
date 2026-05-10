@@ -88,7 +88,7 @@ The most informative log lines for probe diagnosis:
 |----------|-------------------|
 | `Memory detected available_bytes=... source=...` | Whether cgroup detection worked. `source=cgroup_v2` is normal in Fargate; `source=sysctl` means macOS or cgroups failed. |
 | `Workspace budget computed ... utilization_pct=...` | Final budget formula output; $> 90\%$ triggers a startup `WARN`. |
-| `Probe cache fingerprint mismatch; will re-probe` | Cache was present but did not match — what changed? (model, max_seq, arch, server_version) |
+| `Probe cache fingerprint mismatch; will re-probe` | Cache was present but did not match — what changed? (model, `max_seq`, arch, `server_version`) |
 | `Probe: skipping shape (estimated to exceed rss_ceiling)` | OOM-protection layer in §6 — typically benign on small containers. |
 | `Probe shape failed; skipping batch=N seq=N error=...` | A shape errored at runtime; if `seq` matches `MAX_SEQ`, the model variant is incompatible with that length. |
 | `Probe: fitted cost model a=... b=... data_points=...` | Successful fit; record $a$, $b$, and the data-point count for future comparison. |

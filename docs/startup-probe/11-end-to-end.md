@@ -118,7 +118,7 @@ After the cold start above, `GET /health` returns:
 | `tuning.b_bytes_per_token_sq` | OLS fit | The fitted quadratic coefficient |
 | `tuning.max_workspace_bytes` | Workspace-budget formula | Per-worker workspace ceiling enforced by the bin-packer |
 | `tuning.probe_status` | `state.probe_status.load()` | Lifecycle state |
-| `tuning.memory_source` | `detect_available_memory()` | Where the budget formula obtained its `available_bytes` (cgroup_v1, cgroup_v2, sysctl, override) |
+| `tuning.memory_source` | `detect_available_memory()` | Where the budget formula obtained its `available_bytes` (`cgroup_v1`, `cgroup_v2`, sysctl, override) |
 | `tuning.available_bytes` | Same | The detected (or overridden) available memory |
 | `tuning.model_rss_bytes_per_worker` | Layer 2 median RSS delta | Per-worker model + arena baseline |
 | `tuning.worst_case_peak_bytes` | $N \times \text{workspace} + N \times \text{model\_rss} + \text{OS\_HEADROOM}$ | Absolute worst case; must remain below `available_bytes` |
