@@ -490,6 +490,7 @@ async fn main() -> anyhow::Result<()> {
     if want_json {
         tracing_subscriber::fmt()
             .json()
+            .with_current_span(true)
             .with_env_filter(env_filter)
             .try_init()
             .ok();
