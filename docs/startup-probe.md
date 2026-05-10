@@ -60,6 +60,8 @@ uv run python scripts/render_all.py             # static PNGs
 uv run python scripts/render_all.py --animated  # also produce GIFs
 ```
 
+Three interactive Jupyter notebooks at [`tools/visuals/notebooks/`](../tools/visuals/notebooks/) supplement specific pages with slider-driven exploration: cost decomposition (§2), workspace budget sizing (§3), and conditioning (§5). See [`tools/visuals/README.md`](../tools/visuals/README.md) for setup.
+
 ## Audience
 
 This series is intended for three audiences. Operators tuning deployments will find the most directly applicable material in the [Overview](startup-probe/01-overview.md) and the [Operator guide](startup-probe/12-operator-guide.md). Contributors editing `src/probe.rs` or `src/binpack.rs` should follow the mathematical chain from page 02 through page 06. Reviewers auditing the auto-budget logic will find each page is a self-contained examination of one piece, with explicit references back to the implementation.

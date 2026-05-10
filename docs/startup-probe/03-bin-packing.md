@@ -152,6 +152,19 @@ impl CostModel {
 }
 ```
 
+## Interactive exploration
+
+The companion notebook [`tools/visuals/notebooks/02_workspace_budget_calculator.ipynb`](../../tools/visuals/notebooks/02_workspace_budget_calculator.ipynb) computes per-worker workspace and worst-case peak memory from operator-tunable parameters: worker count, per-worker model RSS, container memory, and safety factor. A traffic-light indicator flags configurations that approach the cgroup ceiling and a stacked bar chart decomposes the worst-case allocation.
+
+To run:
+
+```bash
+cd tools/visuals
+uv sync --group notebooks
+uv run python -m ipykernel install --user --name bge-m3-visuals --display-name "BGE-M3 Visuals"
+uv run jupyter notebook notebooks/02_workspace_budget_calculator.ipynb
+```
+
 ---
 
 ← [Previous: Cost decomposition](02-cost-decomposition.md) | [↑ Series overview](../startup-probe.md) | [Next: OLS fitting →](04-ols-fitting.md)

@@ -177,6 +177,19 @@ Without the preconditioner, the probe is functional only when $S_{\max} / S_{\mi
 
 One coordinate change, one line of code per accumulator.
 
+## Interactive exploration
+
+The companion notebook [`tools/visuals/notebooks/03_conditioning_visualiser.ipynb`](../../tools/visuals/notebooks/03_conditioning_visualiser.ipynb) morphs the OLS loss landscape as a function of column scale ratio. Sliding from $r = 1$ to $r = 8192$ reveals the geometric origin of the conditioning failure: the contour ellipses elongate along the $b$-axis at the same rate that the condition number $\kappa(G)$ grows. The Jacobi-normalised right panel remains near-circular regardless of $r$.
+
+To run:
+
+```bash
+cd tools/visuals
+uv sync --group notebooks
+uv run python -m ipykernel install --user --name bge-m3-visuals --display-name "BGE-M3 Visuals"
+uv run jupyter notebook notebooks/03_conditioning_visualiser.ipynb
+```
+
 ---
 
 ← [Previous: OLS fitting](04-ols-fitting.md) | [↑ Series overview](../startup-probe.md) | [Next: Probe shapes →](06-probe-shapes.md)

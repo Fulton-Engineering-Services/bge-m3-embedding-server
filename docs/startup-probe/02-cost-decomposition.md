@@ -126,6 +126,19 @@ A two-parameter fit requires at least two data points; with more, OLS minimises 
 
 A three-parameter extension (such as adding a $c \cdot S^3$ term) would force more probe shapes, lengthen the sweep, and would mostly fit measurement noise. The two-regime decomposition above already captures the dominant terms — and two terms is the minimum number required to model both the FFN-dominated low-$S$ regime and the attention-dominated high-$S$ regime separately.
 
+## Interactive exploration
+
+The companion notebook [`tools/visuals/notebooks/01_cost_decomposition_explorer.ipynb`](../../tools/visuals/notebooks/01_cost_decomposition_explorer.ipynb) provides slider-driven exploration of $W(S) = a \cdot S + b \cdot S^2$ at $B = 1$. Adjusting $a$ and $b$ shifts the crossover sequence length $S^* = a / b$ in real time and highlights the regime in which each coefficient dominates. Preset buttons recall the fitted coefficients (§7) and the conservative defaults (§8).
+
+To run:
+
+```bash
+cd tools/visuals
+uv sync --group notebooks
+uv run python -m ipykernel install --user --name bge-m3-visuals --display-name "BGE-M3 Visuals"
+uv run jupyter notebook notebooks/01_cost_decomposition_explorer.ipynb
+```
+
 ---
 
 ← [Previous: Overview](01-overview.md) | [↑ Series overview](../startup-probe.md) | [Next: Bin-packing →](03-bin-packing.md)
