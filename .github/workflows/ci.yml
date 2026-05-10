@@ -126,3 +126,23 @@ jobs:
           hawkeye --version
       - name: Check license headers
         run: hawkeye check
+
+  python-tools:
+    name: Python Tools (probe-visuals)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: tools/probe-visuals
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+      - uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b  # v8.1.0
+        with:
+          python-version: "3.13"
+      - name: Install dependencies
+        run: uv sync
+      - name: Ruff lint
+        run: uv run ruff check src scripts
+      - name: Ruff format check
+        run: uv run ruff format --check src scripts
+      - name: Import smoke test
+        run: uv run python -c "from probe_visuals import common; print('probe_visuals importable ok')"
