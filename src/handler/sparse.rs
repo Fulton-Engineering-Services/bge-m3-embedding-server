@@ -1,0 +1,67 @@
+use std::sync::Arc;
+use std::time::Instant;
+
+use axum::{extract::State, Json};
+
+use super::common::{check_ready, validate_input};
+use crate::error::AppError;
+use crate::models::{SparseEmbeddingData, SparseRequest, SparseResponse, SparseValues};
+use crate::state::AppState;
+
+#[allow(clippy::cast_possible_truncation)]
+#[tracing::instrument(
+    skip(state, req),
+    fields(batch_size, chunks, max_chunk_seq, tokenize_ms, inference_ms, total_ms)
+)]
+pub async fn sparse_embeddings(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<SparseRequest>,
+) -> Result<Json<SparseResponse>, AppError> {
+    check_ready(&state)?;
+    let texts = req.input.0;
+    validate_input(&texts, state.max_batch)?;
+    let batch_size = texts.len();
+    tracing::Span::current().record("batch_size", batch_size);
+
+    let t0 = Instant::now();
+
+    let _permit = Arc::clone(&state.request_permits)
+        .acquire_owned()
+        .await
+        .expect("request semaphore is never closed");
+
+    let (embeddings, embed_stats) = state.pool.sparse(texts).await?;
+
+    let total_ms = u64::try_from(t0.elapsed().as_millis()).unwrap_or(u64::MAX);
+    tracing::Span::current()
+        .record("chunks", embed_stats.chunks)
+        .record("max_chunk_seq", embed_stats.max_chunk_seq)
+        .record("tokenize_ms", embed_stats.tokenize_ms)
+        .record("inference_ms", embed_stats.inference_ms)
+        .record("total_ms", total_ms);
+    tracing::info!(
+        route = "sparse",
+        batch_size,
+        chunks = embed_stats.chunks,
+        max_chunk_seq = embed_stats.max_chunk_seq,
+        total_token_positions = embed_stats.total_token_positions,
+        tokenize_ms = embed_stats.tokenize_ms,
+        inference_ms = embed_stats.inference_ms,
+        total_ms,
+        "embedding request complete"
+    );
+
+    let data = embeddings
+        .into_iter()
+        .enumerate()
+        .map(|(index, emb)| SparseEmbeddingData {
+            index,
+            sparse_values: SparseValues {
+                indices: emb.indices.iter().map(|i| *i as u32).collect(),
+                values: emb.values,
+            },
+        })
+        .collect();
+
+    Ok(Json(SparseResponse { data }))
+}
