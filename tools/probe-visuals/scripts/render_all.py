@@ -54,6 +54,7 @@ FIGURES = [
 
 
 ANIMATED_FIGURES = [
+    "fig02_workspace_surface_animated",
     "fig03_ols_geometry_animated",
     "fig04_loss_landscape_animated",
     "fig07_probe_shape_animated",
@@ -65,7 +66,7 @@ def main() -> int:
     parser.add_argument(
         "--animated",
         action="store_true",
-        help="Also render animated GIFs (fig03, fig04, fig07).",
+        help="Also render animated GIFs (fig02, fig03, fig04, fig07).",
     )
     args = parser.parse_args()
 
@@ -93,12 +94,14 @@ def main() -> int:
     if args.animated:
         print("\n--- Animated GIFs ---")
         from probe_visuals.figures import (  # noqa: PLC0415
+            fig02_workspace_surface_animated,
             fig03_ols_geometry_animated,
             fig04_loss_landscape_animated,
             fig07_probe_shape_animated,
         )
 
         anim_modules = [
+            ("fig02_workspace_surface_animated", fig02_workspace_surface_animated),
             ("fig03_ols_geometry_animated", fig03_ols_geometry_animated),
             ("fig04_loss_landscape_animated", fig04_loss_landscape_animated),
             ("fig07_probe_shape_animated", fig07_probe_shape_animated),
