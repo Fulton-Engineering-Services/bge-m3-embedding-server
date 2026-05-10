@@ -146,8 +146,7 @@ pub(crate) fn save_probe_cache(
 ) {
     let fitted_at_unix = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+        .map_or(0, |d| d.as_secs());
 
     let cache = ProbeCache {
         schema_version: 1,
