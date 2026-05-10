@@ -63,6 +63,7 @@ impl CostModel {
     ///   = 134 217 728 + 33 554 432
     ///   = 167 772 160 ≈ 160 MB per chunk (workers run sequentially inside one worker).
     pub const CONSERVATIVE_A: f64 = 16_384.0; // 16 KiB per token-position
+    /// Conservative quadratic coefficient (bytes per token-position squared).
     pub const CONSERVATIVE_B: f64 = 8.0; // 8 bytes per token-position^2
 
     /// Default maximum workspace per worker when memory cannot be detected.

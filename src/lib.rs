@@ -18,6 +18,16 @@
 //! orchestration logic lives here so it can be unit-tested and reused from
 //! integration tests without spawning the binary.
 
+// Rustdoc lints — enforce documentation quality
+#![warn(missing_docs)]
+#![warn(rustdoc::missing_crate_level_docs)]
+#![warn(rustdoc::unescaped_backticks)]
+#![deny(rustdoc::broken_intra_doc_links)]
+#![deny(rustdoc::invalid_html_tags)]
+#![deny(rustdoc::bare_urls)]
+#![warn(rustdoc::redundant_explicit_links)]
+#![warn(rustdoc::private_doc_tests)]
+
 pub mod binpack;
 pub mod bootstrap;
 pub mod config;
