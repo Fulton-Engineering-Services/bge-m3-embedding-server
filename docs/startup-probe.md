@@ -377,7 +377,7 @@ This protects the probe itself from the OOM it's trying to predict. On a small c
 
 ---
 
-## 8. Measurement Pipeline — Synthesizing Texts and Reading RSS
+## 8. Measurement Pipeline — Synthesizing Texts and Reading RSS (Resident Set Size)
 
 ### 8.1 Synthesizing inputs
 
@@ -407,9 +407,11 @@ The corpus is the same fixture used by the benchmarks (`benches/fixtures/corpus.
 
 The resulting tokenized lengths are *approximate*. The tokenizer truncates to the configured `max_seq_length` upper bound, so the probe shape `(B, S)` becomes "B texts, each padded to at most S tokens" — which is exactly what the bin-packer needs to predict.
 
-### 8.2 Measuring RSS
+### 8.2 Measuring RSS (Resident Set Size) — two layers
 
-The probe wraps each `session.run()` with two RSS reads:
+RSS is measured at two points in the startup sequence, serving two different purposes.
+
+**Layer 1 — Per-shape workspace measurement (inside `probe_run_dense`).**  The probe wraps each `session.run()` with RSS reads taken immediately before and after the call:
 
 ```582:606:src/embedder.rs
 pub(crate) fn probe_run_dense(
@@ -427,6 +429,32 @@ pub(crate) fn probe_run_dense(
     })
 }
 ```
+
+These per-shape deltas feed the OLS fit and determine `(a, b)`.
+
+**Layer 2 — Per-worker model-weight footprint (inside `run_worker`).**  Each worker measures its own RSS immediately *before* and *after* calling `load_models()`, inside the `spawn_blocking` thread where the ORT session is actually created:
+
+```700:726:src/embedder.rs
+    let pre_load_rss = sysinfo::read_process_rss_bytes().unwrap_or(0);
+    let initial_models = match load_models(...) {
+        Ok(models) => { ... models }
+        Err(e) => { ... }
+    };
+    let post_load_rss = sysinfo::read_process_rss_bytes().unwrap_or(pre_load_rss);
+    let rss_delta = post_load_rss.saturating_sub(pre_load_rss);
+    let _ = rt.block_on(ready_tx.send(Ok(rss_delta)));
+```
+
+The `ready_tx` channel carries `Result<usize>` (the delta in bytes). `EmbedPool::spawn` collects all worker deltas and stores the maximum via `AtomicUsize::fetch_max`. The caller reads `state.pool.model_rss_max_bytes()` to get the per-worker model footprint used in the workspace-budget formula:
+
+```
+total_workspace = available − N×model_rss_max_bytes − OS_HEADROOM
+per_worker_workspace = total_workspace × safety_factor / N
+```
+
+Taking the *max* across workers (rather than the mean or the leader's delta alone) is conservative — it protects against the occasional noisy reading that underestimates the true footprint.
+
+**Why this matters.**  The alternative (reading RSS twice immediately after all workers have finished loading) measures near-zero because both reads happen at the same instant with the model already resident. That approach was the root cause of the 2026-05-09 OOM: with `model_rss_per_worker ≈ 0`, the workspace formula over-budgeted each worker by ~760 MB at 7 workers on a 28 GB Fargate task.
 
 `read_process_rss_bytes()` parses field 1 of `/proc/self/statm` (RSS in pages) and multiplies by the page size (4096 on Linux/x86_64 and Linux/aarch64). The delta `rss_after - rss_before` is the RSS growth attributable to the call.
 
@@ -590,7 +618,23 @@ Setting `BGE_M3_DISABLE_PROBE_CACHE=1` forces a fresh probe even when a valid ca
 
 ## 11. Background Execution and Lock-Free Handoff
 
-The probe takes long enough (~120 s on a cache miss) that blocking startup on it would stall liveness probes and delay rolling-update completion. The implementation runs the probe in a Tokio task and updates the cost model atomically:
+The probe takes long enough (~120 s on a cache miss) that blocking startup on it would stall liveness probes and delay rolling-update completion. The implementation runs the probe in a Tokio task and updates the cost model atomically.
+
+### 11.0 Concurrency gate during the probe window
+
+Because the probe runs on one of the live workers while the server is already accepting traffic, a careless deployment could saturate all workers with real requests and leave none free for the probe shape — or, worse, the probe's `(1, max_seq)` shape could compete with max-size client requests and push peak RSS beyond the container limit before the fitted budget is known.
+
+To prevent this, `AppState` holds a `tokio::sync::Semaphore` (`request_permits`) that gates the three embedding handlers:
+
+```86:93:src/handler.rs
+    let _permit = Arc::clone(&state.request_permits)
+        .acquire_owned()
+        .await
+        .expect("request semaphore is never closed");
+    let embeddings = state.pool.dense(texts).await?;
+```
+
+The semaphore is initialized to `max(cfg_workers − 1, 1)` permits at startup, reserving one worker slot for the probe. On every *terminal* probe-status transition — `Disabled` (cost-model override applied), `CacheHit` (EFS cache hit applied), `Complete` or `Failed` (background probe done) — `add_permits(1)` raises the count to `cfg_workers`, restoring full concurrency. Requests that arrive during the probe window simply queue on the semaphore rather than being rejected; the additional latency is at most the time for one probe shape to complete.
 
 ```161:194:src/main.rs
         } else {
@@ -686,13 +730,15 @@ A representative cold-start trace at default settings on a 28 GB Fargate task:
 [INFO] Starting bge-m3-embedding-server bind=0.0.0.0:8081 workers=7 max_seq=8192 model=Fp16
 [INFO] Phase 1/4 git: cloning model files                                  ┐
 [INFO] Phase 4/4 saveAll: tokenizer + dense + sparse loaded                │ leader-first
-[INFO] Leader worker ready, model cache warm (1/7)                         │ §10 cold-start.md
+[INFO] Leader worker ready, model cache warm rss_delta_mb=1100 (1/7)       │ §8.2 worker-reported
 [INFO] Workers 1..7 loaded from warm cache                                 ┘
 [INFO] Memory detected available_bytes=28991029248 source=cgroup_v2
-[INFO] Estimated model RSS per worker model_rss_per_worker_mb=1100
+[INFO] Measured model RSS per worker model_rss_per_worker_mb=1100          ← pool.model_rss_max_bytes()
+[INFO] Workspace budget computed worst_case_peak_mb=21504 available_mb=27000
+        utilization_pct=75.5 per_worker_workspace_mb=2044                  ← §11.0
 [INFO] Probe cache fingerprint mismatch; will re-probe                     ┐
-[INFO] Starting memory probe max_seq=8192 rss_ceiling_mb=2500              │ probe sweep
-[INFO] Probe shape measured batch=1 seq=64 rss_delta_mb=2                  │ §8
+[INFO] Starting memory probe max_seq=8192 rss_ceiling_mb=2044              │ probe sweep
+[INFO] Probe shape measured batch=1 seq=64 rss_delta_mb=2                  │ §8.1
 [INFO] Probe shape measured batch=4 seq=64 rss_delta_mb=8                  │
 [INFO] Probe shape measured batch=1 seq=256 rss_delta_mb=6                 │
 [INFO] Probe shape measured batch=1 seq=1024 rss_delta_mb=27               │
@@ -716,14 +762,18 @@ After this, `GET /health` returns:
   "tuning": {
     "a_bytes_per_token": 18432.0,
     "b_bytes_per_token_sq": 6.2,
-    "max_workspace_bytes": 2500000000,
+    "max_workspace_bytes": 2044000000,
     "probe_status": "complete",
     "memory_source": "cgroup_v2",
     "available_bytes": 28991029248,
-    "model_rss_bytes_per_worker": 1100000000
+    "model_rss_bytes_per_worker": 1100000000,
+    "worst_case_peak_bytes": 21533073408,
+    "utilization_pct": 74.3
   }
 }
 ```
+
+`worst_case_peak_bytes` is `N × per_worker_workspace + N × model_rss + OS_HEADROOM`. A value above 90% of `available_bytes` triggers a startup `WARN`. At 74% with accurate `model_rss_bytes_per_worker`, the production 7-worker fp16 config has adequate headroom.
 
 On the *next* cold start (cache hit), the probe sweep is skipped:
 
@@ -774,9 +824,20 @@ The asymmetry of conservatism is intentional: bin-packing under-counting is a sl
 ### 14.1 Diagnosing probe state
 
 `curl http://host:8081/health | jq '.tuning'` shows:
-- `probe_status` — pinpoints which path was taken (cache_hit / complete / failed / running / disabled).
-- `(a_bytes_per_token, b_bytes_per_token_sq)` — the live coefficients. Compare against typical values (~18 KiB / ~6 for fp16 amd64).
-- `max_workspace_bytes` — the per-worker budget the bin-packer uses.
+
+| Field | Typical value (fp16, 7 workers, 28 GB) | Meaning |
+|-------|----------------------------------------|---------|
+| `probe_status` | `complete` | Which probe path was taken: `cache_hit`, `complete`, `failed`, `running`, `disabled`. |
+| `a_bytes_per_token` | ~18 432 | Fitted linear coefficient (FFN term). |
+| `b_bytes_per_token_sq` | ~6.2 | Fitted quadratic coefficient (attention term). |
+| `max_workspace_bytes` | ~2.0 GB | Per-worker bin-packing budget derived from available memory. |
+| `model_rss_bytes_per_worker` | ~1 100 000 000 | Peak RSS delta measured by each worker during `load_models()`. Was 0 before the 2026-05-09 fix. |
+| `worst_case_peak_bytes` | ~21.5 GB | `N×workspace + N×model_rss + OS_HEADROOM`. Must be below `available_bytes`. |
+| `utilization_pct` | ~74% | `worst_case_peak / available × 100`. A `WARN` fires at startup if > 90%. |
+
+If `model_rss_bytes_per_worker` is 0 on Linux, the worker RSS measurement failed (non-Linux platform or `/proc/self/statm` unreadable). The budget formula still runs but deducts 0 for model weights — use `BGE_M3_MEMORY_SAFETY_FACTOR=0.5` as a stopgap and file a bug.
+
+If `worst_case_peak_bytes > available_bytes`, the container is over-subscribed. Reduce `BGE_M3_WORKERS` or `BGE_M3_MEMORY_SAFETY_FACTOR` before the OOM kill happens.
 
 ### 14.2 Forcing a fresh probe
 

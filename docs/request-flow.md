@@ -38,6 +38,9 @@ sequenceDiagram
         Handler-->>Client: 400 Bad Request
     end
 
+    Handler->>State: acquire request_permits (Semaphore)
+    Note right of State: Starts at N-1 permits during probe;<br/>raised to N on probe completion.<br/>Queues request if all slots busy.
+
     Handler->>Pool: pool.dense(texts)
     Pool->>Channel: send(EmbedRequest::Dense { texts, reply_tx })
     Channel->>Worker: recv() — next idle worker picks up
@@ -112,6 +115,7 @@ graph TD
     Deser["JSON Deserialization<br/>(Axum extractor)"]
     Ready["check_ready()<br/>ready flag + live workers"]
     Validate["validate_input()<br/>batch size + char limits"]
+    Permit["acquire_owned()<br/>request_permits Semaphore"]
     Pool["EmbedPool dispatch"]
 
     Req --> Body
@@ -122,7 +126,8 @@ graph TD
     Ready -->|"Not ready"| R503["503 Service Unavailable"]
     Ready -->|"OK"| Validate
     Validate -->|"Invalid"| R400b["400 Bad Request"]
-    Validate -->|"OK"| Pool
+    Validate -->|"OK"| Permit
+    Permit -->|"Queues if N-1 slots busy during probe"| Pool
     Pool --> Inference["Worker Inference<br/>(tokenize-once + bin-pack)"]
 
     classDef errorNode fill:#f96,stroke:#333,stroke-width:2px
@@ -138,6 +143,7 @@ graph TD
 | Readiness | `check_ready()` | `ready == true` AND `live_workers > 0` | 503 |
 | Batch size | `validate_input()` | `1..=BGE_M3_MAX_BATCH` | 400 |
 | String length | `validate_input()` | `≤ 32768` chars per text | 400 |
+| Concurrency | `request_permits` Semaphore | `max(N-1, 1)` in-flight during probe; `N` after probe completes | queued (not rejected) |
 
 Note: `BGE_M3_MAX_SEQ_LENGTH` (default 8192 tokens) caps how many tokens
 are actually embedded — the tokenizer silently truncates any text that
