@@ -7,8 +7,8 @@ backports — please upgrade to the latest release.
 
 | Version | Supported |
 |---------|-----------|
-| 0.14.x  | ✓         |
-| < 0.14  | ✗         |
+| 1.x.x   | ✓         |
+| < 1.0   | ✗         |
 
 ## Reporting a Vulnerability
 
