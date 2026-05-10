@@ -80,7 +80,7 @@ If a future model architecture introduces a meaningfully cubic term — some lon
 
 ## Where the seven measurements come from
 
-The probe sweeps six fixed shapes plus a dynamic $(1, \texttt{max\_seq})$ shape:
+The probe sweeps six fixed shapes plus a dynamic $(1, \text{max\_seq})$ shape:
 
 ```
 (1,   64)    linear anchor

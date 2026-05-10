@@ -36,7 +36,7 @@ This is the failure mode that the test `fit_cost_model_production_scale_16_shape
 
 ## The chosen seven
 
-The probe sweeps six fixed shapes plus a dynamic $(1, \texttt{max\_seq})$ shape:
+The probe sweeps six fixed shapes plus a dynamic $(1, \text{max\_seq})$ shape:
 
 ```64:72:src/probe/runner.rs
 const PROBE_SHAPES: &[Shape] = &[
@@ -60,7 +60,7 @@ Each shape has a specific role:
 | $(1, 1024)$ | Mid-range | Bridges linear and quadratic regimes. Improves leverage on $(a, b)$ jointly. |
 | $(1, 2048)$ | Mid-range | Improves the conditioning of the (normalised) Gram matrix — adds spread along the diagonal of design space. |
 | $(1, 4096)$ | Quadratic anchor | Quadratic term is roughly $50\%$ of total cost. Strong leverage on $b$. |
-| $(1, \texttt{max\_seq})$ | Quadratic anchor | Dynamic — sized to the configured upper bound. Dominant $b$ measurement. Doubles as a soft capability check (errors are skipped, not fatal). |
+| $(1, \text{max\_seq})$ | Quadratic anchor | Dynamic — sized to the configured upper bound. Dominant $b$ measurement. Doubles as a soft capability check (errors are skipped, not fatal). |
 
 ### Why $(4, 64)$ is the decisive shape
 

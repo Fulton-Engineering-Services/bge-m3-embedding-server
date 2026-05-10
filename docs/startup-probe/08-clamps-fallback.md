@@ -51,9 +51,9 @@ The capability check is split into a cheap synchronous shape validation at start
 
 ### Stage 1: `validate_max_seq_shape`
 
-A synchronous, cheap check that runs at the start of `run_probe`. It constructs `input_ids` and `attention_mask` ndarrays at shape $(1, \texttt{max\_seq})$ and discards them. The check confirms that `max_seq` fits within `usize` bounds and that ndarray can allocate the 2-D layout. It cannot detect ONNX positional-embedding bounds — only that the OS can allocate the input tensors at all. This stage catches typos (e.g., setting `MAX_SEQ_LENGTH` to a number that overflows `usize`) before the probe wastes time on later stages.
+A synchronous, cheap check that runs at the start of `run_probe`. It constructs `input_ids` and `attention_mask` ndarrays at shape $(1, \text{max\_seq})$ and discards them. The check confirms that `max_seq` fits within `usize` bounds and that ndarray can allocate the 2-D layout. It cannot detect ONNX positional-embedding bounds — only that the OS can allocate the input tensors at all. This stage catches typos (e.g., setting `MAX_SEQ_LENGTH` to a number that overflows `usize`) before the probe wastes time on later stages.
 
-### Stage 2: $(1, \texttt{max\_seq})$ probe shape (dynamic, soft)
+### Stage 2: $(1, \text{max\_seq})$ probe shape (dynamic, soft)
 
 Added to the probe sweep at runtime. Runs after the warm-up and the static shapes. The error path logs and skips, *not* fail-fast:
 
@@ -92,9 +92,9 @@ Every failure path leads to a functional server with conservative budgets. The c
 
 The chosen values:
 
-- **$\texttt{CONSERVATIVE\_A} = 16\,384$** is roughly the legacy assumption: $16\,\text{KiB}$ of FFN/projection workspace per token-position. Slightly higher than typical fitted values (${\sim}18\,\text{KB}$), so the bin-packer will pack a bit fewer texts than ideal but never overshoot.
-- **$\texttt{CONSERVATIVE\_B} = 8$** is intentionally pessimistic — about $1.3\times$ the typical fitted $b \approx 6.2$. At $S = 8192$, this means the conservative model predicts ${\sim}30\%$ more workspace than the fitted model would, so chunks are smaller and chunk count is higher. Slow but safe.
-- **$\texttt{DEFAULT\_MAX\_WORKSPACE} = 2\,\text{GiB}$** is a per-worker budget calibrated for the Fargate $28\,\text{GiB}$ / 7-worker production layout. On smaller containers, the auto-budget recalculates this from `available − N × model_rss − OS_HEADROOM`.
+- **$\text{CONSERVATIVE\_A} = 16\,384$** is roughly the legacy assumption: $16\,\text{KiB}$ of FFN/projection workspace per token-position. Slightly higher than typical fitted values (${\sim}18\,\text{KB}$), so the bin-packer will pack a bit fewer texts than ideal but never overshoot.
+- **$\text{CONSERVATIVE\_B} = 8$** is intentionally pessimistic — about $1.3\times$ the typical fitted $b \approx 6.2$. At $S = 8192$, this means the conservative model predicts ${\sim}30\%$ more workspace than the fitted model would, so chunks are smaller and chunk count is higher. Slow but safe.
+- **$\text{DEFAULT\_MAX\_WORKSPACE} = 2\,\text{GiB}$** is a per-worker budget calibrated for the Fargate $28\,\text{GiB}$ / 7-worker production layout. On smaller containers, the auto-budget recalculates this from `available − N × model_rss − OS_HEADROOM`.
 
 When the cost model is built from `CostModel::conservative(max_workspace_bytes)`, the bin-packer is fully usable — just tuned for safety over throughput.
 
@@ -107,7 +107,7 @@ Every failure path lands in one of these cells:
 | RSS reads return 0 (non-Linux) | All-zero delta detection; fit skipped | `failed` | Conservative defaults; server functional |
 | Warm-up $(1, 64)$ errors | Log warning, proceed without warm-up | depends on sweep | First-shape delta will include arena init noise; fit may fail |
 | One probe shape errors mid-sweep | Skip that data point, continue | `complete` (if others succeed) | Fit may be slightly less accurate |
-| $(1, \texttt{max\_seq})$ errors (model incompatibility) | Skip + warn (no fail-fast) | `complete` (if others succeed) | First real `/v1/embeddings` request surfaces ORT error; operator changes model or lowers `MAX_SEQ_LENGTH` |
+| $(1, \text{max\_seq})$ errors (model incompatibility) | Skip + warn (no fail-fast) | `complete` (if others succeed) | First real `/v1/embeddings` request surfaces ORT error; operator changes model or lowers `MAX_SEQ_LENGTH` |
 | All shapes skipped by RSS-cap guard | Emit diagnostic with `current_rss` + `cgroup_limit` | `failed` | Conservative defaults; check cgroup detection |
 | `validate_max_seq_shape` ndarray fails | Would be a Rust panic (usize overflow); unreachable in practice | — | — |
 | OLS Gram is singular | `fit_cost_model` returns `None` | `failed` | Conservative defaults |

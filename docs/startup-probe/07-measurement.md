@@ -10,7 +10,7 @@ The second question matters because ORT does not expose its workspace allocator 
 
 ![Figure 9 — Scatter: x-axis is sequence length S; y-axis is RSS delta in MB; seven measured probe points (dots) overlaid on the fitted quadratic curve y = a·B·S + b·B·S² (solid line) and the conservative-defaults curve (dashed); residuals visible as the gap between dots and curve.](../figures/startup-probe/fig09_fit_quality.png)
 
-Figure 9 plots the seven probe measurements (filled dots) against the cost model's prediction. The solid curve is $y = a \cdot B \cdot S + b \cdot B \cdot S^2$ with the fitted $(a, b)$. The dashed curve uses the conservative defaults $(\texttt{CONSERVATIVE\_A}, \texttt{CONSERVATIVE\_B})$ for comparison. Each dot's vertical distance to the solid curve is the residual that OLS minimises.
+Figure 9 plots the seven probe measurements (filled dots) against the cost model's prediction. The solid curve is $y = a \cdot B \cdot S + b \cdot B \cdot S^2$ with the fitted $(a, b)$. The dashed curve uses the conservative defaults $(\text{CONSERVATIVE\_A}, \text{CONSERVATIVE\_B})$ for comparison. Each dot's vertical distance to the solid curve is the residual that OLS minimises.
 
 A good fit appears as dots scattered tightly around the solid curve with no systematic over- or under-prediction at any sequence-length range. The fitted curve sits well below the conservative-defaults curve at most points, which represents the throughput win — the bin-packer can pack more aggressively with the fitted model than with the conservative one.
 
