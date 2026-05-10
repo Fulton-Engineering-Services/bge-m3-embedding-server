@@ -89,7 +89,7 @@ $$
 
 This is the cost model in [`src/binpack.rs`](../src/binpack.rs):
 
-```17:30:src/binpack.rs
+```26:44:src/binpack.rs
 /// where `a` (bytes/token-position) captures the FFN / projection contribution
 /// and `b` (bytes/token-position^2) captures the attention contribution.
 ///
@@ -101,7 +101,7 @@ This is the cost model in [`src/binpack.rs`](../src/binpack.rs):
 /// conservatively from compile-time defaults when measurement is unavailable.
 #[derive(Clone, Copy, Debug)]
 #[cfg_attr(test, derive(PartialEq))]
-pub(crate) struct CostModel {
+pub struct CostModel {
     /// Bytes per token-position (linear term: FFN intermediates, projections).
     pub a: f64,
     /// Bytes per token-position-squared (quadratic term: attention scores).
@@ -137,7 +137,7 @@ The model is "wrong but useful" in the George Box sense: it captures the two reg
 
 The fitted `(a, b)` are wrapped in a `CostModel` along with `max_workspace_bytes` (the per-worker workspace ceiling derived from container memory):
 
-```32:60:src/binpack.rs
+```46:59:src/binpack.rs
 impl CostModel {
     /// Conservative static defaults calibrated so a `(16, 512)` chunk lands at
     /// ~140 MB workspace — matching the old static budget at the previous default
@@ -156,7 +156,7 @@ impl CostModel {
 
 Two predicates drive the bin-packer:
 
-```78:88:src/binpack.rs
+```92:102:src/binpack.rs
     pub fn chunk_cost(&self, count: usize, max_seq: usize) -> u128 {
         let n = count as u128 * max_seq as u128;
         let linear = (self.a * n as f64) as u128;
@@ -265,7 +265,7 @@ $$
 
 Solve OLS in `(α, β)` space — both columns are now in `[0, 1]`, so the Gram-matrix entries are all `O(n)`-scale and the determinant test compares like-to-like:
 
-```363:392:src/probe.rs
+```75:104:src/probe/fit.rs
     // Build normalized Gram matrix: n1 = x1/x1_max, n2 = x2/x2_max ∈ [0,1].
     // Variable names use single-letter prefixes to avoid clippy::similar_names
     // on the longer accumulator names (g11, g12, g22, gy1, gy2).
@@ -314,7 +314,7 @@ This is exactly a Jacobi (diagonal) preconditioner — the simplest case of prec
 
 A 2-coefficient OLS needs at least 2 distinct points; more points reduce noise but only if they carry *new information*. The probe sweeps **6 fixed shapes plus a dynamic `(1, max_seq)` shape**:
 
-```49:57:src/probe.rs
+```64:72:src/probe/runner.rs
 const PROBE_SHAPES: &[Shape] = &[
     (1, 64),   // linear anchor
     (4, 64),   // pairs with (1,256) for direct b isolation
@@ -371,7 +371,7 @@ Geometrically: the shapes form a roughly L-shaped distribution in `(N, M) = (B·
 
 Each shape is checked against a *conservative* model before dispatch:
 
-```231:243:src/probe.rs
+```180:195:src/probe/runner.rs
     for (batch, seq) in &shapes {
         let batch = *batch;
         let seq = *seq;
@@ -381,8 +381,11 @@ Each shape is checked against a *conservative* model before dispatch:
         if !conservative.fits(batch, seq) {
             info!(
                 batch,
-                seq, "Probe: skipping shape (estimated to exceed rss_ceiling)"
+                seq,
+                rss_ceiling_mb = rss_ceiling / (1024 * 1024),
+                "Probe: skipping shape (estimated to exceed rss_ceiling)"
             );
+            shapes_skipped += 1;
             continue;
         }
 ```
@@ -397,7 +400,7 @@ This protects the probe itself from the OOM it's trying to predict. On a small c
 
 The probe needs `B` texts each tokenizing to approximately `S` tokens. The probe doesn't have a tokenizer handy (it lives in the worker), so it approximates: at ~4 chars/token for natural English, a `S`-token input is ~`4S` characters. The probe synthesizes batches by repeating curated corpus snippets and trimming:
 
-```465:481:src/probe.rs
+```53:69:src/probe/corpus.rs
 fn synthesize_texts(corpus: &[String], batch: usize, target_seq: usize) -> Vec<String> {
     let target_chars = target_seq.saturating_mul(4).max(16);
     (0..batch)
@@ -427,15 +430,22 @@ RSS is measured at two points in the startup sequence, serving two different pur
 
 **Layer 1 — Per-shape workspace measurement (inside `probe_run_dense`).**  The probe wraps each `session.run()` with RSS reads taken immediately before and after the call:
 
-```582:606:src/embedder.rs
+```85:109:src/embedder/worker.rs
 pub(crate) fn probe_run_dense(
-    session: &Session,
-    tokenizer: &Tokenizer,
-    texts: Vec<String>,
-    max_seq: usize,
+    session: &mut ort::session::Session,
+    ids_array: &ndarray::Array2<i64>,
+    mask_array: &ndarray::Array2<i64>,
 ) -> Result<ProbeResult> {
     let rss_before = sysinfo::read_process_rss_bytes().unwrap_or(0);
-    // ... build_chunk_arrays, session.run() ...
+    let ids_tensor = TensorRef::from_array_view(ids_array.view()).map_err(ort_err)?;
+    let mask_tensor = TensorRef::from_array_view(mask_array.view()).map_err(ort_err)?;
+    // Run inference (output discarded — we only care about RSS).
+    let _outputs = session
+        .run(ort::inputs! {
+            "input_ids" => ids_tensor,
+            "attention_mask" => mask_tensor,
+        })
+        .map_err(ort_err)?;
     let rss_after = sysinfo::read_process_rss_bytes().unwrap_or(rss_before);
     Ok(ProbeResult {
         rss_before,
@@ -448,16 +458,18 @@ These per-shape deltas feed the OLS fit and determine `(a, b)`.
 
 **Layer 2 — Per-worker model-weight + arena-baseline footprint (inside `run_worker`).**  Each worker measures its own RSS immediately *before* `load_models()` and *after* a per-worker arena-priming `session.run()`, inside the `spawn_blocking` thread where the ORT session is actually created:
 
-```src/embedder.rs
+```src/embedder/worker.rs
     let pre_load_rss = sysinfo::read_process_rss_bytes().unwrap_or(0);
     let initial_models = match load_models(...) {
         Ok(mut models) => {
-            // rc7: prime the ORT session arena before measuring post_load_rss.
-            // ORT lazily allocates ~1 GiB of arena bookkeeping on the first
-            // session.run() per session. Including that allocation in the
-            // per-worker RSS delta makes the workspace-budget math realistic
-            // and ensures the probe sweep sees clean per-shape deltas
-            // regardless of which worker the dispatcher routes each shape to.
+            // Prime the ORT session arena with a tiny session.run() BEFORE
+            // measuring post-load RSS. ORT lazily allocates ~1 GiB of arena
+            // bookkeeping on the first run() call regardless of input size;
+            // priming here folds that allocation into the per-worker model
+            // RSS measurement so the workspace-budget math sees the realistic
+            // per-worker memory footprint, AND so the probe sweep's per-shape
+            // rss_delta readings reflect only the incremental workspace
+            // attributable to that shape.
             let prime_ids = ndarray::Array2::<i64>::zeros((1, 8));
             let prime_mask = ndarray::Array2::<i64>::ones((1, 8));
             let _ = probe_run_dense(&mut models.0, &prime_ids, &prime_mask);
@@ -502,13 +514,13 @@ Two safety layers wrap the OLS output.
 
 ### 9.1 Coefficient clamping
 
-Even with a well-conditioned fit, measurement noise can produce values outside the physically reasonable range. We clamp:
+Even with a well-conditioned fit, measurement noise can produce values outside the physically reasonable range. Negative `b` is physically impossible (workspace decreasing as sequence grows) and signals a measurement bug — the fit returns `None` and conservative defaults apply. Negative `a` can arise legitimately when ORT switches attention kernels between sequence regimes, driving the fitter to subtract the quadratic prediction back out at low seq; in this case `a` is clamped to zero rather than rejecting the fit (rc8 fix):
 
-```404:425:src/probe.rs
-    // Reject negative coefficients — physically impossible.
-    if a_raw < 0.0 || b_raw < 0.0 {
+```143:153:src/probe/fit.rs
+    if b_raw < 0.0 {
         return None;
     }
+    let a_raw = a_raw.max(0.0);
 
     // Clamp to sane operational ranges.
     // a: [4 KiB, 256 KiB] per token-position
@@ -517,10 +529,10 @@ Even with a well-conditioned fit, measurement noise can produce values outside t
     let b = b_raw.clamp(0.01, 50_000.0);
 ```
 
-| Coefficient | Lower bound | Upper bound | Rationale |
-|-------------|-------------|-------------|-----------|
-| `a` | 4 KiB / token | 256 KiB / token | Below 4 KiB is implausibly small — suggests measurement saturated to zero. Above 256 KiB would cause vacuous packing budgets at any realistic batch size. |
-| `b` | 0.01 / token² | 50 000 / token² | Below ~0.01 makes the quadratic term negligible at `S=8192`; above 50 000 would force every long text into a single-element chunk. |
+| Coefficient | Negative handling | Lower bound | Upper bound | Rationale |
+|-------------|-------------------|-------------|-------------|-----------|
+| `a` | Clamped to 0 (not rejected) | 4 KiB / token | 256 KiB / token | ORT kernel discontinuities at mid-seq can produce negative `a_raw` while `b_raw` is valid. Clamping to 0 and letting the 4 KiB floor apply preserves the correct `b` and avoids falling back to conservative defaults. |
+| `b` | Returned as `None` → `failed` | 0.01 / token² | 50 000 / token² | Negative `b` is physically impossible — workspace cannot decrease as sequence grows. Returns `None`; conservative defaults apply. |
 
 A clamp is a *graceful degradation*: a fit that lands outside these bounds still produces a valid cost model, just one that is less aggressive than the noise might have suggested. Without clamping, an outlier RSS reading could push `b` to e.g. `1e9` and effectively disable batching for any sequence longer than a few tokens.
 
@@ -556,7 +568,7 @@ The probe takes ~120 s on a Fargate amd64 task at default settings, longer on sl
 
 The cache file at `{BGE_M3_CACHE_DIR}/probe-coefficients.json` carries enough metadata to know when the cached `(a, b)` are still valid:
 
-```72:82:src/probe.rs
+```25:35:src/probe/cache.rs
 #[derive(serde::Serialize, serde::Deserialize)]
 struct ProbeCache {
     schema_version: u32,
@@ -583,7 +595,7 @@ So changing memory or worker settings never invalidates the cache: only the prob
 
 Cache writes use a temp-file-plus-rename to avoid partial-write corruption:
 
-```168:189:src/probe.rs
+```123:143:src/probe/cache.rs
     let final_path = cache_dir.join("probe-coefficients.json");
     let tmp_path = cache_dir.join("probe-coefficients.json.tmp");
 
@@ -644,7 +656,7 @@ Because the probe measures process-wide RSS deltas (`/proc/self/statm`), any con
 
 `AppState` holds a `tokio::sync::Semaphore` (`request_permits`) that gates the three embedding handlers:
 
-```86:93:src/handler.rs
+```55:58:src/handler/dense.rs
     let _permit = Arc::clone(&state.request_permits)
         .acquire_owned()
         .await
@@ -702,7 +714,7 @@ The transition is lock-free and observation-consistent: any single worker either
 
 The companion field tracks the probe lifecycle:
 
-```12:50:src/state.rs
+```27:41:src/state.rs
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProbeStatus {
@@ -807,7 +819,7 @@ On the *next* cold start (cache hit), the probe sweep is skipped:
 
 The probe is designed so every failure path leads to a *functional* server with conservative budgets. The compile-time defaults are calibrated to match the legacy `BGE_M3_ONNX_BATCH_SIZE=16, MAX_SEQ_LENGTH=512` behaviour:
 
-```44:52:src/binpack.rs
+```58:65:src/binpack.rs
     pub const CONSERVATIVE_A: f64 = 16_384.0; // 16 KiB per token-position
     pub const CONSERVATIVE_B: f64 = 8.0; // 8 bytes per token-position^2
 
@@ -829,7 +841,8 @@ Every failure path leads to one of these cells:
 | All shapes skipped by RSS-cap guard | Emit diagnostic with current_rss + cgroup_limit | `failed` | Conservative defaults; check cgroup detection |
 | `validate_max_seq_shape` ndarray fails | Would be a Rust panic (usize overflow); unreachable in practice | — | — |
 | OLS Gram is singular | `fit_cost_model` returns `None` | `failed` | Conservative defaults |
-| Negative coefficient | `fit_cost_model` returns `None` | `failed` | Conservative defaults |
+| Negative `b` coefficient | `fit_cost_model` returns `None` (physically impossible) | `failed` | Conservative defaults |
+| Negative `a` coefficient | `a_raw` clamped to 0; fit proceeds with correct `b` | `complete` | Fitted model with `a ≥ 4 KiB/token` — bin-packer may over-split short batches but never accepts unsafe long ones |
 | Coefficient outside clamp | Clamp; log warning if difference >1% | `complete` | Fitted-but-clamped coefficients used |
 | Cache file unreadable / truncated | Treat as miss; re-probe | normal lifecycle | Probe runs as if no cache |
 | Cache write fails | Log warning, keep fitted coefficients | `complete` | Next cold start re-probes |

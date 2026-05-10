@@ -189,14 +189,15 @@ restart is required.
 The Dockerfile configures:
 
 ```dockerfile
-HEALTHCHECK --interval=10s --timeout=5s --start-period=120s --retries=3 \
-    CMD curl -sf http://localhost:8081/health || exit 1
+HEALTHCHECK --interval=10s --timeout=3s --start-period=120s --retries=3 \
+    CMD curl --fail --silent http://localhost:8081/health || exit 1
 ```
 
 | Parameter | Value | Rationale |
 |-----------|-------|-----------|
 | `start-period` | 120 s | Allows time for ~2 GB model download on first run |
 | `interval` | 10 s | Frequent enough to detect worker failures quickly |
+| `timeout` | 3 s | Maximum time for a single `curl` probe |
 | `retries` | 3 | Tolerates brief transient failures (e.g., during model reload) |
 
 During the `start-period`, Docker ignores health check failures. After that

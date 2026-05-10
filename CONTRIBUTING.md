@@ -56,6 +56,9 @@ cargo nextest run --all-features --no-tests=warn
 
 # Supply chain audit (requires cargo-deny)
 cargo deny check
+
+# License header check (requires hawkeye)
+hawkeye check
 ```
 
 ---
@@ -64,14 +67,51 @@ cargo deny check
 
 ```
 src/
-  main.rs          # server entry point, routes
-  embedder.rs      # worker pool, ONNX inference, bin-packing
-  binpack.rs       # workspace-aware batch bin-packer
-  sysinfo.rs       # memory detection (cgroup v2/v1, /proc/meminfo)
-  probe.rs         # startup cost-model probe
-  models.rs        # request / response types
-benches/           # Criterion benchmarks
-tests/             # integration tests
+  lib.rs                    # library crate root (re-exports for tests)
+  main.rs                   # thin binary entry point
+  bootstrap.rs              # startup orchestration (router, budget, probe task, readiness)
+  bootstrap/
+    budget.rs               # workspace-budget arithmetic
+    probe_task.rs           # background probe task
+    readiness.rs            # foreground readiness probe
+    router.rs               # Axum router + middleware
+  config.rs                 # env-var configuration (Config::from_env)
+  state.rs                  # AppState, TuningInfo, ProbeStatus
+  handler.rs                # HTTP handler module (facade)
+  handler/
+    common.rs               # shared validation + readiness helpers
+    dense.rs                # POST /v1/embeddings
+    sparse.rs               # POST /v1/sparse-embeddings
+    both.rs                 # POST /v1/embeddings:both
+    health.rs               # GET /health
+    models.rs               # GET /v1/models
+  embedder.rs               # worker-pool module (facade)
+  embedder/
+    pool.rs                 # EmbedPool async wrapper
+    worker.rs               # blocking worker thread + probe wiring
+    dense.rs                # dense embedding pipeline
+    sparse.rs               # sparse embedding pipeline
+    dual.rs                 # paired dense + sparse pipeline
+    session.rs              # ORT session loading + execution providers
+    tokenize.rs             # tokenizer load + no-pad tokenization
+    math.rs                 # pure dense/sparse math helpers
+    model_files.rs          # hf-hub download / cache layout
+    types.rs                # EmbedRequest, ProbeResult, SparseEmbedding
+    error.rs                # ort::Error → anyhow::Error adapter
+  binpack.rs                # quadratic-aware workspace bin-packer + CostModel
+  probe.rs                  # cost-model probe module (facade)
+  probe/
+    runner.rs               # (batch, seq) shape-sweep driver
+    fit.rs                  # OLS cost-model fitter
+    cache.rs                # persistent EFS coefficient cache
+    corpus.rs               # probe text synthesis
+    validate.rs             # tokenizer + ndarray shape check
+  sysinfo.rs                # memory detection (cgroup v2/v1 → /proc/meminfo)
+  weights.rs                # bundled sparse_linear.safetensors weights
+  models.rs                 # request / response serde types
+  error.rs                  # AppError → HTTP status mapping
+benches/                    # Criterion benchmarks
+tests/                      # integration tests
 ```
 
 ---

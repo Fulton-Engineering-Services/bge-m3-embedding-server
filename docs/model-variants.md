@@ -144,7 +144,8 @@ See [coreml-ep.md](coreml-ep.md) for the full CoreML dispatch analysis.
 
 At `BGE_M3_MAX_SEQ_LENGTH=8192`, each individual `session.run()` call at a single text
 uses ~671 MB of intermediate workspace (conservative estimate). The bin-packer ensures
-no single call exceeds `max_workspace_bytes` — see [docs/decisions/long-context-security.md](decisions/long-context-security.md).
+no single call exceeds `max_workspace_bytes` — see [startup-probe.md](startup-probe.md)
+for the workspace decomposition and budget math.
 
 ## 8. Sparse Embedding Stability
 

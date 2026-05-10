@@ -279,7 +279,7 @@ SPLADE weights) for the same input string.
 
 ---
 
-
+## Configuration
 
 All configuration is via environment variables. The server reads them once at startup; changes
 require a restart.
@@ -296,7 +296,7 @@ require a restart.
 | `BGE_M3_MAX_SEQ_LENGTH` | `8192` | Maximum tokenized sequence length, range `[1, 8192]`. Lower values reduce memory; `8192` is BGE-M3's published maximum. |
 | `BGE_M3_IDLE_TIMEOUT_SECS` | `300` | Seconds of inactivity before models are unloaded from memory; `0` disables idle unloading |
 | `BGE_M3_MODEL` | `fp16` | Model variant — see [Model Variants](#model-variants) |
-| `BGE_M3_LOG_FORMAT` | (text) | Set to `json` for structured JSON log output |
+| `BGE_M3_LOG_FORMAT` | (text) | Set to `json` for structured JSON log output; omit for auto-detect (JSON in non-TTY, human-readable in TTY) |
 
 ### Auto-Budget Tuning (Linux)
 
