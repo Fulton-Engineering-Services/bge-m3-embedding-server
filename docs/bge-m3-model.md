@@ -307,9 +307,6 @@ graph TD
     Stage1 --> Stage2
     Stage2 --> Stage3
     Stage3 --> Model
-
-    classDef stage fill:#e8f4fd,stroke:#333,stroke-width:1px
-    class Stage1,Stage2,Stage3 stage
 ```
 
 ### Stage 1 — RetroMAE Pre-training

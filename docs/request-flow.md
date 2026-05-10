@@ -17,14 +17,14 @@ sequenceDiagram
     participant Channel as mpsc channel
     participant Worker as Worker Thread
 
-    Client->>Router: POST /v1/embeddings<br/>{"input": ["hello"], "model": "bge-m3"}
+    Client->>Router: POST /v1/embeddings
     Router->>Router: SetRequestIdLayer → generate UUID
     Router->>Router: TraceLayer → start span
     Router->>Router: DefaultBodyLimit → check ≤ 2 MiB
     Router->>Handler: Deserialize JSON → DenseRequest
 
     Handler->>State: check_ready()
-    Note right of State: AtomicBool::load(ready)<br/>+ live_worker_count > 0
+    Note right of State: AtomicBool::load(ready) + live_worker_count > 0
 
     alt Not ready or no live workers
         State-->>Handler: Err(ServiceUnavailable)
@@ -32,14 +32,14 @@ sequenceDiagram
     end
 
     Handler->>Handler: validate_input(texts, max_batch)
-    Note right of Handler: Check: non-empty,<br/>≤ max_batch texts,<br/>each ≤ 32768 chars
+    Note right of Handler: Check non-empty, max_batch texts, max 32768 chars
 
     alt Validation fails
         Handler-->>Client: 400 Bad Request
     end
 
     Handler->>State: acquire request_permits (Semaphore)
-    Note right of State: Starts at N-1 permits during probe;<br/>raised to N on probe completion.<br/>Queues request if all slots busy.
+    Note right of State: N-1 permits during probe, raised to N on completion. Queues if all slots busy.
 
     Handler->>Pool: pool.dense(texts)
     Pool->>Channel: send(EmbedRequest::Dense { texts, reply_tx })
@@ -60,7 +60,7 @@ sequenceDiagram
     Worker-->>Pool: reply_tx.send(Ok(embeddings))
     Pool-->>Handler: await reply_rx
 
-    Handler->>Handler: Build DenseResponse<br/>(OpenAI-compatible format)
+    Handler->>Handler: Build DenseResponse (OpenAI-compatible format)
     Handler-->>Client: 200 OK + JSON response
 ```
 
@@ -82,7 +82,7 @@ sequenceDiagram
     participant Pool as EmbedPool
     participant Worker as Worker Thread
 
-    Client->>Handler: POST /v1/sparse-embeddings<br/>{"input": ["hello"]}
+    Client->>Handler: POST /v1/sparse-embeddings
 
     Handler->>Handler: check_ready() + validate_input()
 
@@ -98,7 +98,7 @@ sequenceDiagram
     end
     Worker-->>Handler: Vec~SparseEmbedding~
 
-    Handler->>Handler: Map indices (usize → u32)<br/>Build SparseResponse
+    Handler->>Handler: Map indices (usize to u32) / Build SparseResponse
     Handler-->>Client: 200 OK + JSON
 ```
 
@@ -129,9 +129,6 @@ graph TD
     Validate -->|"OK"| Permit
     Permit -->|"Queues if N-1 slots busy during probe"| Pool
     Pool --> Inference["Worker Inference<br/>(tokenize-once + bin-pack)"]
-
-    classDef errorNode fill:#f96,stroke:#333,stroke-width:2px
-    class R413,R400a,R503,R400b errorNode
 ```
 
 ### Validation constraints

@@ -25,12 +25,6 @@ graph LR
     CPU --- UMA
     GPU --- UMA
     ANE --- UMA
-
-    classDef active fill:#555,stroke:#222,stroke-width:2px,color:#fff
-    classDef idle fill:#e0e0e0,stroke:#999,stroke-width:1px
-
-    class CPU,GPU active
-    class ANE idle
 ```
 
 ### CPU — NEON SIMD (active)

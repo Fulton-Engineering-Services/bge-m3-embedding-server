@@ -278,7 +278,7 @@ sequenceDiagram
     else cache miss
         Main->>Main: probe_status = Running
         Main->>Probe: tokio::spawn run_probe(pool, max_seq, rss_ceiling)
-        Note over Probe: 7 shapes, ~120 s — runs while<br/>workers serve requests with<br/>conservative defaults
+        Note over Probe: 7 shapes, ~120 s — runs while workers serve requests with conservative defaults
         Probe->>Leader: EmbedRequest::Probe (per shape)
         Leader-->>Probe: ProbeResult { rss_before, rss_after }
         Probe->>Probe: fit_cost_model (normalized OLS)
