@@ -1,14 +1,8 @@
 # 11. End-to-End — A Worked Cold-Start Trace
 
-> Everything in this series, played out in a real cold-start log from a 28 GB Fargate task. Each line is annotated with the page that explains the underlying machinery.
+The preceding pages develop each piece of the probe in isolation. This page assembles them into a real boot sequence: a representative cold-start log from a 28 GB Fargate task running production settings (`workers = 7`, `max_seq = 8192`, `model = Fp16`), with each line cross-referenced to the page that explains the underlying machinery. Operators reading the logs in production should be able to identify each phase by its log signature.
 
-## Intuition
-
-It's one thing to know each piece of the probe in isolation. It's another to see them assembled into a real boot sequence and recognize each piece by its log signature. This page walks through a representative cold start at production settings (`workers=7`, `max_seq=8192`, `model=Fp16`), pointing at every line and saying "this is where page X happens."
-
-If you only ever read one page about *operating* the server — not about the theory — read [Operator guide](12-operator-guide.md). If you want to understand *what you're seeing in the logs*, this is the page.
-
-## A timeline of cold start
+## Cold-start timeline
 
 ```mermaid
 gantt
@@ -36,7 +30,7 @@ gantt
     /v1/embeddings ready           :milestone, m4, after p5, 0
 ```
 
-Roughly: ~10 s to load the leader and prime its arena, ~10 s for the followers to load from warm cache, then ~120 s for the probe sweep (dominated by the `(1, 8192)` shape), then a few seconds of bookkeeping. Total: under three minutes from container start to traffic open. **The `/health` endpoint is at 200 from second ~21 onward** — the load balancer never sees an unhealthy task, even though traffic doesn't actually flow until ~140s later.
+Roughly: ${\sim}10\,\text{s}$ to load the leader and prime its arena, ${\sim}10\,\text{s}$ for the followers to load from warm cache, then ${\sim}120\,\text{s}$ for the probe sweep (dominated by the $(1, 8192)$ shape), then a few seconds of bookkeeping. Total: under three minutes from container start to traffic open. The `/health` endpoint reaches 200 from second ${\sim}21$ onward; the load balancer never sees an unhealthy task, even though traffic does not actually flow until ${\sim}140\,\text{s}$ later.
 
 ## Annotated cold-start log
 
@@ -75,24 +69,24 @@ A representative cold-start trace at default settings on a 28 GB ECS Managed Ins
 [INFO] Models ready — accepting requests                                   ← permits released, traffic opens (§10)
 ```
 
-### What each phase corresponds to in the docs
+### Cross-reference to the series
 
 | Log line(s) | Section | Page |
 |-------------|---------|------|
 | `Phase N/4 ...` | Model fetch and load | (covered in [cold-start.md](../cold-start.md), out of scope here) |
 | `Leader worker ready ... rss_delta_mb=1409` | Layer 2 RSS measurement (per-worker baseline) | [Measurement §7](07-measurement.md) |
 | `Memory detected ... source=cgroup_v2` | cgroup detection | (covered in [architecture.md](../architecture.md)) |
-| `Workspace budget computed ... per_worker_workspace_mb=1058` | `total_workspace = available − N×model_rss − OS_HEADROOM` | [Overview §1](01-overview.md) intro |
+| `Workspace budget computed ... per_worker_workspace_mb=1058` | $\text{total\_workspace} = \text{available} - N \times \text{model\_rss} - \text{OS\_HEADROOM}$ | [Overview §1](01-overview.md) intro |
 | `Probe cache fingerprint mismatch; will re-probe` | Cache miss path | [Cache §9](09-cache.md) |
 | `Starting memory probe ... rss_ceiling_mb=1058` | Probe task spawned, semaphore drained | [Execution §10](10-execution.md) |
-| `Probe: arena warm-up complete` | Layer 1 arena pre-priming inside the probe task | [Probe shapes §6](06-probe-shapes.md) (§7.1: arena warm-up) |
+| `Probe: arena warm-up complete` | Layer 1 arena pre-priming inside the probe task | [Probe shapes §6](06-probe-shapes.md) (arena warm-up) |
 | `Probe shape measured ...` | Per-shape RSS-delta readings (Layer 1) | [Measurement §7](07-measurement.md) |
-| `Probe: fitted cost model a=18432 b=6.2 data_points=7` | OLS solve in normalized space | [OLS fitting §4](04-ols-fitting.md), [Conditioning §5](05-conditioning.md) |
+| `Probe: fitted cost model a=18432 b=6.2 data_points=7` | OLS solve in normalised space | [OLS fitting §4](04-ols-fitting.md), [Conditioning §5](05-conditioning.md) |
 | `Probe coefficients cached to EFS` | Temp + atomic rename | [Cache §9](09-cache.md) |
 | `Dense readiness probe passed` / `Sparse readiness probe passed` | Final correctness checks before opening traffic | [Execution §10](10-execution.md) |
 | `Models ready — accepting requests` | `add_permits(cfg_workers)` releases the gate | [Execution §10](10-execution.md) |
 
-## What `/health` looks like after this
+## `/health` after a successful cold start
 
 After the cold start above, `GET /health` returns:
 
@@ -119,22 +113,22 @@ After the cold start above, `GET /health` returns:
 |-------|--------|---------|
 | `status` | `EmbedPool::worker_health()` | Aggregate live-worker health |
 | `workers.live` / `workers.total` | `EmbedPool` counters | How many of the configured workers are still running |
-| `max_seq_length` | Config | The configured upper bound on tokenized sequence length |
+| `max_seq_length` | Config | The configured upper bound on tokenised sequence length |
 | `tuning.a_bytes_per_token` | OLS fit | The fitted linear coefficient |
 | `tuning.b_bytes_per_token_sq` | OLS fit | The fitted quadratic coefficient |
 | `tuning.max_workspace_bytes` | Workspace-budget formula | Per-worker workspace ceiling enforced by the bin-packer |
 | `tuning.probe_status` | `state.probe_status.load()` | Lifecycle state |
-| `tuning.memory_source` | `detect_available_memory()` | Where the budget formula got its `available_bytes` (cgroup_v1, cgroup_v2, sysctl, override) |
+| `tuning.memory_source` | `detect_available_memory()` | Where the budget formula obtained its `available_bytes` (cgroup_v1, cgroup_v2, sysctl, override) |
 | `tuning.available_bytes` | Same | The detected (or overridden) available memory |
-| `tuning.model_rss_bytes_per_worker` | Layer 2 median RSS delta | Per-worker model+arena baseline |
-| `tuning.worst_case_peak_bytes` | `N×workspace + N×model_rss + OS_HEADROOM` | Absolute worst-case; must stay below `available_bytes` |
-| `tuning.utilization_pct` | `worst_case_peak / available × 100` | Headroom indicator; `WARN` fires at startup if > 90% |
+| `tuning.model_rss_bytes_per_worker` | Layer 2 median RSS delta | Per-worker model + arena baseline |
+| `tuning.worst_case_peak_bytes` | $N \times \text{workspace} + N \times \text{model\_rss} + \text{OS\_HEADROOM}$ | Absolute worst case; must remain below `available_bytes` |
+| `tuning.utilization_pct` | $\text{worst\_case\_peak} / \text{available} \times 100$ | Headroom indicator; `WARN` fires at startup if $> 90\%$ |
 
-`worst_case_peak_bytes` is `N × per_worker_workspace + N × model_rss + OS_HEADROOM`. A value above 90% of `available_bytes` triggers a startup `WARN`. At 74% with accurate `model_rss_bytes_per_worker`, the production 7-worker fp16 config has adequate headroom.
+`worst_case_peak_bytes` is $N \times \text{per\_worker\_workspace} + N \times \text{model\_rss} + \text{OS\_HEADROOM}$. A value above $90\%$ of `available_bytes` triggers a startup `WARN`. At $74\%$ with accurate `model_rss_bytes_per_worker`, the production 7-worker fp16 configuration has adequate headroom.
 
 ## A warm-start trace (cache hit)
 
-On the *next* cold start (cache hit), the probe sweep is skipped:
+On the next cold start (cache hit), the probe sweep is skipped:
 
 ```
 [INFO] Starting bge-m3-embedding-server bind=0.0.0.0:8081 workers=7 max_seq=8192 model=Fp16
@@ -153,7 +147,7 @@ On the *next* cold start (cache hit), the probe sweep is skipped:
 [INFO] Models ready — accepting requests
 ```
 
-…and `/health` reports `probe_status: "cache_hit"`. Total time from container start to traffic open: ~25 seconds (down from ~140s). This is what makes the cache worth having.
+`/health` reports `probe_status: "cache_hit"`. Total time from container start to traffic open: ${\sim}25\,\text{s}$ (down from ${\sim}140\,\text{s}$). This is the throughput rationale for the cache.
 
 ## A failed-probe trace
 
@@ -177,11 +171,9 @@ A cold start where the probe ran but the fit was rejected (e.g., due to RSS meas
 [INFO] Models ready — accepting requests
 ```
 
-Note that **the server still becomes ready and accepts traffic** — it's just running on the conservative defaults rather than the fitted values. Traffic flows. Throughput is lower than optimal. `/health` returns `probe_status: "failed"` so operators know to investigate.
+The server still becomes ready and accepts traffic, but on the conservative defaults rather than the fitted values. Throughput is lower than optimal. `/health` reports `probe_status: "failed"` so operators know to investigate. The asymmetry from §8 is visible: a partial probe is treated as no probe, conservative defaults take over, and the server keeps serving — there is no fail-fast crash even when the fitting machinery declares the data unworkable.
 
-The asymmetry from [Clamps & fallback](08-clamps-fallback.md) is visible here: a partial probe is treated as no probe, conservative defaults take over, the server keeps serving. There's no fail-fast crash even when the fitting machinery declares the data unworkable.
-
-## A deliberately-disabled trace
+## A deliberately disabled trace
 
 When `BGE_M3_DISABLE_AUTO_BUDGET=1` is set:
 
@@ -196,21 +188,17 @@ When `BGE_M3_DISABLE_AUTO_BUDGET=1` is set:
 [INFO] Models ready — accepting requests
 ```
 
-The probe machinery is bypassed entirely. `probe_status: "disabled"` distinguishes this from `failed`: the operator made an explicit decision, not a measurement anomaly. Used heavily in macOS dev loops (where the probe wouldn't work anyway) and for fast smoke tests where probe time matters more than packing optimality.
+The probe machinery is bypassed entirely. `probe_status: "disabled"` distinguishes this from `failed`: the operator made an explicit decision, not a measurement anomaly. This path is used heavily in macOS dev loops (where the probe would not work anyway) and for fast smoke tests where probe time matters more than packing optimality.
 
-## What to look for as an operator
+## Operator checklist
 
 Three things to verify after every cold start:
 
 1. **`probe_status`** — should be `complete` or `cache_hit`. Anything else (`failed`, `disabled`) merits investigation.
-2. **`utilization_pct`** — should be below 90%. Above that, `BGE_M3_WORKERS` is too high or `BGE_M3_MEMORY_SAFETY_FACTOR` is too lax.
-3. **`a` and `b`** — should look like `~18 000` and `~6` for fp16 on amd64. Order-of-magnitude differences signal either a fit failure or a model-variant change.
+2. **`utilization_pct`** — should be below $90\%$. Above that, `BGE_M3_WORKERS` is too high or `BGE_M3_MEMORY_SAFETY_FACTOR` is too lax.
+3. **`a` and `b`** — should look like ${\sim}18\,000$ and ${\sim}6$ for fp16 on amd64. Order-of-magnitude differences signal either a fit failure or a model-variant change.
 
-Page [Operator guide](12-operator-guide.md) covers all of this in checklist form.
-
-## What's next
-
-The next page is the operator's quick-reference for diagnosing probe state in production: what to check, what to tweak, what each tuning env var does.
+§12 covers each of these in checklist form.
 
 ---
 
