@@ -875,7 +875,8 @@ fn run_worker(
     let rt = Handle::current();
 
     // Measure RSS before loading so the delta accurately reflects this
-    // worker's model-weight contribution, not accumulated OS noise.
+    // worker's model-weight + arena-baseline contribution, not accumulated
+    // OS noise.
     let pre_load_rss = sysinfo::read_process_rss_bytes().unwrap_or(0);
     let initial_models = match load_models(
         &cache_dir,
@@ -883,7 +884,36 @@ fn run_worker(
         config.model_variant,
         config.max_seq_length,
     ) {
-        Ok(models) => {
+        Ok(mut models) => {
+            // Prime the ORT session arena with a tiny session.run() BEFORE
+            // measuring post-load RSS. ORT lazily allocates ~1 GiB of arena
+            // bookkeeping on the first run() call regardless of input size;
+            // priming here folds that allocation into the per-worker model
+            // RSS measurement so the workspace-budget math on the main thread
+            // sees the realistic per-worker memory footprint, AND so the
+            // probe sweep's per-shape `rss_delta` readings reflect only the
+            // incremental workspace attributable to that shape.
+            //
+            // Without per-worker priming, the probe could dispatch shapes to
+            // workers that have not yet done a session.run(), and each such
+            // first-touch contributes ~1 GiB of arena init noise to its
+            // delta — which buries the per-shape workspace signal in the
+            // OLS fit.
+            let prime_ids = ndarray::Array2::<i64>::zeros((1, 8));
+            let prime_mask = ndarray::Array2::<i64>::ones((1, 8));
+            match probe_run_dense(&mut models.0, &prime_ids, &prime_mask) {
+                Ok(_) => {
+                    tracing::debug!("Worker {id} arena primed");
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "Worker {id} arena prime failed; first probe shape on this \
+                         worker will include arena init delta"
+                    );
+                }
+            }
+
             let post_load_rss = sysinfo::read_process_rss_bytes().unwrap_or(pre_load_rss);
             tracing::info!(
                 elapsed_ms = load_start.elapsed().as_millis(),
@@ -944,7 +974,20 @@ fn run_worker(
                         config.model_variant,
                         config.max_seq_length,
                     ) {
-                        Ok(m) => {
+                        Ok(mut m) => {
+                            // Prime the freshly-loaded session arena so the
+                            // first incoming request after idle reload doesn't
+                            // pay the ~1 GiB lazy-arena-init cost. Same
+                            // rationale as the startup priming in the
+                            // load-models Ok arm above.
+                            let prime_ids = ndarray::Array2::<i64>::zeros((1, 8));
+                            let prime_mask = ndarray::Array2::<i64>::ones((1, 8));
+                            if let Err(e) = probe_run_dense(&mut m.0, &prime_ids, &prime_mask) {
+                                tracing::warn!(
+                                    error = %e,
+                                    "Worker {id} post-reload arena prime failed"
+                                );
+                            }
                             models = Some(m);
                             loaded_workers.fetch_add(1, Ordering::AcqRel);
                             tracing::info!(
