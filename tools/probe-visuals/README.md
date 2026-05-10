@@ -113,6 +113,31 @@ image links.
 
 ---
 
+## Notebooks
+
+Interactive ipywidgets notebooks for hands-on exploration. Require Jupyter and ipywidgets.
+
+### Setup
+
+```bash
+uv sync --group notebooks
+uv run jupyter notebook
+```
+
+Then open the `notebooks/` directory in the Jupyter file browser.
+
+### Available notebooks
+
+| Notebook | Description |
+|---|---|
+| `01_cost_decomposition_explorer.ipynb` | Sliders for `a` and `b` — live crossover point, preset buttons for fitted vs conservative defaults |
+| `02_workspace_budget_calculator.ipynb` | Deployment sizing tool — workers, model RSS, available memory, safety factor → utilization traffic light |
+| `03_conditioning_visualiser.ipynb` | Column scale ratio slider — morphs OLS loss landscape from circular to elongated, shows condition number |
+
+GitHub renders the markdown and code cells statically. For interactive use, run locally with `uv sync --group notebooks && uv run jupyter notebook`.
+
+---
+
 ## Source-of-truth constants
 
 All figures share the constants defined in `src/probe_visuals/common.py`.
