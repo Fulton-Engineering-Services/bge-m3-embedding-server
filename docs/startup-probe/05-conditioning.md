@@ -199,7 +199,7 @@ One coordinate change, one line of code per accumulator.
 
 The companion notebook for this section runs interactively in the browser via JupyterLite (no install required):
 
-**[▶ Open Conditioning Visualiser](https://fulton-engineering-services.github.io/bge-m3-embedding-server/lab/index.html?path=03_conditioning_visualiser.ipynb)**
+**[▶ Open Conditioning Visualiser](https://fulton-engineering-services.github.io/bge-m3-embedding-server/notebooks/lab/index.html?path=03_conditioning_visualiser.ipynb)**
 
 The notebook morphs the OLS loss landscape as a function of column scale ratio. Sliding from $r = 1$ to $r = 8192$ reveals the geometric origin of the conditioning failure: the contour ellipses elongate along the $b$-axis at the same rate that the condition number $\kappa(G)$ grows. The Jacobi-normalised right panel remains near-circular regardless of $r$.
 

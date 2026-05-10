@@ -142,7 +142,7 @@ A three-parameter extension (such as adding a $c \cdot S^3$ term) would force mo
 
 The companion notebook for this section runs interactively in the browser via JupyterLite (no install required):
 
-**[▶ Open Cost Decomposition Explorer](https://fulton-engineering-services.github.io/bge-m3-embedding-server/lab/index.html?path=01_cost_decomposition_explorer.ipynb)**
+**[▶ Open Cost Decomposition Explorer](https://fulton-engineering-services.github.io/bge-m3-embedding-server/notebooks/lab/index.html?path=01_cost_decomposition_explorer.ipynb)**
 
 The notebook provides slider controls for $a$ (linear coefficient) and $b$ (quadratic coefficient). Moving the sliders shifts the crossover point $S^* = a/b$ in real time and updates both the linear-axes and log-log panels. Preset buttons load the fitted values $(a = 18{,}432,\; b = 6.2)$ and the conservative defaults $(a = 16{,}384,\; b = 8)$.
 
