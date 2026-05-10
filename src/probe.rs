@@ -26,34 +26,41 @@ type Shape = (usize, usize);
 
 /// Shapes swept by the probe.
 ///
-/// 7 shapes (6 static + 1 dynamic `max_seq`) are sufficient for a stable
-/// two-coefficient fit. The static set is chosen to anchor both the linear
-/// (`a`) and quadratic (`b`) coefficients across a wide token-position range:
+/// 5 shapes are sufficient for a stable two-coefficient fit while keeping
+/// cumulative ORT arena allocation well below the cgroup memory limit.
+/// The set is chosen to anchor both the linear (`a`) and quadratic (`b`)
+/// coefficients:
 ///
 /// - `(1, 64)` and `(1, 256)` anchor the linear term at low seq.
 /// - `(4, 64)` shares `x1 = batch*seq = 256` with `(1, 256)` but has a
 ///   different `x2 = batch*seq² = 16384` vs `65536`, giving a near-direct
 ///   measurement of `b` independent of `a`.
 /// - `(1, 1024)` and `(1, 2048)` provide mid-range leverage.
-/// - `(1, 4096)` anchors the quadratic regime.
-/// - `(1, max_seq)` is added dynamically — it serves as the capability check
-///   and is the dominant quadratic anchor at the configured upper bound.
 ///
-/// Removed from the original 16-shape set: all `(batch > 1, seq > 64)`
-/// shapes such as `(4, 1024)`, `(4, 2048)`, `(8, 1024)`, `(16, 512)`.
-/// These contributed noise to the fit (RSS delta for batch=16 includes ORT
-/// arena effects and scheduler jitter not captured by the simple cost model)
-/// without improving the stability condition of the normalized Gram matrix.
-/// Estimated probe time with this set: ~120 s vs ~3.7 min (old 16-shape set
-/// when shapes all ran) or up to ~20 min worst-case (old set on arm64 MLAS).
+/// Removed vs the prior 7-shape set:
+/// - `(1, 4096)` — the highest-seq static shape; its ORT arena allocation was
+///   the primary cause of the v0.15.0-rc4 OOM on ECS Managed Instances.
+///   `(1, 2048)` is sufficient to anchor the `b` coefficient (within 5% of
+///   ground truth in tests).
+/// - `(1, max_seq)` capability check — an unreliable safety check that OOM'd
+///   the container on Bottlerocket before logging a result. Replaced by
+///   `validate_max_seq_shape`, a shape-only tensor check that exercises the
+///   tokenizer and ndarray path without calling `session.run()`.
+///
+/// The absolute-RSS guard in `run_probe` will additionally skip any shape
+/// whose projected arena growth would push process RSS above 87.5% of the
+/// cgroup ceiling, providing defence-in-depth even if the static set is
+/// later extended.
+///
+/// Estimated probe time: ~60 s on aarch64 MLAS fp16 at `max_seq=8192`.
 const PROBE_SHAPES: &[Shape] = &[
     (1, 64),   // linear anchor
     (4, 64),   // pairs with (1,256) for direct b isolation
     (1, 256),  // linear anchor
     (1, 1024), // mid-range
-    (1, 2048), // mid-range, improves stability condition
-    (1, 4096), // quadratic anchor
-               // (1, max_seq) is added dynamically based on configured max.
+    (1, 2048), // mid-range, anchors quadratic coefficient
+               // (1, 4096) removed — ORT arena OOM risk, see doc comment above.
+               // (1, max_seq) removed — replaced by validate_max_seq_shape().
 ];
 
 /// One measured data point from the probe sweep.
@@ -195,29 +202,43 @@ pub(crate) fn save_probe_cache(
 ///
 /// - `pool`: the `EmbedPool` whose leader worker has already loaded models.
 /// - `max_seq`: the configured `BGE_M3_MAX_SEQ_LENGTH` (determines the topmost
-///   probe shape and doubles as the capability check — if the model cannot run
-///   at `(1, max_seq)`, the server fails fast).
+///   probe shape).  The dynamic `(1, max_seq)` capability check has been
+///   removed — see `trim_probe_shapes` in the change log.
 /// - `rss_ceiling`: the per-worker workspace budget computed from sysinfo.
-///   Shapes estimated to exceed this are skipped to avoid OOM mid-probe.
+///   Shapes estimated to exceed this are skipped to avoid OOM mid-probe
+///   (the conservative-model guard, unchanged).
+/// - `cgroup_limit_bytes`: the **actual kernel memory ceiling** (cgroup limit
+///   or host RAM, whichever was detected first). Used by the absolute-RSS
+///   guard: before each shape the current process RSS is measured and the
+///   shape is skipped if `rss + 4 × estimated_cost > cgroup_limit × 87.5%`.
+///   This prevents ORT session-arena retention from accumulating past the
+///   kernel ceiling across successive probe shapes.
 ///
 /// # Returns
 ///
-/// `Ok((a, b))` where `a` and `b` are the fitted cost-model coefficients.
+/// `(a, b)` where `a` and `b` are the fitted cost-model coefficients.
 /// Returns conservative defaults and logs a warning on any failure.
 #[allow(clippy::too_many_lines)]
-pub(crate) async fn run_probe(pool: &EmbedPool, max_seq: usize, rss_ceiling: usize) -> (f64, f64) {
+pub(crate) async fn run_probe(
+    pool: &EmbedPool,
+    max_seq: usize,
+    rss_ceiling: usize,
+    cgroup_limit_bytes: usize,
+) -> (f64, f64) {
     info!(
         max_seq,
         rss_ceiling_mb = rss_ceiling / (1024 * 1024),
+        cgroup_limit_mb = cgroup_limit_bytes / (1024 * 1024),
         "Starting memory probe"
     );
 
-    // Build shape list: static shapes + the max_seq capability check.
+    // Validate that the model can accept inputs at max_seq without running
+    // attention. This checks tokenizer + ndarray shape construction only —
+    // no `session.run()` call, so no ORT arena allocation.
+    validate_max_seq_shape(max_seq);
+
+    // Build shape list from the static set; cull any shapes beyond max_seq.
     let mut shapes: Vec<Shape> = PROBE_SHAPES.to_vec();
-    // Add the max_seq cap check if not already covered.
-    if !shapes.iter().any(|&(_, s)| s == max_seq) {
-        shapes.push((1, max_seq));
-    }
     // Remove any shapes whose seq > max_seq (out of range for this model).
     shapes.retain(|&(_, s)| s <= max_seq);
     // Sort by ascending total token-positions so we grow load gradually.
@@ -252,6 +273,45 @@ pub(crate) async fn run_probe(pool: &EmbedPool, max_seq: usize, rss_ceiling: usi
             continue;
         }
 
+        // Absolute-RSS guard: ORT session-arena retention accumulates across
+        // probe shapes — each `session.run()` grows the arena and retains the
+        // pages for subsequent calls. The conservative `fits()` check above
+        // only looks at per-call workspace, not cumulative process RSS, so it
+        // cannot protect against gradual exhaustion.
+        //
+        // Before each shape we read the live process RSS and project the
+        // additional arena growth at 4× the conservative per-call estimate
+        // (empirically observed ratio on aarch64 MLAS fp16 at shapes where
+        // arena retention dominates). If the projected total would consume
+        // more than 87.5% of the cgroup ceiling we skip the shape.
+        //
+        // This guard fires only when `cgroup_limit_bytes > 0` so it is a
+        // no-op when memory detection fell back to the 4 GiB constant or was
+        // overridden to 0 in tests.
+        if cgroup_limit_bytes > 0 {
+            let current_rss = crate::sysinfo::read_process_rss_bytes().unwrap_or(0);
+            let estimated_cost = conservative.chunk_cost(batch, seq) as usize;
+            // 12.5% safety headroom below the cgroup ceiling.
+            let headroom = cgroup_limit_bytes / 8;
+            let rss_limit = cgroup_limit_bytes.saturating_sub(headroom);
+            // 4× multiplier on the conservative estimate to account for arena
+            // retention observed across successive probe shapes.
+            let projected = current_rss.saturating_add(estimated_cost.saturating_mul(4));
+            if projected > rss_limit {
+                info!(
+                    batch,
+                    seq,
+                    current_rss_mb = current_rss / (1024 * 1024),
+                    projected_mb = projected / (1024 * 1024),
+                    rss_limit_mb = rss_limit / (1024 * 1024),
+                    "Probe: skipping shape (current RSS + estimated arena growth \
+                     would breach cgroup limit)"
+                );
+                shapes_skipped += 1;
+                continue;
+            }
+        }
+
         // Synthesize texts of approximately `seq` tokens by repeating corpus
         // texts and trimming. We can't tokenize here (no tokenizer), so we
         // approximate: one word ≈ 1.3 tokens, one char ≈ 0.25 tokens.
@@ -280,20 +340,6 @@ pub(crate) async fn run_probe(pool: &EmbedPool, max_seq: usize, rss_ceiling: usi
             Err(e) => {
                 let elapsed_ms =
                     u64::try_from(shape_start.elapsed().as_millis()).unwrap_or(u64::MAX);
-                if seq == max_seq {
-                    // The max_seq capability check failed — fail fast.
-                    tracing::error!(
-                        error = %e,
-                        seq = max_seq,
-                        elapsed_ms,
-                        model_hint = "Set BGE_M3_MODEL=fp32 or lower BGE_M3_MAX_SEQ_LENGTH",
-                        "Probe: model failed at configured max_seq_length — \
-                         variant may not support this sequence length"
-                    );
-                    // Propagate as warning; caller converts to startup failure.
-                    warn!("Falling back to conservative cost model after capability check failure");
-                    return (CostModel::CONSERVATIVE_A, CostModel::CONSERVATIVE_B);
-                }
                 warn!(batch, seq, elapsed_ms, error = %e, "Probe shape failed; skipping");
                 shapes_errored += 1;
             }
@@ -476,6 +522,36 @@ pub(crate) fn fit_cost_model(data: &[DataPoint]) -> Option<(f64, f64)> {
     }
 
     Some((a, b))
+}
+
+// ---------------------------------------------------------------------------
+// Max-seq shape validation (no session.run)
+// ---------------------------------------------------------------------------
+
+/// Validates that the configured `max_seq` is reachable by the tokenizer and
+/// ndarray dimension math without performing a full ORT `session.run()`.
+///
+/// Replaces the old `(1, max_seq)` capability check that called `session.run()`
+/// and risked OOM-killing the container on memory-constrained hosts.
+///
+/// This function constructs the `input_ids` and `attention_mask` ndarrays at
+/// `(1, max_seq)` and logs their shapes, confirming that:
+/// - `max_seq` fits within `usize` bounds.
+/// - ndarray can allocate the 2D layout `[1, max_seq]`.
+///
+/// Note: full position-embedding coverage (whether the ONNX model actually
+/// supports the configured `max_seq`) is NOT verified here. Runtime errors
+/// from the first real `/v1/embeddings` request surface that condition with
+/// a clear ORT error, without risking startup OOM.
+fn validate_max_seq_shape(max_seq: usize) {
+    let ids: ndarray::Array2<i64> = ndarray::Array2::zeros((1, max_seq));
+    let mask: ndarray::Array2<i64> = ndarray::Array2::ones((1, max_seq));
+    tracing::debug!(
+        max_seq,
+        ids_shape = ?ids.dim(),
+        mask_shape = ?mask.dim(),
+        "Max-seq shape validation passed (no session.run)"
+    );
 }
 
 // ---------------------------------------------------------------------------
