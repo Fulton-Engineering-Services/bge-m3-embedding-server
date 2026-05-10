@@ -546,10 +546,39 @@ pub(crate) fn fit_cost_model(data: &[DataPoint]) -> Option<(f64, f64)> {
     let a_raw = alpha / x1_max;
     let b_raw = beta / x2_max;
 
-    // Reject negative coefficients — physically impossible.
-    if a_raw < 0.0 || b_raw < 0.0 {
+    // ----- Negative-coefficient handling (rc8) -----
+    //
+    // OLS can return a negative `a_raw` when the data has a sharp
+    // discontinuity in y across the seq axis — for example, when ORT
+    // switches attention kernels between seq=2048 and seq=4096 (small
+    // memory-frugal fused kernel below the threshold; full O(N²) score
+    // matrix above). The two-coefficient quadratic model `y = a·N + b·N²`
+    // cannot describe a step function — the fitter has to drive `a` strongly
+    // negative to subtract the quadratic prediction back out at low seq
+    // where y ≈ 0.
+    //
+    // In that regime, `b_raw` is fine (the high-seq points fit a clean
+    // quadratic) but `a_raw` is non-physical. The rc7 production data was
+    // exactly this: `a_raw ≈ -109,000`, `b_raw ≈ 117`. Returning `None`
+    // and falling back to conservative defaults under-budgets ORT
+    // workspace by ~12× at high seq, which causes batched real-traffic
+    // OOMs (see CLAUDE.md gotcha "rc7 production capacity at max_seq=8192").
+    //
+    // Fix: when `a_raw` is negative, raise it to 0 and let the existing
+    // `.clamp(4_096.0, ...)` lower bound floor it at 4 KiB/token. That
+    // produces a fitted `b` that correctly predicts high-seq workspace
+    // (so the bin-packer rejects oversize batches) and an `a` that
+    // slightly over-predicts low-seq workspace (which is the safe
+    // direction — bin-packer might split low-seq batches more
+    // aggressively than ideal, but never accepts unsafe ones).
+    //
+    // A negative `b_raw` still fails fast: that would require a quadratic
+    // model to predict workspace *decreasing* as seq grows, which is
+    // genuinely non-physical and signals a measurement bug.
+    if b_raw < 0.0 {
         return None;
     }
+    let a_raw = a_raw.max(0.0);
 
     // Clamp to sane operational ranges.
     // a: [4 KiB, 256 KiB] per token-position
@@ -837,6 +866,107 @@ mod tests {
         assert!(
             fit_cost_model(&data).is_none(),
             "identical rows should give None"
+        );
+    }
+
+    /// rc8 regression test — recreates the kernel-switch discontinuity
+    /// observed on the rc7 production deployment at `max_seq=8192`:
+    /// near-zero deltas at seq ≤ 2048 (small ORT attention kernel) and
+    /// purely quadratic deltas at seq ≥ 4096 (full O(N²) attention).
+    /// `fit_cost_model` must clamp the non-physical negative `a_raw` to 0
+    /// (rounded up to the 4 KiB/token floor) and recover `b ≈ 117`
+    /// from the high-seq points instead of returning None.
+    #[test]
+    fn fit_recovers_b_when_kernel_switch_creates_negative_a_raw() {
+        // Production data points from the rc7 task at workers=2,
+        // max_seq=8192 (CloudWatch probe sweep, 2026-05-10T06:21:47Z):
+        //   (1, 64)   →     ~0 MB
+        //   (4, 64)   →     ~0 MB
+        //   (1, 256)  →     ~0 MB
+        //   (1, 1024) →    10 MB
+        //   (1, 2048) →    12 MB
+        //   (1, 4096) →  1976 MB
+        //   (1, 8192) →  7846 MB
+        let data = vec![
+            DataPoint {
+                batch: 1,
+                seq: 64,
+                rss_delta: 0,
+            },
+            DataPoint {
+                batch: 4,
+                seq: 64,
+                rss_delta: 0,
+            },
+            DataPoint {
+                batch: 1,
+                seq: 256,
+                rss_delta: 0,
+            },
+            DataPoint {
+                batch: 1,
+                seq: 1024,
+                rss_delta: 10_000_000,
+            },
+            DataPoint {
+                batch: 1,
+                seq: 2048,
+                rss_delta: 12_000_000,
+            },
+            DataPoint {
+                batch: 1,
+                seq: 4096,
+                rss_delta: 1_976_000_000,
+            },
+            DataPoint {
+                batch: 1,
+                seq: 8192,
+                rss_delta: 7_846_000_000,
+            },
+        ];
+
+        let result = fit_cost_model(&data);
+        assert!(
+            result.is_some(),
+            "rc8 fit must succeed on kernel-switch data instead of returning \
+             None — see the negative-a clamp branch in fit_cost_model"
+        );
+        let (a, b) = result.unwrap();
+
+        // After clamp, `a` should be at the lower bound (4 KiB/token) since
+        // the OLS solver wanted it negative. Allow up to 5% above the floor
+        // to absorb numerical jitter.
+        assert!(
+            (4_096.0..4_300.0).contains(&a),
+            "a={a:.0} should be at or just above the 4096 floor"
+        );
+
+        // `b` should recover the quadratic coefficient from the high-seq
+        // data points: rss_delta(1, 8192) ≈ b · 8192² → b ≈ 117 bytes/token²
+        // for a pure quadratic. The low-seq points (small but nonzero) pull
+        // the fit slightly above the pure-quadratic ideal — empirically
+        // b ≈ 131 on this data set. Allow ±20% to keep the test resilient
+        // to small changes in the low-seq deltas while still asserting the
+        // fit recovers the correct order of magnitude (and not the
+        // CONSERVATIVE_B = 8 fallback, which would mean we returned the
+        // wrong branch).
+        assert!(
+            (95.0..145.0).contains(&b),
+            "b={b:.4} should recover roughly 117 bytes/token² from the \
+             high-seq points (must NOT be CONSERVATIVE_B=8 conservative \
+             fallback nor wildly off)"
+        );
+
+        // Sanity: the fitted coefficients must predict (1, 8192) workspace
+        // close to the measured 7.85 GB (within 15%) so the bin-packer
+        // correctly rejects oversize batches at max_seq=8192.
+        let predicted_8192 = a * 8192.0 + b * 8192.0 * 8192.0;
+        let measured_8192 = 7_846_000_000.0_f64;
+        let ratio = predicted_8192 / measured_8192;
+        assert!(
+            (0.85..=1.15).contains(&ratio),
+            "predicted (1, 8192) = {predicted_8192:.0} must be within 15% \
+             of measured {measured_8192:.0}; got ratio {ratio:.3}"
         );
     }
 
