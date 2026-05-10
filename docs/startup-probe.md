@@ -312,7 +312,7 @@ This is exactly a Jacobi (diagonal) preconditioner — the simplest case of prec
 
 ## 7. Probe Shape Selection — Information Geometry for Two Coefficients
 
-A 2-coefficient OLS needs at least 2 distinct points; more points reduce noise but only if they carry *new information*. The probe sweeps **6 fixed shapes plus the configured `max_seq`**:
+A 2-coefficient OLS needs at least 2 distinct points; more points reduce noise but only if they carry *new information*. The probe sweeps **5 fixed shapes**:
 
 ```49:57:src/probe.rs
 const PROBE_SHAPES: &[Shape] = &[
@@ -320,9 +320,9 @@ const PROBE_SHAPES: &[Shape] = &[
     (4, 64),   // pairs with (1,256) for direct b isolation
     (1, 256),  // linear anchor
     (1, 1024), // mid-range
-    (1, 2048), // mid-range, improves stability condition
-    (1, 4096), // quadratic anchor
-               // (1, max_seq) is added dynamically based on configured max.
+    (1, 2048), // mid-range, anchors quadratic coefficient
+               // (1, 4096) removed — ORT arena OOM risk, see doc comment above.
+               // (1, max_seq) removed — replaced by validate_max_seq_shape().
 ];
 ```
 
@@ -334,11 +334,31 @@ Each shape is chosen for a reason:
 | `(1, 256)` | Linear anchor | Same regime, longer arm. Confirms `a` and starts probing `b`. |
 | `(4, 64)` | **`b`-isolator** | Has the same `B·S = 256` as `(1, 256)`, but `B·S² = 16384` vs `65536`. The two shapes share the linear column but differ on the quadratic column by 4×. The difference of their RSS deltas is almost purely a measurement of `b`. |
 | `(1, 1024)` | Mid-range | Bridges linear and quadratic regimes. Improves leverage on `(a, b)` jointly. |
-| `(1, 2048)` | Mid-range | Improves the stability condition of the (normalized) Gram matrix — adds spread along the diagonal of the design space. |
-| `(1, 4096)` | Quadratic anchor | Quadratic term ~50% of total cost. Strong leverage on `b`. |
-| `(1, max_seq)` | Quadratic anchor + capability check | Dominant `b` measurement at the upper end. Doubles as a fail-fast check that the model can actually run at `max_seq` (see §9). |
+| `(1, 2048)` | Mid-range | Sufficient to anchor the quadratic coefficient — drops within 5% of ground truth in tests even without a higher-seq point. Removing `(1, 4096)` and `(1, max_seq)` prevents ORT arena accumulation from reaching the cgroup ceiling. |
 
-### 7.1 Why these and not others
+### 7.1 Why `(1, 4096)` and `(1, max_seq)` were removed (v0.15.0-rc5)
+
+The v0.15.0-rc4 production incident (OOM kill 3 minutes into startup) traced to ORT session-arena *retention*: each successive probe shape's `session.run()` grew the arena and retained the pages. By `(1, 4096)`, cumulative process RSS had climbed to ~21 GiB on a 28 GiB container and the next call pushed past the cgroup ceiling.
+
+Two shapes contributed most of the risk:
+- `(1, 4096)`: the quadratic anchor at high seq — each `session.run()` adds ~1.5 GiB of arena that is retained for subsequent calls.
+- `(1, max_seq)` (previously the capability check): the largest possible shape, ran last, and consistently triggered the OOM when the five preceding shapes had already consumed ~20 GiB.
+
+`(1, 2048)` is sufficient for coefficient recovery within 5% of ground truth. Geometrically: the fit needs spread along the `M = B·S²` axis, not absolute reach to `S = 8192`. The key constraint is that `(1, 2048)` is far enough from the linear anchors in `M`-space that the two columns in the Gram matrix are not near-collinear.
+
+Removing these shapes reduces probe time from ~120 s to ~60 s on aarch64 MLAS at `max_seq=8192` and eliminates the OOM failure mode.
+
+### 7.2 Absolute-RSS guard (defence-in-depth)
+
+Even with the trimmed shape set, an absolute-RSS guard fires before each shape as defence-in-depth:
+
+```
+current_rss + 4 × chunk_cost(batch, seq) > 87.5% × cgroup_limit  →  skip
+```
+
+The `4×` multiplier is empirically derived from the rc4 incident: measured `rss_delta` values were 24–49× the conservative model prediction at small shapes due to arena retention, but the multiplier of `4` is calibrated to protect against the critical-path case near `(1, 2048)` rather than the full observed range at smaller shapes. Combined with the trimmed shape set, this provides two independent lines of defence.
+
+### 7.3 Why earlier shapes and not others
 
 A previous draft used 16 shapes including `(8, 64)`, `(8, 256)`, `(8, 1024)`, `(16, 64)`, `(16, 256)`, `(16, 512)`. Those were removed because:
 
@@ -346,10 +366,10 @@ A previous draft used 16 shapes including `(8, 64)`, `(8, 256)`, `(8, 1024)`, `(
 2. **No information gain.** Once you have `(1, S)` for several `S` plus *one* `(B>1, S)` shape that breaks the pure `B=1` line, additional `(B>1, S)` shapes mostly add noise. The OLS fit weights them all equally; a single noisy 16-batch measurement can drag the coefficients more than its information contribution justifies.
 3. **Conditioning.** All `(B>1, large S)` shapes lie roughly along the same direction in design-matrix space (`B·S ≈ B·S²/S` — collinear with the `(1, S)` line at fixed `S`). They don't add a new dimension, only repetition.
 
-The chosen 7 give us:
+The chosen 5 give us:
 - two clean low-`S` linear anchors at different effective `S`,
 - one shape that *breaks* the `B=1` line in a controlled way (`(4, 64)` paired with `(1, 256)`),
-- four `(1, S)` shapes spanning `64–8192` for quadratic leverage.
+- two `(1, S)` shapes at mid-range for quadratic leverage without high-arena-retention risk.
 
 Geometrically: the shapes form a roughly L-shaped distribution in `(N, M) = (B·S, B·S²)` space — points along the `B=1` arc plus one off-arc point. That's the minimum-information geometry for separating linear from quadratic.
 
@@ -501,32 +521,21 @@ Even with a well-conditioned fit, measurement noise can produce values outside t
 
 A clamp is a *graceful degradation*: a fit that lands outside these bounds still produces a valid cost model, just one that is less aggressive than the noise might have suggested. Without clamping, an outlier RSS reading could push `b` to e.g. `1e9` and effectively disable batching for any sequence longer than a few tokens.
 
-### 9.2 Capability check at `(1, max_seq)`
+### 9.2 Max-seq shape validation (`validate_max_seq_shape`)
 
-The dynamically-added probe shape doubles as a fail-fast check:
+Before the probe sweep, the server calls `validate_max_seq_shape(max_seq)`, which constructs `input_ids` and `attention_mask` ndarrays at shape `(1, max_seq)` but does **not** call `session.run()`. This confirms that:
 
-```265:282:src/probe.rs
-            Err(e) => {
-                if seq == max_seq {
-                    // The max_seq capability check failed — fail fast.
-                    tracing::error!(
-                        error = %e,
-                        seq = max_seq,
-                        model_hint = "Set BGE_M3_MODEL=fp32 or lower BGE_M3_MAX_SEQ_LENGTH",
-                        "Probe: model failed at configured max_seq_length — \
-                         variant may not support this sequence length"
-                    );
-                    // Propagate as warning; caller converts to startup failure.
-                    warn!("Falling back to conservative cost model after capability check failure");
-                    return (CostModel::CONSERVATIVE_A, CostModel::CONSERVATIVE_B);
-                }
-                warn!(batch, seq, error = %e, "Probe shape failed; skipping");
-            }
-```
+- `max_seq` fits within `usize` bounds.
+- ndarray can allocate the 2D layout `[1, max_seq]`.
 
-Some Xenova ONNX exports were generated with `max_position_embeddings=512`, which means an `(1, 8192)` `session.run()` will error before producing output. The probe runs that shape at startup; if it fails, the operator sees an actionable log message naming the variant and the env var to change. This is significantly better than discovering the limit on a production request, which would surface as a generic ORT error.
+This replaces the previous `(1, max_seq)` probe shape that acted as a capability check by running a full `session.run()` call. That approach was the direct cause of the v0.15.0-rc4 OOM: it ran last in the probe sweep (when RSS was already ~21 GiB), added ~6 GiB of arena, and pushed process RSS past the 28 GiB cgroup ceiling before the probe could log a result.
 
-When this happens, the probe falls back to conservative defaults (with `ProbeStatus::Failed` reported in `/health`) rather than aborting the process. The server still serves requests at sequence lengths the model *can* handle.
+**Trade-off:** some Xenova ONNX exports were generated with `max_position_embeddings=512`, which means a `session.run()` at `S=8192` will error. The ndarray-only check does not detect this. The incompatibility surfaces as an ORT error on the first real `/v1/embeddings` request rather than at startup. Operators who hit this should:
+
+1. Check the error message from the first embedding request for a positional-embedding bounds violation.
+2. Set `BGE_M3_MODEL=fp32` (uses `BAAI/bge-m3` with full 8192-position embeddings) or lower `BGE_M3_MAX_SEQ_LENGTH` to 512.
+
+This is an acceptable trade-off: the previous startup OOM killed the container silently with no actionable log message; the new runtime error is visible to callers and surfaced in `tower-http`'s structured error log.
 
 ---
 
@@ -620,11 +629,13 @@ Setting `BGE_M3_DISABLE_PROBE_CACHE=1` forces a fresh probe even when a valid ca
 
 The probe takes long enough (~120 s on a cache miss) that blocking startup on it would stall liveness probes and delay rolling-update completion. The implementation runs the probe in a Tokio task and updates the cost model atomically.
 
-### 11.0 Concurrency gate during the probe window
+### 11.0 Concurrency gate during the probe window (v0.15.0-rc5 — fully serialized)
 
-Because the probe runs on one of the live workers while the server is already accepting traffic, a careless deployment could saturate all workers with real requests and leave none free for the probe shape — or, worse, the probe's `(1, max_seq)` shape could compete with max-size client requests and push peak RSS beyond the container limit before the fitted budget is known.
+Because the probe measures process-wide RSS deltas (`/proc/self/statm`), any concurrent `session.run()` call from real traffic pollutes the per-shape measurement. The v0.15.0-rc4 incident confirmed this: the dense + sparse readiness calls launched concurrently with the first probe shape caused the `(1, 64)` delta to read `3074 MiB` (3× the actual per-call cost), which would have driven a grossly inflated `a` coefficient.
 
-To prevent this, `AppState` holds a `tokio::sync::Semaphore` (`request_permits`) that gates the three embedding handlers:
+To prevent RSS contamination, the probe **holds all `cfg_workers` permits** while running, blocking all incoming `/v1/embeddings*` requests at the semaphore. Requests queue rather than being rejected; `/health` still returns 200 during this window. The dense + sparse readiness checks and the `state.ready = true` flip both happen **inside** the probe task after the probe sweep completes.
+
+`AppState` holds a `tokio::sync::Semaphore` (`request_permits`) that gates the three embedding handlers:
 
 ```86:93:src/handler.rs
     let _permit = Arc::clone(&state.request_permits)
@@ -634,45 +645,9 @@ To prevent this, `AppState` holds a `tokio::sync::Semaphore` (`request_permits`)
     let embeddings = state.pool.dense(texts).await?;
 ```
 
-The semaphore is initialized to `max(cfg_workers − 1, 1)` permits at startup, reserving one worker slot for the probe. On every *terminal* probe-status transition — `Disabled` (cost-model override applied), `CacheHit` (EFS cache hit applied), `Complete` or `Failed` (background probe done) — `add_permits(1)` raises the count to `cfg_workers`, restoring full concurrency. Requests that arrive during the probe window simply queue on the semaphore rather than being rejected; the additional latency is at most the time for one probe shape to complete.
+The semaphore is initialized to `max(cfg_workers − 1, 1)` permits at startup (one slot already reserved for the probe worker). On a cache miss, the probe task acquires the remaining `cfg_workers − 1` permits before launching, draining all available slots. After the probe + readiness checks complete, `add_permits(cfg_workers)` releases all slots, opening traffic.
 
-```161:194:src/main.rs
-        } else {
-            // Cache miss — launch background probe.
-            state
-                .probe_status
-                .store(ProbeStatus::Running as u8, Ordering::Release);
-            let state_bg = Arc::clone(&state);
-            let model_variant_bg = model_variant_str.clone();
-            tokio::spawn(async move {
-                let (a, b) =
-                    probe::run_probe(&state_bg.pool, cfg_max_seq, per_worker_workspace).await;
-                let cm = CostModel {
-                    a,
-                    b,
-                    max_workspace_bytes: per_worker_workspace,
-                };
-                info!(
-                    a = cm.a,
-                    b = cm.b,
-                    max_workspace_mb = cm.max_workspace_bytes / (1024 * 1024),
-                    "Background probe complete — updating cost model"
-                );
-                state_bg.cost_model.store(Arc::new(cm));
-                // Distinguish real fit from conservative fallback.
-                let status = if (a - CostModel::CONSERVATIVE_A).abs() < f64::EPSILON
-                    && (b - CostModel::CONSERVATIVE_B).abs() < f64::EPSILON
-                {
-                    ProbeStatus::Failed
-                } else {
-                    probe::save_probe_cache(&cache_dir, &model_variant_bg, cfg_max_seq, a, b);
-                    ProbeStatus::Complete
-                };
-                state_bg.probe_status.store(status as u8, Ordering::Release);
-                info!(probe_status = status.as_str(), "Probe status updated");
-            });
-        }
-```
+Override and cache-hit paths do not acquire the extra permits — they run readiness checks inline (no concurrent probe, no contamination risk) and release the initial `cfg_workers − 1` + 1 permits by simply not holding them.
 
 Two synchronization primitives make this safe:
 
@@ -724,33 +699,38 @@ pub enum ProbeStatus {
 
 ## 12. End-to-End Example — From Probe Run to `/health`
 
-A representative cold-start trace at default settings on a 28 GB Fargate task:
+A representative cold-start trace at default settings on a 28 GB ECS Managed Instance task (v0.15.0-rc5+):
 
 ```
 [INFO] Starting bge-m3-embedding-server bind=0.0.0.0:8081 workers=7 max_seq=8192 model=Fp16
 [INFO] Phase 1/4 git: cloning model files                                  ┐
 [INFO] Phase 4/4 saveAll: tokenizer + dense + sparse loaded                │ leader-first
-[INFO] Leader worker ready, model cache warm rss_delta_mb=1100 (1/7)       │ §8.2 worker-reported
-[INFO] Workers 1..7 loaded from warm cache                                 ┘
-[INFO] Memory detected available_bytes=28991029248 source=cgroup_v2
-[INFO] Measured model RSS per worker model_rss_per_worker_mb=1100          ← pool.model_rss_max_bytes()
-[INFO] Workspace budget computed worst_case_peak_mb=21504 available_mb=27000
-        utilization_pct=75.5 per_worker_workspace_mb=2044                  ← §11.0
-[INFO] Probe cache fingerprint mismatch; will re-probe                     ┐
-[INFO] Starting memory probe max_seq=8192 rss_ceiling_mb=2044              │ probe sweep
-[INFO] Probe shape measured batch=1 seq=64 rss_delta_mb=2                  │ §8.1
-[INFO] Probe shape measured batch=4 seq=64 rss_delta_mb=8                  │
-[INFO] Probe shape measured batch=1 seq=256 rss_delta_mb=6                 │
-[INFO] Probe shape measured batch=1 seq=1024 rss_delta_mb=27               │
-[INFO] Probe shape measured batch=1 seq=2048 rss_delta_mb=68               │
-[INFO] Probe shape measured batch=1 seq=4096 rss_delta_mb=210              │
-[INFO] Probe shape measured batch=1 seq=8192 rss_delta_mb=720              ┘
-[INFO] Probe: fitted cost model a=18432 b=6.2 data_points=7                ┐ OLS, §6
-[INFO] Background probe complete — updating cost model                     │
-[INFO] Probe coefficients cached to EFS                                    │ §10.2
-[INFO] Probe status updated probe_status=complete                          ┘
-[INFO] Models ready — accepting requests
+[INFO] Leader worker ready, model cache warm rss_delta_mb=1409 (1/7)       │ §8.2 worker-reported
+[INFO] Workers 1..7 loaded from warm cache rss_delta_mb=1409 each          ┘ sequential, §8.2
+[INFO] Memory detected available_bytes=30064771072 source=cgroup_v2        ← path-walk §2 (Bug A fix)
+[INFO] Measured model RSS per worker model_rss_per_worker_mb=1409          ← median across workers
+[INFO] Workspace budget computed worst_case_peak_mb=17537 available_mb=28672
+        utilization_pct=61.2 per_worker_workspace_mb=1058                  ← §11.0
+[INFO] Probe cache fingerprint mismatch; will re-probe
+[INFO] Starting memory probe max_seq=8192 rss_ceiling_mb=1058              ┐ probe task holds all
+        cgroup_limit_mb=28672                                               │ cfg_workers permits
+[INFO] Probe shape measured batch=1 seq=64 rss_delta_mb=1                  │ §8.1
+[INFO] Probe shape measured batch=4 seq=64 rss_delta_mb=4                  │ per-shape RSS guard
+[INFO] Probe shape measured batch=1 seq=256 rss_delta_mb=3                 │ fires before each
+[INFO] Probe shape measured batch=1 seq=1024 rss_delta_mb=18               │ shape (§7.2)
+[INFO] Probe shape measured batch=1 seq=2048 rss_delta_mb=52               │
+[INFO] Probe: fitted cost model a=18500 b=6.3 data_points=5                ┘ OLS, §6
+[INFO] Probe complete — updating cost model
+[INFO] Probe coefficients cached to EFS                                    ← §10.2
+[INFO] Probe status updated probe_status=complete
+[INFO] Dense readiness probe passed                                        ┐ readiness checks
+[INFO] Sparse readiness probe passed                                       ┘ inside probe task
+[INFO] Models ready — accepting requests                                   ← permits released, traffic opens
 ```
+
+Note that probe RSS deltas are substantially lower than in the rc4 incident because:
+1. No concurrent dense/sparse readiness calls contaminate the first-shape RSS measurement.
+2. Probe halts at `(1, 2048)` — no `(1, 4096)` or `(1, 8192)` arena accumulation.
 
 After this, `GET /health` returns:
 
@@ -806,14 +786,16 @@ Every failure path leads to one of these cells:
 
 | Failure | What the probe does | What `probe_status` becomes | Server behaviour |
 |---------|---------------------|------------------------------|-------------------|
-| RSS reads return 0 (non-Linux) | Fit fails with empty data | `failed` | Conservative defaults; server functional |
+| RSS reads return 0 (non-Linux) | All-zero delta detection; fit skipped | `failed` | Conservative defaults; server functional |
 | One probe shape errors mid-sweep | Skip that data point, continue | `complete` (if others succeed) | Fit may be slightly less accurate |
-| `(1, max_seq)` errors (capability check) | Fail fast with hint log | `failed` | Conservative defaults; user reads log |
+| All shapes skipped by RSS-cap guard | Emit diagnostic with current_rss + cgroup_limit | `failed` | Conservative defaults; check cgroup detection |
+| `max_seq` ndarray construction fails | Would be a Rust panic (usize overflow); unreachable in practice | — | — |
 | OLS Gram is singular | `fit_cost_model` returns `None` | `failed` | Conservative defaults |
 | Negative coefficient | `fit_cost_model` returns `None` | `failed` | Conservative defaults |
 | Coefficient outside clamp | Clamp; log warning if difference >1% | `complete` | Fitted-but-clamped coefficients used |
 | Cache file unreadable / truncated | Treat as miss; re-probe | normal lifecycle | Probe runs as if no cache |
 | Cache write fails | Log warning, keep fitted coefficients | `complete` | Next cold start re-probes |
+| Model does not support `max_seq` (Xenova 512-cap) | Surfaces as ORT error on first real request | — | First request fails; operator changes model variant or lowers `MAX_SEQ_LENGTH` |
 
 The asymmetry of conservatism is intentional: bin-packing under-counting is a slow service, bin-packing over-counting is no service. We over-count when in doubt.
 

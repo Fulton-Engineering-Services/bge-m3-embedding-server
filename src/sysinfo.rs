@@ -5,6 +5,20 @@
 /// reported by `/proc/meminfo`. On macOS we read host RAM via `sysctl`;
 /// cgroup support requires unsafe FFI so it is deferred.
 ///
+/// ## cgroup-v2 detection on ECS Managed Instances (Bottlerocket)
+///
+/// ECS Managed Instances launch containers **without** `--cgroupns=private`,
+/// so `/sys/fs/cgroup/memory.max` resolves to the unified-hierarchy root,
+/// which reads `"max"` (no limit). The actual container memory limit is
+/// set at a deeper path whose last component is recorded in
+/// `/proc/self/cgroup` (unified-hierarchy format: a single line
+/// `0::<path>`, e.g. `0::/ecs.slice/ecs-…-task.scope/<id>`).
+///
+/// `cgroup_memory()` reads `/proc/self/cgroup`, extracts that path, then
+/// reads `memory.max` at each ancestor (deepest first) until it finds a
+/// numeric limit or exhausts the tree. Falls through to `host_ram` only
+/// when the entire walk yields `"max"` (truly unconstrained host).
+///
 /// RSS tracking (`read_process_rss_bytes`) is Linux-only (parses
 /// `/proc/self/statm`). On macOS it returns `None`; the auto-budget logic
 /// treats `None` as "cannot measure model footprint" and uses conservative
@@ -137,21 +151,20 @@ fn cgroup_memory() -> Option<MemoryReading> {
     // no limit is configured. Treat any value ≥ 1 TiB as "unlimited".
     const ONE_TIB: usize = 1024 * 1024 * 1024 * 1024;
 
-    // cgroup v2: /sys/fs/cgroup/memory.max (value "max" means unlimited)
-    if let Ok(raw) = std::fs::read_to_string("/sys/fs/cgroup/memory.max") {
-        let trimmed = raw.trim();
-        if trimmed != "max" {
-            if let Ok(bytes) = trimmed.parse::<usize>() {
-                tracing::debug!(bytes, source = "cgroup_v2", "Detected memory limit");
-                return Some(MemoryReading {
-                    available_bytes: bytes,
-                    source: MemorySource::CgroupV2,
-                });
-            }
-        }
+    // --- cgroup v2: path-walk from /proc/self/cgroup ---
+    //
+    // ECS Managed Instances (Bottlerocket) do NOT set --cgroupns=private, so
+    // /sys/fs/cgroup/memory.max resolves to the host root where value is "max".
+    // The container's actual limit lives at a deeper path recorded in
+    // /proc/self/cgroup (unified v2 format: `0::<path>`).
+    //
+    // Walk ancestors deepest-first until a numeric limit < 1 TiB is found.
+    // If the entire walk yields "max", fall through to cgroup v1 then host_ram.
+    if let Some(reading) = cgroup_v2_walk("/sys/fs/cgroup", "/proc/self/cgroup") {
+        return Some(reading);
     }
 
-    // cgroup v1: /sys/fs/cgroup/memory/memory.limit_in_bytes
+    // --- cgroup v1: /sys/fs/cgroup/memory/memory.limit_in_bytes ---
     if let Ok(raw) = std::fs::read_to_string("/sys/fs/cgroup/memory/memory.limit_in_bytes") {
         let trimmed = raw.trim();
         if let Ok(bytes) = trimmed.parse::<usize>() {
@@ -162,6 +175,83 @@ fn cgroup_memory() -> Option<MemoryReading> {
                     source: MemorySource::CgroupV1,
                 });
             }
+        }
+    }
+
+    None
+}
+
+/// Reads the cgroup v2 memory limit by walking ancestors of the container's
+/// cgroup path.
+///
+/// # Arguments
+///
+/// - `cgroup_fs_root`: the mountpoint of the cgroup v2 filesystem (normally
+///   `/sys/fs/cgroup`; injectable for unit tests).
+/// - `proc_self_cgroup`: path to the per-process cgroup file (normally
+///   `/proc/self/cgroup`; injectable for unit tests).
+///
+/// Parses the unified-hierarchy line (`0::<path>`), then iterates from the
+/// deepest ancestor up to the root, reading `memory.max` at each level.
+/// Returns the first numeric limit found that is below 1 TiB, or `None`
+/// when the entire walk yields `"max"` or the file is unreadable.
+#[cfg(target_os = "linux")]
+pub(crate) fn cgroup_v2_walk(
+    cgroup_fs_root: &str,
+    proc_self_cgroup: &str,
+) -> Option<MemoryReading> {
+    const ONE_TIB: usize = 1024 * 1024 * 1024 * 1024;
+
+    let cgroup_content = std::fs::read_to_string(proc_self_cgroup).ok()?;
+
+    // Unified hierarchy: exactly one line, format `0::<path>` (e.g. `0::/ecs.slice/…`)
+    // Legacy v1 has multiple lines, each with `<hierarchy_id>:<controllers>:<path>`.
+    // We only attempt v2 if we find the unified `0::` prefix.
+    let cgroup_rel_path = cgroup_content
+        .lines()
+        .find_map(|line| line.strip_prefix("0::"))?;
+
+    // Build the absolute cgroup directory path.
+    let cgroup_dir = std::path::PathBuf::from(cgroup_fs_root).join(
+        // Strip the leading '/' so PathBuf::join doesn't replace the root.
+        cgroup_rel_path.trim_start_matches('/'),
+    );
+
+    // Walk ancestors from deepest to shallowest (inclusive of the container
+    // cgroup itself, exclusive of the root mountpoint).
+    let mut current = cgroup_dir.as_path();
+    let fs_root = std::path::Path::new(cgroup_fs_root);
+
+    loop {
+        let memory_max = current.join("memory.max");
+        if let Ok(raw) = std::fs::read_to_string(&memory_max) {
+            let trimmed = raw.trim();
+            if trimmed != "max" {
+                if let Ok(bytes) = trimmed.parse::<usize>() {
+                    if bytes < ONE_TIB {
+                        tracing::debug!(
+                            bytes,
+                            source = "cgroup_v2",
+                            path = %memory_max.display(),
+                            "Detected memory limit"
+                        );
+                        return Some(MemoryReading {
+                            available_bytes: bytes,
+                            source: MemorySource::CgroupV2,
+                        });
+                    }
+                }
+            }
+        }
+
+        // Stop at the cgroup filesystem root — don't walk above it.
+        if current == fs_root {
+            break;
+        }
+
+        match current.parent() {
+            Some(parent) => current = parent,
+            None => break,
         }
     }
 
@@ -270,5 +360,139 @@ mod tests {
         assert_eq!(MemorySource::CgroupV2.to_string(), "cgroup_v2");
         assert_eq!(MemorySource::CgroupV1.to_string(), "cgroup_v1");
         assert_eq!(MemorySource::HostRam.to_string(), "host_ram");
+    }
+
+    // -----------------------------------------------------------------------
+    // cgroup_v2_walk unit tests
+    //
+    // These use tempfile::TempDir to construct a minimal fake cgroup2 FS so
+    // the tests run on any OS (including macOS CI) without touching real
+    // /sys or /proc paths.
+    // -----------------------------------------------------------------------
+
+    /// Helper: write `memory.max` at every component of `rel_path` under `root`,
+    /// creating intermediate directories.  `values` is a list of (rel_dir, content)
+    /// pairs — e.g. `[("ecs.slice/task/container", "30064771072"), ("ecs.slice/task", "max")]`.
+    #[cfg(target_os = "linux")]
+    fn write_memory_max_files(root: &std::path::Path, files: &[(&str, &str)]) {
+        for (rel_dir, content) in files {
+            let dir = root.join(rel_dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("memory.max"), content).unwrap();
+        }
+        // Also create memory.max at root itself to terminate walks cleanly.
+        if !root.join("memory.max").exists() {
+            std::fs::write(root.join("memory.max"), "max").unwrap();
+        }
+    }
+
+    /// Helper: write the /proc/self/cgroup file (unified v2 format).
+    #[cfg(target_os = "linux")]
+    fn write_proc_cgroup(dir: &std::path::Path, rel_cgroup_path: &str) -> std::path::PathBuf {
+        let path = dir.join("proc_cgroup");
+        std::fs::write(&path, format!("0::/{rel_cgroup_path}\n")).unwrap();
+        path
+    }
+
+    /// Case 1 — ECS-style deeply-nested cgroup: numeric limit at the leaf.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cgroup_v2_walk_ecs_nested_returns_leaf_limit() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        let cgroup_rel = "ecs.slice/ecs-task.scope/container-abc123";
+        let limit_bytes: usize = 30 * 1024 * 1024 * 1024; // 30 GiB
+
+        write_memory_max_files(
+            root,
+            &[
+                (cgroup_rel, &limit_bytes.to_string()),
+                ("ecs.slice/ecs-task.scope", "max"),
+                ("ecs.slice", "max"),
+            ],
+        );
+        let proc_cgroup = write_proc_cgroup(root, cgroup_rel);
+
+        let result = cgroup_v2_walk(root.to_str().unwrap(), proc_cgroup.to_str().unwrap());
+        assert!(result.is_some(), "should find the leaf limit");
+        let r = result.unwrap();
+        assert_eq!(r.available_bytes, limit_bytes);
+        assert_eq!(r.source, MemorySource::CgroupV2);
+    }
+
+    /// Case 2 — leaf is "max", parent has a numeric limit: walk-up succeeds.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cgroup_v2_walk_walks_up_to_parent_with_limit() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        let cgroup_rel = "ecs.slice/task.scope/container-xyz";
+        let limit_bytes: usize = 28 * 1024 * 1024 * 1024; // 28 GiB
+
+        write_memory_max_files(
+            root,
+            &[
+                (cgroup_rel, "max"),
+                ("ecs.slice/task.scope", &limit_bytes.to_string()),
+                ("ecs.slice", "max"),
+            ],
+        );
+        let proc_cgroup = write_proc_cgroup(root, cgroup_rel);
+
+        let result = cgroup_v2_walk(root.to_str().unwrap(), proc_cgroup.to_str().unwrap());
+        assert!(result.is_some(), "should walk up and find parent limit");
+        assert_eq!(result.unwrap().available_bytes, limit_bytes);
+    }
+
+    /// Case 3 — all ancestors (including root) have "max": returns None so
+    /// caller falls through to host_ram.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cgroup_v2_walk_all_max_returns_none() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        let cgroup_rel = "system.slice/myservice.service";
+
+        write_memory_max_files(root, &[(cgroup_rel, "max"), ("system.slice", "max")]);
+        // root memory.max is already "max" from write_memory_max_files helper.
+        let proc_cgroup = write_proc_cgroup(root, cgroup_rel);
+
+        let result = cgroup_v2_walk(root.to_str().unwrap(), proc_cgroup.to_str().unwrap());
+        assert!(result.is_none(), "all-max hierarchy should return None");
+    }
+
+    /// Case 4 — /proc/self/cgroup is empty: returns None.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cgroup_v2_walk_empty_proc_cgroup_returns_none() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        let proc_cgroup = root.join("proc_cgroup_empty");
+        std::fs::write(&proc_cgroup, "").unwrap();
+
+        let result = cgroup_v2_walk(root.to_str().unwrap(), proc_cgroup.to_str().unwrap());
+        assert!(result.is_none(), "empty proc/cgroup should return None");
+    }
+
+    /// Case 5 — /proc/self/cgroup has cgroup-v1 lines only (no `0::` prefix):
+    /// returns None, preserving the cgroup-v1 fallback path.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cgroup_v2_walk_v1_only_cgroup_file_returns_none() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        // cgroup v1 format: multiple lines, non-zero hierarchy IDs.
+        let proc_cgroup = root.join("proc_cgroup_v1");
+        std::fs::write(
+            &proc_cgroup,
+            "11:memory:/docker/abc123\n10:cpu,cpuacct:/docker/abc123\n",
+        )
+        .unwrap();
+
+        let result = cgroup_v2_walk(root.to_str().unwrap(), proc_cgroup.to_str().unwrap());
+        assert!(
+            result.is_none(),
+            "v1-only cgroup file should return None (no 0:: line)"
+        );
     }
 }
