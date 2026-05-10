@@ -22,6 +22,7 @@ import matplotlib
 
 matplotlib.use("Agg")  # headless rendering — no display needed
 import matplotlib.pyplot as plt
+from matplotlib.animation import FuncAnimation, PillowWriter
 
 # ---------------------------------------------------------------------------
 # rcParams — mathtext only, no LaTeX binary required
@@ -102,4 +103,19 @@ def save(fig: plt.Figure, name: str, out_dir: Path | None = None) -> str:
     target.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(str(target), bbox_inches="tight")
     plt.close(fig)
+    return str(target)
+
+
+def save_animation(
+    anim: FuncAnimation,
+    name: str,
+    fps: int = 10,
+    out_dir: Path | None = None,
+    dpi: int = 100,
+) -> str:
+    """Write anim to <out_dir>/<name>.gif using PillowWriter; return full path."""
+    target = (out_dir if out_dir is not None else OUT_DIR) / (name + ".gif")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    writer = PillowWriter(fps=fps, metadata={"loop": 0})
+    anim.save(str(target), writer=writer, dpi=dpi)
     return str(target)

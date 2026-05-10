@@ -14,6 +14,7 @@ dependencies = [
 
 [package.dev-dependencies]
 dev = [
+    { name = "pillow" },
     { name = "ruff" },
 ]
 
@@ -25,7 +26,10 @@ requires-dist = [
 ]
 
 [package.metadata.requires-dev]
-dev = [{ name = "ruff", specifier = ">=0.9.0" }]
+dev = [
+    { name = "pillow", specifier = ">=10.0" },
+    { name = "ruff", specifier = ">=0.9.0" },
+]
 
 [[package]]
 name = "contourpy"
