@@ -20,8 +20,7 @@ Builds up a 20-step gradient-descent trajectory on both panels simultaneously.
 Left (raw, ill-conditioned): zig-zag.
 Right (normalised): smoother convergence.
 
-30 frames at 10 fps ≈ 3 s loop.
-"""
+135 frames at 15 fps ≈ 9 s loop."""
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -40,7 +39,7 @@ from probe_visuals.common import (
 )
 
 _N_TRAJ_STEPS = 20
-_N_FRAMES = 30
+_N_FRAMES = 135
 
 
 def _run_gd_raw(
@@ -226,7 +225,7 @@ def main() -> None:
     def update(frame: int) -> None:
         _clear_artists()
 
-        step = min(frame, _N_TRAJ_STEPS)
+        step = min(frame // 3, _N_TRAJ_STEPS)
 
         # Draw trajectory segments up to current step
         for i in range(1, step + 1):
@@ -271,9 +270,9 @@ def main() -> None:
         )
         step_text.append(txt)
 
-        # Hold-phase annotations (frames 21-29)
-        if frame >= 21:
-            alpha_fade = min(1.0, (frame - 20) / 5.0)
+        # Hold-phase annotations (frames 63-134)
+        if frame >= 63:
+            alpha_fade = min(1.0, (frame - 62) / 15.0)
 
             ann_r = ax1.text(
                 0.03,
@@ -324,8 +323,8 @@ def main() -> None:
         )
         traj_raw.append(frame_lbl)
 
-    anim = FuncAnimation(fig, update, frames=_N_FRAMES, interval=100, repeat=False)
-    path = save_animation(anim, "fig04_loss_landscape_animated", fps=10, dpi=100)
+    anim = FuncAnimation(fig, update, frames=_N_FRAMES, interval=67, repeat=False)
+    path = save_animation(anim, "fig04_loss_landscape_animated", fps=15, dpi=100)
     print(f"  saved → {path}")
     plt.close(fig)
 

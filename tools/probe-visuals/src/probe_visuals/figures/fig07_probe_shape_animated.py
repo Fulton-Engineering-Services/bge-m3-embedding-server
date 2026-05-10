@@ -20,12 +20,11 @@ Probe shapes appear one-by-one in sweep order.  After each shape appears the
 normalised Gram-matrix determinant counter updates.  Shows how design coverage
 grows and why the off-arc (4,64) point matters.
 
-30 frames at 8 fps ≈ 3.75 s loop.
-  Frames  0– 3: shape 1 visible
-  Frames  4– 7: shapes 1-2 visible
+168 frames at 15 fps ≈ 11.2 s loop.
+  Frames   0– 23: shape 1 visible
+  Frames  24– 47: shapes 1-2 visible
   ...
-  Frames 24–27: all 7 shapes visible
-  Frames 28–29: hold + stability annotation
+  Frames 144–167: all 7 shapes visible (stability annotation)
 """
 
 import matplotlib.patches as mpatches
@@ -44,8 +43,8 @@ from probe_visuals.common import (
 )
 
 _N_SHAPES = len(PROBE_SHAPES)
-_FRAMES_PER_SHAPE = 4
-_N_FRAMES = _N_SHAPES * _FRAMES_PER_SHAPE + 2  # 30
+_FRAMES_PER_SHAPE = 24
+_N_FRAMES = _N_SHAPES * _FRAMES_PER_SHAPE  # 168
 
 
 def _compute_gram_dets(
@@ -111,7 +110,7 @@ def main() -> None:
 
         # How many shapes visible this frame
         num_shown = min(frame // _FRAMES_PER_SHAPE + 1, _N_SHAPES)
-        show_stability = frame >= _N_SHAPES * _FRAMES_PER_SHAPE  # frames 28-29
+        show_stability = num_shown == _N_SHAPES  # frames 144-167
 
         ax.set_title(
             f"Probe Shape Information Geometry — shape {num_shown}/{_N_SHAPES} added\n"
@@ -209,8 +208,8 @@ def main() -> None:
 
         fig.tight_layout()
 
-    anim = FuncAnimation(fig, update, frames=_N_FRAMES, interval=125, repeat=False)
-    path = save_animation(anim, "fig07_probe_shape_animated", fps=8, dpi=100)
+    anim = FuncAnimation(fig, update, frames=_N_FRAMES, interval=67, repeat=False)
+    path = save_animation(anim, "fig07_probe_shape_animated", fps=15, dpi=100)
     print(f"  saved → {path}")
     plt.close(fig)
 

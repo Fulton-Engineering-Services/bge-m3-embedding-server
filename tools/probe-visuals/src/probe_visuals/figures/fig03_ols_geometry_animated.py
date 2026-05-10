@@ -19,7 +19,7 @@ fig03_ols_geometry_animated.py
 Data points appear one-by-one in sweep order, then the best-fit plane
 materialises (alpha fade), then the view slowly rotates.
 
-30 frames at 10 fps ≈ 3 s loop.
+135 frames at 15 fps ≈ 9 s loop.
 """
 
 import matplotlib.pyplot as plt
@@ -38,7 +38,7 @@ from probe_visuals.common import (
 )
 
 _N_SHAPES = len(PROBE_SHAPES)
-_N_FRAMES = 30
+_N_FRAMES = 135
 _INIT_AZIM = 30.0
 _INIT_ELEV = 25.0
 
@@ -72,28 +72,28 @@ def main() -> None:
         ax = fig.add_subplot(111, projection="3d")
 
         # Determine state from frame index
-        if frame < _N_SHAPES:
-            # Frames 0-6: points appear one by one
-            n_show = frame + 1
-            b_sz, s_sz = PROBE_SHAPES[frame]
+        if frame < 21:
+            # Frames 0-20: points appear one by one (3 frames per shape)
+            n_show = frame // 3 + 1
+            b_sz, s_sz = PROBE_SHAPES[frame // 3]
             title = f"Adding probe measurement {n_show}/{_N_SHAPES}: ({b_sz},{s_sz})"
             plane_alpha = 0.0
             show_residuals = False
-        elif frame == _N_SHAPES:
-            # Frame 7: all points, fitting hint
+        elif frame < 24:
+            # Frames 21-23: all points, fitting hint
             n_show = _N_SHAPES
             title = "Fitting OLS plane…"
             plane_alpha = 0.0
             show_residuals = False
-        elif frame < _N_SHAPES + 8:
-            # Frames 8-14: plane fades in over 7 steps
+        elif frame < 45:
+            # Frames 24-44: plane fades in over 7 steps (3 frames per step)
             n_show = _N_SHAPES
-            fade_step = frame - _N_SHAPES  # 1..7
+            fade_step = (frame - 24) // 3 + 1  # 1..7
             plane_alpha = (fade_step / 7) * 0.30
             show_residuals = True
             title = "Best-fit plane materialising…"
         else:
-            # Frames 15-29: rotate azimuth 90°
+            # Frames 45-134: rotate azimuth 90°
             n_show = _N_SHAPES
             plane_alpha = 0.30
             show_residuals = True
@@ -152,8 +152,8 @@ def main() -> None:
         ax.set_title(title, fontsize=10)
 
         # Rotate during final phase
-        if frame >= 15:
-            rot = (frame - 15) * (90.0 / 14.0)
+        if frame >= 45:
+            rot = (frame - 45) * (90.0 / 89.0)
             ax.view_init(elev=_INIT_ELEV, azim=_INIT_AZIM + rot)
         else:
             ax.view_init(elev=_INIT_ELEV, azim=_INIT_AZIM)
@@ -168,8 +168,24 @@ def main() -> None:
             color="navy",
         )
 
-    anim = FuncAnimation(fig, _draw_frame, frames=_N_FRAMES, interval=100)
-    path = save_animation(anim, "fig03_ols_geometry_animated", fps=10, dpi=100)
+        # Per-frame counter prevents Pillow GIF optimizer from collapsing
+        # identical consecutive hold frames (e.g. 3 frames per shape during
+        # the appearance phase) into a single compressed frame.
+        # alpha=0.25 darkblue on white survives 256-colour quantisation.
+        ax.text2D(
+            0.999,
+            0.001,
+            str(frame),
+            transform=ax.transAxes,
+            fontsize=5,
+            alpha=0.25,
+            color="darkblue",
+            ha="right",
+            va="bottom",
+        )
+
+    anim = FuncAnimation(fig, _draw_frame, frames=_N_FRAMES, interval=67)
+    path = save_animation(anim, "fig03_ols_geometry_animated", fps=15, dpi=75)
     print(f"  saved → {path}")
     plt.close(fig)
 

@@ -109,7 +109,7 @@ def save(fig: plt.Figure, name: str, out_dir: Path | None = None) -> str:
 def save_animation(
     anim: FuncAnimation,
     name: str,
-    fps: int = 10,
+    fps: int = 15,
     out_dir: Path | None = None,
     dpi: int = 100,
 ) -> str:
