@@ -42,6 +42,7 @@ pub enum ProbeStatus {
 
 impl ProbeStatus {
     /// Returns the JSON-serializable string representation used in `/health`.
+    #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Disabled => "disabled",
@@ -53,6 +54,7 @@ impl ProbeStatus {
     }
 
     /// Converts a raw `u8` (from `AtomicU8::load`) back to `ProbeStatus`.
+    #[must_use]
     pub fn from_u8(v: u8) -> Self {
         match v {
             0 => Self::Disabled,
@@ -142,6 +144,8 @@ pub struct TuningInfo {
 }
 
 impl TuningInfo {
+    /// Creates a [`TuningInfo`] from a memory reading and probe measurements.
+    #[must_use]
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         mem: &MemoryReading,
@@ -160,6 +164,7 @@ impl TuningInfo {
 
     /// Convenience builder for the case where memory detection was not possible
     /// (macOS without cgroup support, or probe disabled).
+    #[must_use]
     #[allow(dead_code)]
     pub fn unknown(model_rss_per_worker: usize) -> Self {
         Self {

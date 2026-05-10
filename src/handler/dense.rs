@@ -22,6 +22,18 @@ use crate::error::AppError;
 use crate::models::{DenseEmbeddingData, DenseRequest, DenseResponse, Usage};
 use crate::state::AppState;
 
+/// Handles `POST /v1/embeddings` — returns dense (float32) embeddings.
+///
+/// # Errors
+///
+/// - [`AppError::ServiceUnavailable`] if the model is not ready or no workers are live.
+/// - [`AppError::InvalidRequest`] if the batch is empty, exceeds `max_batch`, or any
+///   text exceeds the per-string character limit.
+/// - [`AppError::Internal`] if the embedding pool returns an inference error.
+///
+/// # Panics
+///
+/// Panics if the request semaphore has been closed — should not occur in normal operation.
 #[tracing::instrument(
     skip(state, req),
     fields(

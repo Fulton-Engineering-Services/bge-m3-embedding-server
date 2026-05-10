@@ -189,6 +189,13 @@ impl EmbedPool {
         )
     }
 
+    /// Runs dense (float32) embedding inference on `texts`.
+    ///
+    /// # Errors
+    ///
+    /// - Returns `Err` if the worker channel has closed (pool shut down).
+    /// - Returns `Err` if the worker drops the reply sender before responding.
+    /// - Returns `Err` if the ORT session fails during inference.
     pub async fn dense(&self, texts: Vec<String>) -> Result<(Vec<Vec<f32>>, EmbedStats)> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.tx
@@ -203,6 +210,13 @@ impl EmbedPool {
             .map_err(|_| anyhow::anyhow!("Worker dropped reply sender"))?
     }
 
+    /// Runs sparse (SPLADE-style) embedding inference on `texts`.
+    ///
+    /// # Errors
+    ///
+    /// - Returns `Err` if the worker channel has closed (pool shut down).
+    /// - Returns `Err` if the worker drops the reply sender before responding.
+    /// - Returns `Err` if the ORT session fails during inference.
     pub async fn sparse(&self, texts: Vec<String>) -> Result<(Vec<SparseEmbedding>, EmbedStats)> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.tx
@@ -222,6 +236,12 @@ impl EmbedPool {
     /// Equivalent to calling [`Self::dense`] and [`Self::sparse`] back-to-back,
     /// but uses one `session.run()` per chunk instead of two — at near-zero
     /// marginal GPU cost.
+    ///
+    /// # Errors
+    ///
+    /// - Returns `Err` if the worker channel has closed (pool shut down).
+    /// - Returns `Err` if the worker drops the reply sender before responding.
+    /// - Returns `Err` if the ORT session fails during inference.
     pub async fn both(&self, texts: Vec<String>) -> Result<(Vec<DualEmbedding>, EmbedStats)> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.tx

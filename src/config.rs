@@ -181,6 +181,7 @@ impl Config {
     /// Creates a [`Config`] by reading environment variables.
     ///
     /// Unrecognized or missing variables fall back to their defaults.
+    #[must_use]
     pub fn from_env() -> Self {
         Self::from_lookup(|key| env::var(key).ok())
     }

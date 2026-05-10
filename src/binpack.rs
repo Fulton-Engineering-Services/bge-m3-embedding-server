@@ -65,6 +65,7 @@ impl CostModel {
     pub const DEFAULT_MAX_WORKSPACE: usize = 2 * 1024 * 1024 * 1024; // 2 GiB
 
     /// Constructs a `CostModel` with conservative defaults and the given workspace ceiling.
+    #[must_use]
     pub fn conservative(max_workspace_bytes: usize) -> Self {
         Self {
             a: Self::CONSERVATIVE_A,
@@ -84,6 +85,7 @@ impl CostModel {
     //   this is a memory *budget estimate*, not an exact byte count.
     // cast_sign_loss: a and b are validated positive at construction, so the
     //   products are always ≥ 0 before the cast.
+    #[must_use]
     #[allow(
         clippy::cast_precision_loss,
         clippy::cast_possible_truncation,
@@ -97,6 +99,7 @@ impl CostModel {
     }
 
     /// Returns `true` if the chunk fits within the workspace budget.
+    #[must_use]
     pub fn fits(&self, count: usize, max_seq: usize) -> bool {
         self.chunk_cost(count, max_seq) <= self.max_workspace_bytes as u128
     }

@@ -17,23 +17,6 @@
 //! `main.rs` is a 20–30 line entry point that calls [`run`]; all real
 //! orchestration logic lives here so it can be unit-tested and reused from
 //! integration tests without spawning the binary.
-//!
-//! ## Lints
-//!
-//! These pedantic clippy lints are allowed crate-wide:
-//! - `missing_errors_doc` — internal-purpose lib; per-fn `# Errors` sections
-//!   would duplicate the names of the wrapped underlying anyhow errors with
-//!   no added value.
-//! - `missing_panics_doc` — same rationale.
-//! - `must_use_candidate` — many of the type's accessors return primitive
-//!   `usize`/`bool` values that are routinely used at call sites without a
-//!   formal `#[must_use]` reminder.
-
-#![allow(
-    clippy::missing_errors_doc,
-    clippy::missing_panics_doc,
-    clippy::must_use_candidate
-)]
 
 pub mod binpack;
 pub mod bootstrap;
@@ -65,9 +48,12 @@ use crate::state::{AppState, ProbeStatus};
 /// Runs the embedding server end-to-end: load config, spawn the worker pool,
 /// install the readiness probe, start the heartbeat, and serve HTTP traffic.
 ///
-/// Returns `Err` only on an unrecoverable startup failure (bind error, etc.);
-/// background tasks log and `process::exit(1)` if their own setup fails so the
-/// container is restarted by the orchestrator.
+/// Background tasks log and call `process::exit(1)` on their own unrecoverable
+/// failures so the container is restarted by the orchestrator.
+///
+/// # Errors
+///
+/// Returns `Err` if the TCP listener cannot bind to the configured address.
 #[allow(clippy::too_many_lines)]
 pub async fn run() -> anyhow::Result<()> {
     info!(

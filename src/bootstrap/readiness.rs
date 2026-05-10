@@ -54,6 +54,12 @@ use crate::sysinfo;
 ///    If the probe is still running in the background, the bin-packer uses
 ///    conservative defaults until the `ArcSwap` is updated (typically ~120 s).
 ///
+/// # Errors
+///
+/// - Worker pool init panicked (`JoinError`) or returned an error from model loading.
+/// - Per-worker workspace budget falls below the physics floor (cannot fit even one text
+///   at `max_seq_length` — container is restarted by the orchestrator).
+///
 // cast_possible_truncation: physics_floor is a u128 workspace estimate; truncating
 //   to usize is safe because per_worker_workspace is itself bounded by available_bytes
 //   which fits comfortably in usize on any 64-bit target.
