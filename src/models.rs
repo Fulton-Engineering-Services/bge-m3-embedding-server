@@ -12,6 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! Request and response model types for the embedding API endpoints.
+//!
+//! Dense types are OpenAI-compatible. Sparse and dual types are BGE-M3
+//! specific; they extend the same request shape with additional output fields.
+
 use serde::{Deserialize, Deserializer, Serialize};
 
 // ---------------------------------------------------------------------------
@@ -46,31 +51,42 @@ impl<'de> Deserialize<'de> for TextInput {
 /// Request body for the dense embeddings endpoint.
 #[derive(Debug, Deserialize)]
 pub struct DenseRequest {
+    /// Input texts to generate embeddings for.
     pub input: TextInput,
+    /// Accepted for `OpenAI` API compatibility; value is ignored — always uses BGE-M3.
     pub model: Option<String>,
 }
 
 /// Top-level response for the dense embeddings endpoint (OpenAI-compatible).
 #[derive(Debug, Serialize)]
 pub struct DenseResponse {
+    /// Always `"list"`.
     pub object: &'static str,
+    /// Always `"bge-m3"`.
     pub model: &'static str,
+    /// Per-document dense embedding entries, one per input text.
     pub data: Vec<DenseEmbeddingData>,
+    /// Aggregate token usage estimates.
     pub usage: Usage,
 }
 
 /// Per-document dense embedding entry.
 #[derive(Debug, Serialize)]
 pub struct DenseEmbeddingData {
+    /// Always `"embedding"`.
     pub object: &'static str,
+    /// Zero-based position of this document in the request's input array.
     pub index: usize,
+    /// L2-normalized 1024-dimensional dense embedding vector.
     pub embedding: Vec<f32>,
 }
 
 /// Token usage counters.
 #[derive(Debug, Serialize)]
 pub struct Usage {
+    /// Estimated input token count (approximated as `chars / 4 + 1` per text).
     pub prompt_tokens: usize,
+    /// Same as `prompt_tokens` — embedding models have no completion tokens.
     pub total_tokens: usize,
 }
 
@@ -81,26 +97,32 @@ pub struct Usage {
 /// Request body for the sparse embeddings endpoint.
 #[derive(Debug, Deserialize)]
 pub struct SparseRequest {
+    /// Input texts to generate sparse embeddings for.
     pub input: TextInput,
 }
 
 /// Top-level response for the sparse embeddings endpoint.
 #[derive(Debug, Serialize)]
 pub struct SparseResponse {
+    /// Per-document sparse embedding entries, one per input text.
     pub data: Vec<SparseEmbeddingData>,
 }
 
 /// Per-document sparse embedding entry.
 #[derive(Debug, Serialize)]
 pub struct SparseEmbeddingData {
+    /// Zero-based position of this document in the request's input array.
     pub index: usize,
+    /// Non-zero vocabulary token weights for this document.
     pub sparse_values: SparseValues,
 }
 
 /// Parallel arrays of token indices and their weights.
 #[derive(Debug, Serialize)]
 pub struct SparseValues {
+    /// Sorted vocabulary token IDs with non-zero ReLU-gated weight.
     pub indices: Vec<u32>,
+    /// ReLU-gated weights corresponding to each index, in the same order.
     pub values: Vec<f32>,
 }
 
@@ -111,6 +133,7 @@ pub struct SparseValues {
 /// Request body for the unified dense + sparse embeddings endpoint.
 #[derive(Debug, Deserialize)]
 pub struct DualRequest {
+    /// Input texts to generate dense and sparse embeddings for.
     pub input: TextInput,
     /// Accepted for `OpenAI` API compatibility; always uses BGE-M3.
     pub model: Option<String>,
@@ -119,17 +142,24 @@ pub struct DualRequest {
 /// Top-level response for the unified dense + sparse embeddings endpoint.
 #[derive(Debug, Serialize)]
 pub struct DualResponse {
+    /// Always `"list"`.
     pub object: &'static str,
+    /// Always `"bge-m3"`.
     pub model: &'static str,
+    /// Per-document paired dense + sparse embedding entries.
     pub data: Vec<DualEmbeddingData>,
+    /// Aggregate token usage estimates.
     pub usage: Usage,
 }
 
 /// Per-document paired dense + sparse embedding entry.
 #[derive(Debug, Serialize)]
 pub struct DualEmbeddingData {
+    /// Zero-based position of this document in the request's input array.
     pub index: usize,
+    /// L2-normalized 1024-dimensional dense embedding vector.
     pub embedding: Vec<f32>,
+    /// Non-zero vocabulary token weights for this document.
     pub sparse_values: SparseValues,
 }
 
@@ -140,14 +170,18 @@ pub struct DualEmbeddingData {
 /// Top-level response for GET /v1/models (OpenAI-compatible).
 #[derive(Debug, Serialize)]
 pub struct ModelsResponse {
+    /// Always `"list"`.
     pub object: &'static str,
+    /// List of available model entries.
     pub data: Vec<ModelEntry>,
 }
 
 /// A single model entry.
 #[derive(Debug, Serialize)]
 pub struct ModelEntry {
+    /// Model identifier — always `"bge-m3"`.
     pub id: &'static str,
+    /// Always `"model"`.
     pub object: &'static str,
 }
 

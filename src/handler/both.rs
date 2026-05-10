@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! `POST /v1/embeddings:both` handler — dense + sparse embeddings in one pass.
+
 use std::sync::Arc;
 use std::time::Instant;
 

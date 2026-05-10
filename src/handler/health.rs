@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! `GET /health` handler — readiness status, worker counts, and tuning diagnostics.
+
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
@@ -19,6 +21,11 @@ use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
 
 use crate::state::{AppState, ProbeStatus};
 
+/// Handles `GET /health` — returns readiness status, worker counts, and tuning diagnostics.
+///
+/// Returns `503` while models are loading or if all workers have exited; returns
+/// `200 ok` (or `200 warn` when fewer workers are live than configured) with the
+/// current cost-model coefficients and probe status in the `tuning` block.
 pub async fn health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let ready = state.ready.load(Ordering::Acquire);
     let live = state.pool.live_worker_count();

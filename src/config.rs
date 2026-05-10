@@ -12,6 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! Server configuration loaded from environment variables at startup.
+//!
+//! All settings are read once via [`Config::from_env`] and then immutable
+//! for the server's lifetime. See each field's doc comment for the
+//! corresponding environment variable name and default value.
+
 use crate::binpack::CostModel;
 use std::env;
 use std::time::Duration;
@@ -187,6 +193,12 @@ impl Config {
     }
 
     #[allow(clippy::too_many_lines)]
+    /// Creates a [`Config`] by resolving each setting through `lookup`.
+    ///
+    /// `lookup` receives an env-var name and returns its value if set, or
+    /// `None` to fall back to the default for that setting. Used by
+    /// [`Config::from_env`] with the real environment and in tests with a
+    /// closure over a `HashMap`.
     pub(crate) fn from_lookup<F: Fn(&str) -> Option<String>>(lookup: F) -> Self {
         let workers = lookup("BGE_M3_WORKERS")
             .and_then(|v| v.parse::<usize>().ok())

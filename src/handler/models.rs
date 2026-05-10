@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! `GET /v1/models` handler — OpenAI-compatible fleet discovery endpoint.
+
 use std::sync::Arc;
 
 use axum::{extract::State, response::IntoResponse, Json};

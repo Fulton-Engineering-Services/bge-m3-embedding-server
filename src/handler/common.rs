@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! Shared input validation and service-readiness helpers used by all handlers.
+
 use std::sync::atomic::Ordering;
 
 use crate::error::AppError;

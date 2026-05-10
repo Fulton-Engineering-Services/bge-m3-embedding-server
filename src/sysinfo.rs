@@ -12,31 +12,31 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-/// Memory detection for auto-budget computation.
-///
-/// Production target is Linux (Fargate/ECS). On Linux we walk the cgroup
-/// hierarchy to find the container memory limit, then fall back to host RAM
-/// reported by `/proc/meminfo`. On macOS we read host RAM via `sysctl`;
-/// cgroup support requires unsafe FFI so it is deferred.
-///
-/// ## cgroup-v2 detection on ECS Managed Instances (Bottlerocket)
-///
-/// ECS Managed Instances launch containers **without** `--cgroupns=private`,
-/// so `/sys/fs/cgroup/memory.max` resolves to the unified-hierarchy root,
-/// which reads `"max"` (no limit). The actual container memory limit is
-/// set at a deeper path whose last component is recorded in
-/// `/proc/self/cgroup` (unified-hierarchy format: a single line
-/// `0::<path>`, e.g. `0::/ecs.slice/ecs-…-task.scope/<id>`).
-///
-/// `cgroup_memory()` reads `/proc/self/cgroup`, extracts that path, then
-/// reads `memory.max` at each ancestor (deepest first) until it finds a
-/// numeric limit or exhausts the tree. Falls through to `host_ram` only
-/// when the entire walk yields `"max"` (truly unconstrained host).
-///
-/// RSS tracking (`read_process_rss_bytes`) is Linux-only (parses
-/// `/proc/self/statm`). On macOS it returns `None`; the auto-budget logic
-/// treats `None` as "cannot measure model footprint" and uses conservative
-/// defaults.
+//! Memory detection for auto-budget computation.
+//!
+//! Production target is Linux (Fargate/ECS). On Linux we walk the cgroup
+//! hierarchy to find the container memory limit, then fall back to host RAM
+//! reported by `/proc/meminfo`. On macOS we read host RAM via `sysctl`;
+//! cgroup support requires unsafe FFI so it is deferred.
+//!
+//! ## cgroup-v2 detection on ECS Managed Instances (Bottlerocket)
+//!
+//! ECS Managed Instances launch containers **without** `--cgroupns=private`,
+//! so `/sys/fs/cgroup/memory.max` resolves to the unified-hierarchy root,
+//! which reads `"max"` (no limit). The actual container memory limit is
+//! set at a deeper path whose last component is recorded in
+//! `/proc/self/cgroup` (unified-hierarchy format: a single line
+//! `0::<path>`, e.g. `0::/ecs.slice/ecs-…-task.scope/<id>`).
+//!
+//! `cgroup_memory()` reads `/proc/self/cgroup`, extracts that path, then
+//! reads `memory.max` at each ancestor (deepest first) until it finds a
+//! numeric limit or exhausts the tree. Falls through to `host_ram` only
+//! when the entire walk yields `"max"` (truly unconstrained host).
+//!
+//! RSS tracking (`read_process_rss_bytes`) is Linux-only (parses
+//! `/proc/self/statm`). On macOS it returns `None`; the auto-budget logic
+//! treats `None` as "cannot measure model footprint" and uses conservative
+//! defaults.
 use tracing::warn;
 
 // ---------------------------------------------------------------------------
@@ -71,7 +71,9 @@ impl std::fmt::Display for MemorySource {
 /// A memory reading with its provenance.
 #[derive(Debug, Clone, Copy)]
 pub struct MemoryReading {
+    /// Total available memory bytes detected from the source.
     pub available_bytes: usize,
+    /// Detection method that produced this reading.
     pub source: MemorySource,
 }
 

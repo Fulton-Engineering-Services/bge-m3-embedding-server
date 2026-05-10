@@ -27,6 +27,14 @@ use super::math::median_usize;
 use super::types::{DualEmbedding, EmbedRequest, EmbedStats, ProbeResult, SparseEmbedding};
 use super::worker::{run_worker, WorkerConfig};
 
+/// Async handle to the embedding worker thread pool.
+///
+/// Wraps a bounded `mpsc` channel shared by `n` `spawn_blocking` worker threads.
+/// Each worker owns its own ORT session and tokenizer; the pool dispatches
+/// `EmbedRequest` variants to whichever worker is free next.
+///
+/// Clone is cheap — the underlying channel sender and atomic counters are
+/// reference-counted.
 #[derive(Clone)]
 pub struct EmbedPool {
     tx: mpsc::Sender<EmbedRequest>,
@@ -273,11 +281,16 @@ impl EmbedPool {
     }
 
     #[must_use]
+    /// Returns the number of worker threads currently alive (not yet exited).
     pub fn live_worker_count(&self) -> usize {
         self.live_workers.load(Ordering::Acquire)
     }
 
     #[must_use]
+    /// Returns the number of workers that currently have model instances loaded in memory.
+    ///
+    /// A worker transitions from loaded to unloaded after the [`crate::config::Config::idle_timeout`]
+    /// elapses with no incoming requests, and back to loaded on the next request.
     pub fn loaded_worker_count(&self) -> usize {
         self.loaded_workers.load(Ordering::Acquire)
     }

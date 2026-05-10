@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! Application-level error types that map to HTTP status codes.
+
 use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},

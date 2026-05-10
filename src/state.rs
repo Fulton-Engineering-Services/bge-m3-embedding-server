@@ -12,6 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! Shared application state threaded through Axum handlers via [`Arc<AppState>`].
+//!
+//! [`AppState`] holds the worker pool, readiness flag, concurrency semaphore,
+//! and the live cost-model handle. [`TuningInfo`] captures the static
+//! memory-detection snapshot written once before the background probe starts.
+
 use crate::binpack::CostModel;
 use crate::embedder::EmbedPool;
 use crate::sysinfo::{MemoryReading, MemorySource};

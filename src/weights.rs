@@ -12,6 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! Bundled BGE-M3 sparse-linear projection weights.
+//!
+//! The weights file (`sparse_linear.safetensors`) is embedded at compile time
+//! via `include_bytes!` and parsed once on first use. All workers share the
+//! same static reference via `sparse_linear`.
+
 use ndarray::Array1;
 use std::sync::OnceLock;
 

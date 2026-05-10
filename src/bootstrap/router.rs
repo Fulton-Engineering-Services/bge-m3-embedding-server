@@ -29,6 +29,8 @@ use tracing::Level;
 use crate::handler;
 use crate::state::AppState;
 
+/// [`MakeRequestId`] implementation that assigns a random UUID v4 to every
+/// incoming request, attached as the `x-request-id` header.
 #[derive(Clone, Default)]
 pub(super) struct UuidRequestId;
 
@@ -70,6 +72,8 @@ impl<B> MakeSpan<B> for RouteAwareSpan {
     }
 }
 
+/// Builds the Axum [`Router`] with all embedding, health, and fleet-discovery
+/// routes, a 2 MiB body limit, request-id propagation, and structured tracing.
 pub fn build_router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/v1/embeddings", post(handler::dense_embeddings))

@@ -23,6 +23,11 @@ use super::model_files::download_model_files;
 use super::tokenize::load_tokenizer;
 use crate::config::ModelVariant;
 
+/// Returns the execution providers to use for this platform.
+///
+/// On macOS: uses the `CoreML` EP with `MLProgram` format and `FastPrediction`
+/// specialisation strategy (overridable via `BGE_M3_COREML_STRATEGY=default`).
+/// On all other platforms: returns an empty list, so ORT falls back to MLAS (CPU).
 pub(super) fn execution_providers(cache_dir: &Path) -> Vec<ort::ep::ExecutionProviderDispatch> {
     #[cfg(target_os = "macos")]
     {
@@ -72,6 +77,8 @@ pub(super) fn load_session(
     Ok(session)
 }
 
+/// Downloads (if not already cached) and loads both the ORT session and the
+/// tokenizer for the given model variant, returning them as a pair.
 pub(super) fn load_models(
     cache_dir: &Path,
     show_download_progress: bool,

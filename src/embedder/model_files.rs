@@ -32,8 +32,11 @@ const XENOVA_REPO_ID: &str = "Xenova/bge-m3";
 /// Update intentionally after verifying equivalent embedding quality vs FP32.
 const XENOVA_REPO_REVISION: &str = "4de13258303883538bd53b696b452bf8099f0858";
 
+/// Paths to the ONNX model and tokenizer files resolved from the hf-hub cache.
 pub(super) struct ModelFiles {
+    /// Path to the ONNX model file (variant-specific).
     pub onnx_path: PathBuf,
+    /// Path to the `tokenizer.json` file.
     pub tokenizer_path: PathBuf,
 }
 
@@ -57,6 +60,11 @@ fn is_model_cached(cache_dir: &Path, repo_id: &str, revision: &str, onnx_filenam
         .exists()
 }
 
+/// Downloads (or retrieves from the local hf-hub snapshot cache) the ONNX model
+/// and tokenizer files for the given model variant.
+///
+/// `show_progress` enables hf-hub's download progress bar; pass `true` only for
+/// the leader worker (worker 0) so progress is shown exactly once.
 pub(super) fn download_model_files(
     cache_dir: &Path,
     show_progress: bool,

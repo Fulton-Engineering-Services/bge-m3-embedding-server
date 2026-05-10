@@ -12,6 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! Bin-packing algorithm that groups tokenized sequences into `session.run()`
+//! calls that each fit within the per-worker workspace budget.
+//!
+//! The central type is [`CostModel`], which captures the quadratic memory
+//! scaling of BGE-M3 attention and is used by `bin_pack` to partition an
+//! incoming batch into chunks that are safe to run in a single ORT call.
+
 /// Quadratic-aware workspace cost model for ONNX attention inference.
 ///
 /// BGE-M3 uses multi-head attention whose intermediate tensor footprint scales

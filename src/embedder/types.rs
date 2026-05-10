@@ -18,9 +18,15 @@
 use anyhow::Result;
 use tokio::sync::oneshot;
 
+/// Sparse embedding output from the BGE-M3 sparse-linear projection layer.
+///
+/// Represents a document as a sparse vector over the tokenizer vocabulary.
+/// Token IDs with zero ReLU-gated score are omitted.
 #[derive(Debug, Clone)]
 pub struct SparseEmbedding {
+    /// Sorted vocabulary token IDs with non-zero ReLU-gated weight.
     pub indices: Vec<usize>,
+    /// Corresponding ReLU-gated projection scores, in the same order as `indices`.
     pub values: Vec<f32>,
 }
 
@@ -53,10 +59,12 @@ pub struct EmbedStats {
 }
 
 pub(crate) enum EmbedRequest {
+    /// Dense (float32) embedding inference on a batch of texts.
     Dense {
         texts: Vec<String>,
         reply: oneshot::Sender<Result<(Vec<Vec<f32>>, EmbedStats)>>,
     },
+    /// Sparse (SPLADE-style) embedding inference on a batch of texts.
     Sparse {
         texts: Vec<String>,
         reply: oneshot::Sender<Result<(Vec<SparseEmbedding>, EmbedStats)>>,
@@ -76,6 +84,8 @@ pub(crate) enum EmbedRequest {
 
 /// Result of a single probe `session.run()` call.
 pub(crate) struct ProbeResult {
+    /// Process RSS (bytes) measured immediately before `session.run()`.
     pub rss_before: usize,
+    /// Process RSS (bytes) measured immediately after `session.run()`.
     pub rss_after: usize,
 }
