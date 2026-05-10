@@ -5,3 +5,6 @@
 
 # AI assistant working state — never commit
 .serena/
+
+# Scratch/temp work — never commit
+tmp/
