@@ -371,7 +371,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     /// Helper: write `memory.max` at every component of `rel_path` under `root`,
-    /// creating intermediate directories.  `values` is a list of (rel_dir, content)
+    /// creating intermediate directories.  `values` is a list of (`rel_dir`, content)
     /// pairs — e.g. `[("ecs.slice/task/container", "30064771072"), ("ecs.slice/task", "max")]`.
     #[cfg(target_os = "linux")]
     fn write_memory_max_files(root: &std::path::Path, files: &[(&str, &str)]) {
@@ -445,7 +445,7 @@ mod tests {
     }
 
     /// Case 3 — all ancestors (including root) have "max": returns None so
-    /// caller falls through to host_ram.
+    /// caller falls through to `host_ram`.
     #[cfg(target_os = "linux")]
     #[test]
     fn cgroup_v2_walk_all_max_returns_none() {
