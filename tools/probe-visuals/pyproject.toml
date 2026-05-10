@@ -1,0 +1,105 @@
+# Copyright 2026 Fulton Engineering Services LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+[project]
+name = "bge-m3-probe-visuals"
+version = "0.1.0"
+description = "Mathematical figure scripts for docs/startup-probe.md."
+readme = "README.md"
+requires-python = ">=3.13"
+license = "Apache-2.0"
+authors = [{ name = "Fulton Engineering Services LLC", email = "contact@fultonengineeringservices.com" }]
+
+dependencies = [
+    "matplotlib>=3.9,<4.0",
+    "numpy>=2.0,<3.0",
+    "scipy>=1.13,<2.0",
+]
+
+[dependency-groups]
+dev = ["ruff>=0.9.0"]
+
+# ---------------------------------------------------------------------------
+# Build backend
+# ---------------------------------------------------------------------------
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/probe_visuals"]
+
+# ---------------------------------------------------------------------------
+# Ruff — lint + format
+# ---------------------------------------------------------------------------
+
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+include = ["src/**/*.py", "scripts/**/*.py"]
+exclude = [".venv", "dist", "build", "__pycache__", "out"]
+
+[tool.ruff.lint]
+select = [
+    "E",     # pycodestyle errors
+    "W",     # pycodestyle warnings
+    "F",     # pyflakes
+    "I",     # isort
+    "N",     # pep8-naming
+    "UP",    # pyupgrade
+    "B",     # flake8-bugbear
+    "SIM",   # flake8-simplify
+    "PTH",   # flake8-use-pathlib
+    "RUF",   # ruff-specific
+    "TID",   # flake8-tidy-imports
+    "PL",    # pylint
+    "S",     # flake8-bandit (security)
+    "T20",   # flake8-print
+]
+ignore = [
+    "S603", "S607",  # subprocess with literal list is safe
+    "PLR2004",       # magic constants — intentional in rendering/numeric scripts
+    "T201",          # print() in scripts — intentional
+    "S311",          # PRNG seeding for deterministic noise in figures
+    "RUF012",        # mutable class attributes (dataclasses)
+    "SIM108",        # ternary can hurt readability in rendering code
+    "TID252",        # relative parent imports inside package are correct
+    "PLR0913",       # figure helpers may legitimately have many parameters
+    "PLR0915",       # figure main() functions are intentionally long
+    "PLR0912",       # complex figure layout logic
+    "RUF001",        # unicode in plot labels is intentional (×, –, ≈, →, ÷, ≤)
+    "RUF002",        # mathematical symbols in docstrings intentional
+    "RUF003",
+    "N803",          # uppercase names in math (e.g. B, S, A, X) are idiomatic
+    "N806",          # uppercase local variables in math are idiomatic
+]
+
+[tool.ruff.lint.per-file-ignores]
+"scripts/**" = [
+    "T201",    # print() is fine in runner scripts
+    "PLR2004", # numeric constants fine in orchestration scripts
+]
+"src/probe_visuals/figures/**" = [
+    "T201",    # print() for save-path reporting is intentional
+    "PLR2004", # magic constants throughout figure code are intentional
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["probe_visuals"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+line-ending = "lf"
