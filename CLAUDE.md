@@ -37,6 +37,9 @@ cargo fmt --check
 # Supply chain audit (requires cargo-deny)
 cargo deny check
 
+# License header check
+hawkeye check
+
 # Build with CoreML dispatch profiling (emits per-op GPU/CPU/ANE decisions to stderr at model load)
 cargo build --features coreml-profile
 ```

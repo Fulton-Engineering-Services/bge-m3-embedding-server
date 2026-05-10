@@ -1,0 +1,12 @@
+headerPath = "config/hawkeye/license-header.txt"
+
+includes = [
+    "src/**/*.rs",
+    "tests/**/*.rs",
+    "benches/**/*.rs",
+    "examples/**/*.rs",
+    "build.rs",
+]
+
+[properties]
+inceptionYear = 2026
