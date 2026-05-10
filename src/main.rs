@@ -309,130 +309,144 @@ async fn run_readiness_probe(
             // Cache hit — run readiness checks inline and open traffic.
             run_readiness_checks_and_open(&state).await?;
         } else {
-            // Cache miss — probe must run.
-            //
-            // Serialisation protocol:
-            //   1. Acquire ALL cfg_workers permits before launching the probe
-            //      so that incoming /v1/embeddings requests queue behind the
-            //      semaphore and no concurrent inference contaminates the
-            //      per-shape RSS measurements.
-            //   2. Run the probe in a background task. The readiness checks
-            //      and the state.ready flip both happen inside that task,
-            //      after the probe completes, so traffic is not opened until
-            //      both the cost model and the readiness checks are complete.
-            //   3. On probe completion (success or failure) all cfg_workers
-            //      permits are released, opening traffic.
-            state
-                .probe_status
-                .store(ProbeStatus::Running as u8, Ordering::Release);
-
-            // Drain all remaining permits so the handler layer blocks new
-            // requests while the probe is in progress. The semaphore starts
-            // with cfg_workers-1 permits (one already reserved for the probe
-            // worker), so we acquire the remaining cfg_workers-1 permits here.
-            let _probe_lock = state
-                .request_permits
-                .acquire_many(u32::try_from(cfg_workers.saturating_sub(1)).unwrap_or(u32::MAX))
-                .await
-                .ok();
-
-            let state_bg = Arc::clone(&state);
-            let model_variant_bg = model_variant_str.clone();
-            tokio::spawn(async move {
-                let (a, b) = probe::run_probe(
-                    &state_bg.pool,
-                    cfg_max_seq,
-                    per_worker_workspace,
-                    cgroup_limit_bytes,
-                )
-                .await;
-                let cm = CostModel {
-                    a,
-                    b,
-                    max_workspace_bytes: per_worker_workspace,
-                };
-                info!(
-                    a = cm.a,
-                    b = cm.b,
-                    max_workspace_mb = cm.max_workspace_bytes / (1024 * 1024),
-                    "Probe complete — updating cost model"
-                );
-                state_bg.cost_model.store(Arc::new(cm));
-                // Distinguish real fit from conservative fallback.
-                let status = if (a - CostModel::CONSERVATIVE_A).abs() < f64::EPSILON
-                    && (b - CostModel::CONSERVATIVE_B).abs() < f64::EPSILON
-                {
-                    ProbeStatus::Failed
-                } else {
-                    probe::save_probe_cache(&cache_dir, &model_variant_bg, cfg_max_seq, a, b);
-                    ProbeStatus::Complete
-                };
-                state_bg.probe_status.store(status as u8, Ordering::Release);
-                info!(probe_status = status.as_str(), "Probe status updated");
-
-                // Readiness checks and ready flag go here so they don't
-                // contaminate the probe's RSS measurements.
-                if let Err(e) = run_readiness_checks_and_open(&state_bg).await {
-                    tracing::error!(error = %e, "Post-probe readiness check failed");
-                }
-                // Release all cfg_workers permits to open traffic.
-                state_bg.request_permits.add_permits(cfg_workers);
-            });
-            // The probe task is now running; we return here so main can finish
-            // setting up the rest of the server (signal handler, etc.).
+            // Cache miss — probe must run. See `spawn_probe_task` for the
+            // serialisation protocol that holds all cfg_workers permits across
+            // the probe + readiness window.
+            spawn_probe_task(
+                Arc::clone(&state),
+                cfg_workers,
+                cfg_max_seq,
+                per_worker_workspace,
+                cgroup_limit_bytes,
+                cache_dir,
+                model_variant_str,
+                /* save_cache = */ true,
+            )
+            .await;
             return Ok(());
         }
     } else {
         // BGE_M3_DISABLE_PROBE_CACHE=1 but no override — run probe without caching.
-        state
-            .probe_status
-            .store(ProbeStatus::Running as u8, Ordering::Release);
-
-        let _probe_lock = state
-            .request_permits
-            .acquire_many(u32::try_from(cfg_workers.saturating_sub(1)).unwrap_or(u32::MAX))
-            .await
-            .ok();
-
-        let state_bg = Arc::clone(&state);
-        let model_variant_bg = model_variant_str.clone();
-        tokio::spawn(async move {
-            let (a, b) = probe::run_probe(
-                &state_bg.pool,
-                cfg_max_seq,
-                per_worker_workspace,
-                cgroup_limit_bytes,
-            )
-            .await;
-            let cm = CostModel {
-                a,
-                b,
-                max_workspace_bytes: per_worker_workspace,
-            };
-            state_bg.cost_model.store(Arc::new(cm));
-            let status = if (a - CostModel::CONSERVATIVE_A).abs() < f64::EPSILON
-                && (b - CostModel::CONSERVATIVE_B).abs() < f64::EPSILON
-            {
-                ProbeStatus::Failed
-            } else {
-                ProbeStatus::Complete
-            };
-            state_bg.probe_status.store(status as u8, Ordering::Release);
-            info!(
-                probe_status = status.as_str(),
-                model_variant = model_variant_bg,
-                "Probe complete (cache disabled)"
-            );
-
-            if let Err(e) = run_readiness_checks_and_open(&state_bg).await {
-                tracing::error!(error = %e, "Post-probe readiness check failed");
-            }
-            state_bg.request_permits.add_permits(cfg_workers);
-        });
+        spawn_probe_task(
+            Arc::clone(&state),
+            cfg_workers,
+            cfg_max_seq,
+            per_worker_workspace,
+            cgroup_limit_bytes,
+            cache_dir,
+            model_variant_str,
+            /* save_cache = */ false,
+        )
+        .await;
         return Ok(());
     }
 
     Ok(())
+}
+
+/// Spawns the background probe task with proper permit ownership.
+///
+/// # Serialisation protocol (rc6+)
+///
+/// 1. Set `probe_status = Running`.
+/// 2. Acquire `cfg_workers - 1` permits via `acquire_many_owned` — combined
+///    with the 1 permit already reserved at startup, this drains the
+///    semaphore to 0 so all incoming `/v1/embeddings*` requests queue
+///    behind the gate while the probe is in flight.
+/// 3. Move the [`tokio::sync::OwnedSemaphorePermit`] into the spawned
+///    task. Its destructor is invoked just before `add_permits(cfg_workers)`
+///    at the end of the task, restoring full traffic concurrency.
+///
+/// **rc5 regression note:** the rc5 implementation acquired the permit in
+/// the parent function with `acquire_many` and bound it to a local
+/// `_probe_lock` variable. Because the `tokio::spawn` call returns
+/// synchronously, the permit went out of scope and was released
+/// immediately, before the spawned task could even start the probe.
+/// Real `/v1/embeddings*` traffic could therefore enter during the probe
+/// window, contaminating the per-shape RSS measurements and overshooting
+/// the cgroup limit. `acquire_many_owned` returns an `OwnedSemaphorePermit`
+/// that survives the move into the async closure, fixing the regression.
+#[allow(clippy::too_many_arguments)]
+async fn spawn_probe_task(
+    state: Arc<AppState>,
+    cfg_workers: usize,
+    cfg_max_seq: usize,
+    per_worker_workspace: usize,
+    cgroup_limit_bytes: usize,
+    cache_dir: PathBuf,
+    model_variant_str: String,
+    save_cache: bool,
+) {
+    state
+        .probe_status
+        .store(ProbeStatus::Running as u8, Ordering::Release);
+
+    // Drain all remaining permits. The semaphore starts with
+    // `max(cfg_workers - 1, 1)` permits at startup (one slot reserved for
+    // the probe worker); we acquire the remaining `cfg_workers - 1` here
+    // so the count drops to 0 for the duration of the probe.
+    //
+    // `acquire_many_owned` returns an `OwnedSemaphorePermit` that we move
+    // into the spawned task closure. The permit's drop handler returns the
+    // permits to the semaphore — we manually call `add_permits(cfg_workers)`
+    // in the task to also release the originally-reserved probe slot.
+    let probe_permit = Arc::clone(&state.request_permits)
+        .acquire_many_owned(u32::try_from(cfg_workers.saturating_sub(1)).unwrap_or(u32::MAX))
+        .await
+        .ok();
+
+    tokio::spawn(async move {
+        // Forget the OwnedSemaphorePermit at the end; we manually
+        // add_permits(cfg_workers) below so the count goes from 0
+        // straight to cfg_workers (releasing both the drained permits
+        // and the originally-reserved probe slot in one operation).
+        if let Some(p) = probe_permit {
+            p.forget();
+        }
+
+        let (a, b) = probe::run_probe(
+            &state.pool,
+            cfg_max_seq,
+            per_worker_workspace,
+            cgroup_limit_bytes,
+        )
+        .await;
+        let cm = CostModel {
+            a,
+            b,
+            max_workspace_bytes: per_worker_workspace,
+        };
+        info!(
+            a = cm.a,
+            b = cm.b,
+            max_workspace_mb = cm.max_workspace_bytes / (1024 * 1024),
+            "Probe complete — updating cost model"
+        );
+        state.cost_model.store(Arc::new(cm));
+        // Distinguish real fit from conservative fallback.
+        let status = if (a - CostModel::CONSERVATIVE_A).abs() < f64::EPSILON
+            && (b - CostModel::CONSERVATIVE_B).abs() < f64::EPSILON
+        {
+            ProbeStatus::Failed
+        } else {
+            if save_cache {
+                probe::save_probe_cache(&cache_dir, &model_variant_str, cfg_max_seq, a, b);
+            }
+            ProbeStatus::Complete
+        };
+        state.probe_status.store(status as u8, Ordering::Release);
+        info!(probe_status = status.as_str(), "Probe status updated");
+
+        // Readiness checks run inside the probe task so they do not
+        // contaminate the probe's RSS measurements.
+        if let Err(e) = run_readiness_checks_and_open(&state).await {
+            tracing::error!(error = %e, "Post-probe readiness check failed");
+        }
+        // Release the drained permits AND the originally-reserved probe
+        // slot in one operation. Net effect: semaphore count goes from 0
+        // back to cfg_workers, opening traffic at full concurrency.
+        state.request_permits.add_permits(cfg_workers);
+    });
 }
 
 /// Runs the dense + sparse readiness calls and flips `state.ready`.
