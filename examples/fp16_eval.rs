@@ -87,7 +87,7 @@ struct SparseLinearWeights {
 // its own SparseLinearWeights/SparseFp16 types for FP16 evaluation output.
 
 fn load_sparse_weights() -> SparseLinearWeights {
-    let data = include_bytes!("../src/weights/sparse_linear.safetensors");
+    let data = include_bytes!("../src/sparse_linear.safetensors");
     let tensors = safetensors::SafeTensors::deserialize(data).expect("Invalid safetensors");
     let weight_view = tensors.tensor("weight").expect("Missing weight tensor");
     let bias_view = tensors.tensor("bias").expect("Missing bias tensor");

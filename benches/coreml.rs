@@ -245,7 +245,7 @@ fn load_bench_models_for_variant(
 // ---------------------------------------------------------------------------
 
 fn load_sparse_weights() -> (ndarray::Array1<f32>, f32) {
-    let data = include_bytes!("../src/weights/sparse_linear.safetensors");
+    let data = include_bytes!("../src/sparse_linear.safetensors");
     let tensors = safetensors::SafeTensors::deserialize(data).expect("Invalid safetensors");
     let weight_view = tensors.tensor("weight").expect("Missing weight tensor");
     let bias_view = tensors.tensor("bias").expect("Missing bias tensor");
