@@ -46,7 +46,8 @@ jobs:
           pip install \
             jupyterlite-core==0.7.6 \
             jupyterlite-pyodide-kernel==0.7.2 \
-            jupyter-server==2.15.0
+            jupyter-server==2.15.0 \
+            ipympl==0.9.7
       - name: Copy notebooks to build input
         run: |
           mkdir -p _input
