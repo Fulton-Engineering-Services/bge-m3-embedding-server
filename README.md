@@ -29,8 +29,11 @@ BGE_M3_CACHE_DIR=/tmp/bge-m3-cache cargo run --release
 ```
 
 Wait for the log line `"Models ready — accepting requests"` before sending requests. On first
-run this takes a minute or two while the ONNX model files download. On Linux, an additional
-startup probe runs (up to ~60 s) to measure workspace cost — this is normal.
+run this takes a minute or two while the ONNX model files download. On Linux, the server
+returns ready as soon as the leader worker loads, then an additional **startup workspace probe**
+(~120 s on a cache miss, milliseconds on a cache hit) runs in the background to measure the
+auto-budget cost-model coefficients — see [docs/startup-probe.md](docs/startup-probe.md) for
+the full theory primer.
 
 ### Verify
 
@@ -93,6 +96,7 @@ curl http://localhost:8081/health
     "a_bytes_per_token": 18432.0,
     "b_bytes_per_token_sq": 6.2,
     "max_workspace_bytes": 2500000000,
+    "probe_status": "complete",
     "memory_source": "cgroup_v2",
     "available_bytes": 28991029248,
     "model_rss_bytes_per_worker": 1100000000
@@ -101,6 +105,8 @@ curl http://localhost:8081/health
 ```
 
 The `tuning` object lets operators verify what the server derived at startup without scraping logs.
+`probe_status` is one of `disabled`, `running`, `complete`, `failed`, or `cache_hit`. See
+[docs/startup-probe.md](docs/startup-probe.md) for what each state means and how to act on it.
 
 **Response (`loading`)**
 
@@ -294,11 +300,15 @@ require a restart.
 ### Auto-Budget Tuning (Linux)
 
 On Linux, the server automatically detects available memory and derives a safe workspace budget
-via a startup probe. No manual batch-size tuning is needed.
+via a startup probe. No manual batch-size tuning is needed. The probe fits a quadratic cost model
+`workspace ≈ a · (batch · seq) + b · (batch · seq²)` from a small set of measured `(batch, seq)`
+shapes — see [docs/startup-probe.md](docs/startup-probe.md) for the math primer (transformer
+workspace decomposition, normalized OLS, conditioning, persistent caching, lock-free handoff).
 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `BGE_M3_DISABLE_AUTO_BUDGET` | unset | Set to `1` to skip the probe; uses conservative defaults |
+| `BGE_M3_DISABLE_PROBE_CACHE` | unset | Set to `1` to force a fresh probe even when a fingerprint-matching cache file exists at `{cache_dir}/probe-coefficients.json` |
 | `BGE_M3_AVAILABLE_MEMORY_BYTES` | detected | Override memory detection (cgroup v2 → v1 → `/proc/meminfo`) |
 | `BGE_M3_MEMORY_SAFETY_FACTOR` | `0.7` | Fraction `[0.1, 1.0]` of detected workspace to use; provides headroom for ORT arena fragmentation |
 | `BGE_M3_TOKEN_BUDGET` | unset | Pin `max_workspace_bytes` directly (replaces the legacy `BGE_M3_ONNX_BATCH_SIZE` approach) |
@@ -467,7 +477,7 @@ flowchart TD
 
 - **Tokenize-once, bin-pack:** each request tokenizes all input texts in a single pass (no padding), then `binpack::bin_pack()` groups them into `session.run()` calls where each chunk is padded only to its own longest sequence. This eliminates the "one long text pads the whole batch" inefficiency.
 - **Quadratic cost model:** workspace per `session.run()` call is estimated as `a × (batch × seq) + b × (batch × seq²)`. At `MAX_SEQ_LENGTH=8192`, the quadratic attention term dominates; the bin-packer automatically assigns fewer texts per chunk for long sequences.
-- **Memory-aware startup probe (Linux):** after the leader worker loads its model, the server sweeps 18 `(batch, seq)` shapes, measures peak RSS deltas, and fits cost-model coefficients `a` and `b` via least squares. Conservative defaults apply when the probe cannot run.
+- **Memory-aware startup probe (Linux):** after the leader worker loads its model, the server sweeps 7 `(batch, seq)` shapes (6 fixed + the configured `max_seq` capability check), measures peak RSS deltas via `/proc/self/statm`, and fits cost-model coefficients `a` and `b` via normalized ordinary least squares. The probe runs in a background task — workers serve requests immediately with conservative defaults and pick up the fitted coefficients lock-free via `Arc<ArcSwap<CostModel>>` once the fit completes. Fitted coefficients are cached to `{cache_dir}/probe-coefficients.json` (fingerprinted by `version × model × max_seq × arch`) so warm starts skip the probe entirely. Conservative defaults apply when the probe cannot run. See [docs/startup-probe.md](docs/startup-probe.md) for the full theory primer.
 - **Single forward pass for dual embeddings:** BGE-M3's ONNX graph exposes the data needed for both dense and sparse embeddings from one `session.run()`. For fp32, the graph has explicit named output heads (`sentence_embedding` + `token_embeddings`). For fp16/int8, both are derived from the single `last_hidden_state` output — dense from the CLS position, sparse base from all token positions. In both cases the transformer executes once per chunk for the `/v1/embeddings:both` handler.
 - Each worker runs on a Tokio `spawn_blocking` thread, loading its own ORT session and tokenizer.
 - The shared `Arc<Mutex<Receiver>>` provides natural load balancing without a separate dispatcher.

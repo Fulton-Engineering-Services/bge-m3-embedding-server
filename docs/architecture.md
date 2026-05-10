@@ -105,15 +105,23 @@ classDiagram
         +usize total_workers
         +usize max_seq_length
         +OnceLock~TuningInfo~ tuning
+        +Arc~ArcSwap~CostModel~~ cost_model
+        +AtomicU8 probe_status
     }
 
     class TuningInfo {
-        +f64 a_bytes_per_token
-        +f64 b_bytes_per_token_sq
-        +usize max_workspace_bytes
         +String memory_source
         +usize available_bytes
         +usize model_rss_bytes_per_worker
+    }
+
+    class ProbeStatus {
+        <<enum>>
+        Disabled
+        Running
+        Complete
+        Failed
+        CacheHit
     }
 
     class EmbedPool {
@@ -151,10 +159,19 @@ classDiagram
 
     AppState --> EmbedPool
     AppState --> TuningInfo
+    AppState --> CostModel : via ArcSwap
+    AppState --> ProbeStatus
     EmbedPool ..> EmbedRequest : sends via channel
     EmbedPool ..> WorkerConfig : spawns workers with
-    WorkerConfig --> CostModel
+    WorkerConfig --> CostModel : shared ArcSwap handle
 ```
+
+`AppState.cost_model` is held in an `Arc<ArcSwap<CostModel>>`. Workers `load()`
+the current handle on every bin-pack call, and the background probe `store()`s
+the fitted model once the OLS fit completes — a wait-free hand-off so workers
+never block on coefficient updates. `probe_status` (an `AtomicU8`) lets
+`/health` distinguish "still probing" from "probe done" from "fit failed"
+without any locks.
 
 ## Tokenize-Once + Bin-Pack Inference Pipeline
 
@@ -218,27 +235,50 @@ endpoint's ability to differentiate `"ok"` from `"idle"` states.
 
 ## Startup Sequence (Linux)
 
+The startup sequence has three phases: model load (leader-first), cost-model
+resolution (override / cache hit / background probe), and readiness probes.
+
+The cost model is held in `Arc<ArcSwap<CostModel>>` so workers can begin serving
+requests with conservative defaults while the probe runs asynchronously in the
+background; the probe task `store()`s the fitted model when finished and all
+workers see it on their next bin-pack call. See
+[startup-probe.md](startup-probe.md) for the math behind the probe and the
+lock-free handoff details.
+
 ```mermaid
 sequenceDiagram
     participant Main
     participant Sysinfo as sysinfo
     participant Leader as Worker 0 (leader)
-    participant Probe as probe
     participant Followers as Workers 1..N
+    participant Probe as probe (background task)
+    participant Cache as EFS probe cache
 
-    Main->>Sysinfo: detect_available_memory()
-    Sysinfo-->>Main: MemoryReading { bytes, source }
-    Main->>Leader: spawn_blocking(run_worker)
+    Main->>Leader: spawn_blocking(run_worker, conservative CostModel)
     Leader->>Leader: load_models()
-    Leader-->>Main: ready signal
-    Main->>Sysinfo: read_process_rss_bytes() (post-load)
-    Main->>Probe: run_probe(pool, max_seq, rss_ceiling)
-    Probe->>Leader: EmbedRequest::Probe (18 shapes)
-    Leader-->>Probe: ProbeResult { rss_before, rss_after }
-    Probe-->>Main: (a, b) coefficients
-    Main->>Main: compute CostModel { a, b, max_workspace }
-    Main->>Followers: spawn_blocking(run_worker) with CostModel
+    Leader-->>Main: leader ready
+    Main->>Followers: spawn_blocking with shared ArcSwap<CostModel>
     Followers-->>Main: ready signals
+    Main->>Sysinfo: detect_available_memory() + read_process_rss_bytes()
+    Sysinfo-->>Main: MemoryReading { bytes, source }, model_rss_per_worker
+
+    alt cost-model override env vars set
+        Main->>Main: cost_model.store(override); probe_status = Disabled
+    else cache fingerprint matches
+        Main->>Cache: try_load_probe_cache(model, max_seq, arch)
+        Cache-->>Main: (a, b)
+        Main->>Main: cost_model.store(cached); probe_status = CacheHit
+    else cache miss
+        Main->>Main: probe_status = Running
+        Main->>Probe: tokio::spawn run_probe(pool, max_seq, rss_ceiling)
+        Note over Probe: 7 shapes, ~120 s — runs while<br/>workers serve requests with<br/>conservative defaults
+        Probe->>Leader: EmbedRequest::Probe (per shape)
+        Leader-->>Probe: ProbeResult { rss_before, rss_after }
+        Probe->>Probe: fit_cost_model (normalized OLS)
+        Probe->>Cache: save_probe_cache(a, b)
+        Probe-->>Main: cost_model.store(fitted); probe_status = Complete
+    end
+
     Main->>Main: dense + sparse readiness probes
     Main->>Main: state.ready = true
 ```
@@ -265,10 +305,13 @@ All configuration is read once at startup from environment variables via
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `BGE_M3_DISABLE_AUTO_BUDGET` | unset | Skip probe, use conservative defaults |
+| `BGE_M3_DISABLE_PROBE_CACHE` | unset | Force a fresh probe even when a fingerprint-matching cache file exists |
 | `BGE_M3_AVAILABLE_MEMORY_BYTES` | detected | Override sysinfo memory detection |
 | `BGE_M3_MEMORY_SAFETY_FACTOR` | `0.7` | Workspace headroom fraction `[0.1, 1.0]` |
 | `BGE_M3_TOKEN_BUDGET` | unset | Legacy workspace ceiling (replaces `BGE_M3_ONNX_BATCH_SIZE`) |
-| `BGE_M3_COST_MODEL_A` / `BGE_M3_COST_MODEL_B` | probe-derived | Override cost coefficients |
+| `BGE_M3_COST_MODEL_A` / `BGE_M3_COST_MODEL_B` | probe-derived | Override cost coefficients (see [startup-probe.md §14.4](startup-probe.md#144-pinning-explicit-coefficients)) |
+
+See [startup-probe.md](startup-probe.md) for the full theory and operator reference.
 
 > **Apple Silicon:** A `.cargo/config.toml` with `rustflags = ["-C", "target-cpu=native"]`
 > for `aarch64-apple-darwin` is committed in the repo. This enables M2+ instruction set
