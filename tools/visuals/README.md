@@ -1,3 +1,5 @@
+[![Open in JupyterLite](https://jupyterlite.rtfd.io/en/latest/_static/badge.svg)](https://fulton-engineering-services.github.io/bge-m3-embedding-server/)
+
 # Startup-Probe Visualisations
 
 This directory contains ten Python figure scripts that produce the mathematical diagrams

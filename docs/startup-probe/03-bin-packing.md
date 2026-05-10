@@ -154,14 +154,17 @@ impl CostModel {
 
 ## Interactive exploration
 
-The companion notebook [`tools/visuals/notebooks/02_workspace_budget_calculator.ipynb`](../../tools/visuals/notebooks/02_workspace_budget_calculator.ipynb) computes per-worker workspace and worst-case peak memory from operator-tunable parameters: worker count, per-worker model RSS, container memory, and safety factor. A traffic-light indicator flags configurations that approach the cgroup ceiling and a stacked bar chart decomposes the worst-case allocation.
+The companion notebook for this section runs interactively in the browser via JupyterLite (no install required):
 
-To run:
+**[▶ Open Workspace Budget Calculator](https://fulton-engineering-services.github.io/bge-m3-embedding-server/lab/index.html?path=02_workspace_budget_calculator.ipynb)**
+
+The notebook computes per-worker workspace and worst-case peak memory from operator-tunable parameters: worker count, per-worker model RSS, container memory, and safety factor. A traffic-light indicator flags configurations that approach the cgroup ceiling and a stacked bar chart decomposes the worst-case allocation.
+
+To run locally instead:
 
 ```bash
 cd tools/visuals
 uv sync --group notebooks
-uv run python -m ipykernel install --user --name bge-m3-visuals --display-name "BGE-M3 Visuals"
 uv run jupyter notebook notebooks/02_workspace_budget_calculator.ipynb
 ```
 

@@ -128,14 +128,17 @@ A three-parameter extension (such as adding a $c \cdot S^3$ term) would force mo
 
 ## Interactive exploration
 
-The companion notebook [`tools/visuals/notebooks/01_cost_decomposition_explorer.ipynb`](../../tools/visuals/notebooks/01_cost_decomposition_explorer.ipynb) provides slider-driven exploration of $W(S) = a \cdot S + b \cdot S^2$ at $B = 1$. Adjusting $a$ and $b$ shifts the crossover sequence length $S^* = a / b$ in real time and highlights the regime in which each coefficient dominates. Preset buttons recall the fitted coefficients (§7) and the conservative defaults (§8).
+The companion notebook for this section runs interactively in the browser via JupyterLite (no install required):
 
-To run:
+**[▶ Open Cost Decomposition Explorer](https://fulton-engineering-services.github.io/bge-m3-embedding-server/lab/index.html?path=01_cost_decomposition_explorer.ipynb)**
+
+The notebook provides slider controls for $a$ (linear coefficient) and $b$ (quadratic coefficient). Moving the sliders shifts the crossover point $S^* = a/b$ in real time and updates both the linear-axes and log-log panels. Preset buttons load the fitted values $(a = 18{,}432,\; b = 6.2)$ and the conservative defaults $(a = 16{,}384,\; b = 8)$.
+
+To run locally instead:
 
 ```bash
 cd tools/visuals
 uv sync --group notebooks
-uv run python -m ipykernel install --user --name bge-m3-visuals --display-name "BGE-M3 Visuals"
 uv run jupyter notebook notebooks/01_cost_decomposition_explorer.ipynb
 ```
 
