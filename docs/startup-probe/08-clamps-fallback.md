@@ -51,9 +51,9 @@ The capability check is split into a cheap synchronous shape validation at start
 
 ### Stage 1: `validate_max_seq_shape`
 
-A synchronous, cheap check that runs at the start of `run_probe`. It constructs `input_ids` and `attention_mask` ndarrays at shape $(1, \text{max\_seq})$ and discards them. The check confirms that `max_seq` fits within `usize` bounds and that ndarray can allocate the 2-D layout. It cannot detect ONNX positional-embedding bounds — only that the OS can allocate the input tensors at all. This stage catches typos (e.g., setting `MAX_SEQ_LENGTH` to a number that overflows `usize`) before the probe wastes time on later stages.
+A synchronous, cheap check that runs at the start of `run_probe`. It constructs `input_ids` and `attention_mask` ndarrays at shape (1, `max_seq`) and discards them. The check confirms that `max_seq` fits within `usize` bounds and that ndarray can allocate the 2-D layout. It cannot detect ONNX positional-embedding bounds — only that the OS can allocate the input tensors at all. This stage catches typos (e.g., setting `MAX_SEQ_LENGTH` to a number that overflows `usize`) before the probe wastes time on later stages.
 
-### Stage 2: $(1, \text{max\_seq})$ probe shape (dynamic, soft)
+### Stage 2: (1, `max_seq`) probe shape (dynamic, soft)
 
 Added to the probe sweep at runtime. Runs after the warm-up and the static shapes. The error path logs and skips, *not* fail-fast:
 
@@ -92,9 +92,9 @@ Every failure path leads to a functional server with conservative budgets. The c
 
 The chosen values:
 
-- **$\text{CONSERVATIVE\_A} = 16\,384$** is roughly the legacy assumption: $16\,\text{KiB}$ of FFN/projection workspace per token-position. Slightly higher than typical fitted values (${\sim}18\,\text{KB}$), so the bin-packer will pack a bit fewer texts than ideal but never overshoot.
-- **$\text{CONSERVATIVE\_B} = 8$** is intentionally pessimistic — about $1.3\times$ the typical fitted $b \approx 6.2$. At $S = 8192$, this means the conservative model predicts ${\sim}30\%$ more workspace than the fitted model would, so chunks are smaller and chunk count is higher. Slow but safe.
-- **$\text{DEFAULT\_MAX\_WORKSPACE} = 2\,\text{GiB}$** is a per-worker budget calibrated for the Fargate $28\,\text{GiB}$ / 7-worker production layout. On smaller containers, the auto-budget recalculates this from `available − N × model_rss − OS_HEADROOM`.
+- **`CONSERVATIVE_A` = 16,384** is roughly the legacy assumption: $16\,\text{KiB}$ of FFN/projection workspace per token-position. Slightly higher than typical fitted values (${\sim}18\,\text{KB}$), so the bin-packer will pack a bit fewer texts than ideal but never overshoot.
+- **`CONSERVATIVE_B` = 8** is intentionally pessimistic — about $1.3\times$ the typical fitted $b \approx 6.2$. At $S = 8192$, this means the conservative model predicts ${\sim}30\%$ more workspace than the fitted model would, so chunks are smaller and chunk count is higher. Slow but safe.
+- **`DEFAULT_MAX_WORKSPACE` = 2 GiB** is a per-worker budget calibrated for the Fargate $28\,\text{GiB}$ / 7-worker production layout. On smaller containers, the auto-budget recalculates this from `available − N × model_rss − OS_HEADROOM`.
 
 When the cost model is built from `CostModel::conservative(max_workspace_bytes)`, the bin-packer is fully usable — just tuned for safety over throughput.
 
@@ -107,7 +107,7 @@ Every failure path lands in one of these cells:
 | RSS reads return 0 (non-Linux) | All-zero delta detection; fit skipped | `failed` | Conservative defaults; server functional |
 | Warm-up $(1, 64)$ errors | Log warning, proceed without warm-up | depends on sweep | First-shape delta will include arena init noise; fit may fail |
 | One probe shape errors mid-sweep | Skip that data point, continue | `complete` (if others succeed) | Fit may be slightly less accurate |
-| $(1, \text{max\_seq})$ errors (model incompatibility) | Skip + warn (no fail-fast) | `complete` (if others succeed) | First real `/v1/embeddings` request surfaces ORT error; operator changes model or lowers `MAX_SEQ_LENGTH` |
+| (1, `max_seq`) errors (model incompatibility) | Skip + warn (no fail-fast) | `complete` (if others succeed) | First real `/v1/embeddings` request surfaces ORT error; operator changes model or lowers `MAX_SEQ_LENGTH` |
 | All shapes skipped by RSS-cap guard | Emit diagnostic with `current_rss` + `cgroup_limit` | `failed` | Conservative defaults; check cgroup detection |
 | `validate_max_seq_shape` ndarray fails | Would be a Rust panic (usize overflow); unreachable in practice | — | — |
 | OLS Gram is singular | `fit_cost_model` returns `None` | `failed` | Conservative defaults |
@@ -137,7 +137,7 @@ The asymmetry of conservatism is intentional: bin-packing under-counting is a sl
 
 Consider the symmetric alternative in which negative $b$ is clamped to a small positive value rather than rejecting the fit. A noisy probe could produce $(a, b) = (\text{very high}, \text{slightly negative})$. Clamped symmetrically, that becomes $(\text{very high}, 0.01)$. The bin-packer would then believe linear cost is much higher than reality (slightly slow) and quadratic cost is essentially zero (catastrophically wrong at long $S$).
 
-The bin-packer would happily pack 100 texts at $S = 8192$ because $\text{chunk\_cost}(100, 8192) \approx 100 \cdot (\text{very high}) \cdot 8192 + 100 \cdot 0.01 \cdot 8192^2 \approx (\text{very high linear}) + (\text{tiny quad})$. The actual workspace would be ${\sim}10\times$ higher because $b$ is really ${\sim}6$, not $0.01$. The result is OOM.
+The bin-packer would happily pack 100 texts at $S = 8192$ because `chunk_cost(100, 8192)` \approx 100 \cdot (\text{very high}) \cdot 8192 + 100 \cdot 0.01 \cdot 8192^2 \approx (\text{very high linear}) + (\text{tiny quad})$. The actual workspace would be ${\sim}10\times$ higher because $b$ is really ${\sim}6$, not $0.01$. The result is OOM.
 
 By rejecting the whole fit when $b < 0$, the system never enters the state where one coefficient is mistakenly tiny while the other absorbs the model error. Either both coefficients are believable or defaults are used. There is no "partially trust the fit" state.
 

@@ -15,8 +15,8 @@ This page is structured diagnose-first, fix-second. Each section starts with a s
 | `b_bytes_per_token_sq` | ${\sim}6.2$ | Fitted quadratic coefficient (attention term). |
 | `max_workspace_bytes` | ${\sim}2.0\,\text{GB}$ | Per-worker bin-packing budget derived from available memory. |
 | `model_rss_bytes_per_worker` | ${\sim}1\,100\,000\,000$ | Peak RSS delta measured by each worker during `load_models()`. Was 0 before the 2026-05-09 fix. |
-| `worst_case_peak_bytes` | ${\sim}21.5\,\text{GB}$ | $N \times \text{workspace} + N \times \text{model\_rss} + \text{OS\_HEADROOM}$. Must be below `available_bytes`. |
-| `utilization_pct` | ${\sim}74\%$ | $\text{worst\_case\_peak} / \text{available} \times 100$. A `WARN` fires at startup if $> 90\%$. |
+| `worst_case_peak_bytes` | ${\sim}21.5\,\text{GB}$ | $N \times \text{workspace} + N \times \text{model-rss} + \text{OS-HEADROOM}$. Must be below `available_bytes`. |
+| `utilization_pct` | ${\sim}74\%$ | $\text{worst-case-peak} / \text{available} \times 100$. A `WARN` fires at startup if $> 90\%$. |
 
 If `model_rss_bytes_per_worker` is 0 on Linux, the worker RSS measurement failed (non-Linux platform or `/proc/self/statm` unreadable). The budget formula still runs but deducts 0 for model weights — use `BGE_M3_MEMORY_SAFETY_FACTOR=0.5` as a stopgap and file a bug.
 
@@ -66,7 +66,7 @@ This is the only path that gives direct control over $(a, b)$. The probe is bypa
 
 The most common production tuning is changing `BGE_M3_WORKERS`. The trade-off:
 
-- **More workers → more parallelism, less per-worker budget.** Each worker gets $(\text{available} - N \times \text{model\_rss} - \text{OS\_HEADROOM}) \times \text{safety} / N$. Doubling $N$ roughly halves the per-worker budget.
+- **More workers → more parallelism, less per-worker budget.** Each worker gets $(\text{available} - N \times \text{model-rss} - \text{OS-HEADROOM}) \times \text{safety} / N$. Doubling $N$ roughly halves the per-worker budget.
 - **Fewer workers → larger per-worker budget but lower throughput ceiling.** Inference is single-threaded inside an ORT session, so total inference throughput scales linearly with worker count.
 
 A rule of thumb that has worked well in production:

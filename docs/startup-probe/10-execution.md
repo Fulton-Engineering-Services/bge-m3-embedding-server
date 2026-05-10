@@ -18,7 +18,7 @@ Because the probe measures process-wide RSS deltas via `/proc/self/statm`, any c
     let embeddings = state.pool.dense(texts).await?;
 ```
 
-The semaphore is initialised to $\max(\text{cfg\_workers} - 1, 1)$ permits at startup, with one slot already reserved for the probe worker. On a cache miss, `spawn_probe_task` acquires the remaining $\text{cfg\_workers} - 1$ permits via `Arc<Semaphore>::acquire_many_owned`, moves the resulting `OwnedSemaphorePermit` into the spawned task closure, and releases everything via `add_permits(cfg_workers)` once the probe + readiness work completes.
+The semaphore is initialised to $\max(\text{cfg-workers} - 1, 1)$ permits at startup, with one slot already reserved for the probe worker. On a cache miss, `spawn_probe_task` acquires the remaining $\text{cfg-workers} - 1$ permits via `Arc<Semaphore>::acquire_many_owned`, moves the resulting `OwnedSemaphorePermit` into the spawned task closure, and releases everything via `add_permits(cfg_workers)` once the probe + readiness work completes.
 
 ### The OwnedSemaphorePermit subtlety
 
@@ -48,7 +48,7 @@ tokio::spawn(async move {
 
 The closure calls `forget()` on the permit (preventing its drop handler from returning the permits) and then explicitly calls `add_permits(cfg_workers)` at the end of the task. The semaphore count goes from 0 (drained) directly to `cfg_workers` (full concurrency) in one operation, releasing both the explicitly acquired permits and the originally reserved probe slot.
 
-Override and cache-hit paths do not acquire the extra permits — they run readiness checks inline, and the initial $\text{cfg\_workers} - 1 + 1$ permits never get drained.
+Override and cache-hit paths do not acquire the extra permits — they run readiness checks inline, and the initial $\text{cfg-workers} - 1 + 1$ permits never get drained.
 
 ### Sequence diagram of the probe window
 
@@ -152,7 +152,7 @@ If a `running` status persists past 5 minutes:
 
 - Check `/health` for `live_workers` — any dead workers indicate a degraded pool.
 - Check container logs for `Probe: skipping shape` messages — a shape may be repeatedly hitting OOM guards.
-- Check `BGE_M3_MAX_SEQ_LENGTH` — if it is set higher than the model variant supports, the dynamic $(1, \text{max\_seq})$ shape will hang on positional-embedding errors before timing out.
+- Check `BGE_M3_MAX_SEQ_LENGTH` — if it is set higher than the model variant supports, the dynamic $(1, \text{max-seq})$ shape will hang on positional-embedding errors before timing out.
 
 In all cases, the worst outcome is "task gets replaced after liveness timeout, restart picks up the cache or defaults" — never silent corruption.
 
@@ -162,7 +162,7 @@ In all cases, the worst outcome is "task gets replaced after liveness timeout, r
 2. **Workers load and prime.** Each worker measures pre-load RSS, downloads the model (cache hit on warm starts), creates the ORT session, runs a tiny `session.run((1, 8))` to prime the arena, measures post-load RSS, and sends its delta to `main()`.
 3. **`main()` aggregates deltas.** The median across workers becomes `model_rss_per_worker`. The workspace-budget formula computes `max_workspace_bytes` from container memory, the worker count, and the safety factor.
 4. **Probe-cache check.** If the fingerprint matches, jump to step 7.
-5. **`main()` drains the semaphore.** Acquires all $\text{cfg\_workers} - 1$ remaining permits via `acquire_many_owned`, spawning the probe task with the permit `move`d in.
+5. **`main()` drains the semaphore.** Acquires all $\text{cfg-workers} - 1$ remaining permits via `acquire_many_owned`, spawning the probe task with the permit `move`d in.
 6. **`main()` returns; `/health` flips to 200.** The load balancer is satisfied. Any incoming `/v1/embeddings` requests queue at the drained semaphore.
 7. **Inside the probe task:** arena warm-up; sweep 7 shapes (each protected by 3 OOM-guard layers); fit OLS in normalised space; unscale; clamp; save cache; run dense + sparse readiness probes.
 8. **Probe task `forget()`s the permit and `add_permits(cfg_workers)`.** Semaphore goes from 0 to N in one operation. Queued requests flood through.

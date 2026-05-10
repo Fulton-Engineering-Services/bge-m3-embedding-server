@@ -76,7 +76,7 @@ A representative cold-start trace at default settings on a 28 GB ECS Managed Ins
 | `Phase N/4 ...` | Model fetch and load | (covered in [cold-start.md](../cold-start.md), out of scope here) |
 | `Leader worker ready ... rss_delta_mb=1409` | Layer 2 RSS measurement (per-worker baseline) | [Measurement §7](07-measurement.md) |
 | `Memory detected ... source=cgroup_v2` | cgroup detection | (covered in [architecture.md](../architecture.md)) |
-| `Workspace budget computed ... per_worker_workspace_mb=1058` | $\text{total\_workspace} = \text{available} - N \times \text{model\_rss} - \text{OS\_HEADROOM}$ | [Overview §1](01-overview.md) intro |
+| `Workspace budget computed ... per_worker_workspace_mb=1058` | $\text{total-workspace} = \text{available} - N \times \text{model-rss} - \text{OS-HEADROOM}$ | [Overview §1](01-overview.md) intro |
 | `Probe cache fingerprint mismatch; will re-probe` | Cache miss path | [Cache §9](09-cache.md) |
 | `Starting memory probe ... rss_ceiling_mb=1058` | Probe task spawned, semaphore drained | [Execution §10](10-execution.md) |
 | `Probe: arena warm-up complete` | Layer 1 arena pre-priming inside the probe task | [Probe shapes §6](06-probe-shapes.md) (arena warm-up) |
@@ -121,10 +121,10 @@ After the cold start above, `GET /health` returns:
 | `tuning.memory_source` | `detect_available_memory()` | Where the budget formula obtained its `available_bytes` (`cgroup_v1`, `cgroup_v2`, sysctl, override) |
 | `tuning.available_bytes` | Same | The detected (or overridden) available memory |
 | `tuning.model_rss_bytes_per_worker` | Layer 2 median RSS delta | Per-worker model + arena baseline |
-| `tuning.worst_case_peak_bytes` | $N \times \text{workspace} + N \times \text{model\_rss} + \text{OS\_HEADROOM}$ | Absolute worst case; must remain below `available_bytes` |
-| `tuning.utilization_pct` | $\text{worst\_case\_peak} / \text{available} \times 100$ | Headroom indicator; `WARN` fires at startup if $> 90\%$ |
+| `tuning.worst_case_peak_bytes` | $N \times \text{workspace} + N \times \text{model-rss} + \text{OS-HEADROOM}$ | Absolute worst case; must remain below `available_bytes` |
+| `tuning.utilization_pct` | $\text{worst-case-peak} / \text{available} \times 100$ | Headroom indicator; `WARN` fires at startup if $> 90\%$ |
 
-`worst_case_peak_bytes` is $N \times \text{per\_worker\_workspace} + N \times \text{model\_rss} + \text{OS\_HEADROOM}$. A value above $90\%$ of `available_bytes` triggers a startup `WARN`. At $74\%$ with accurate `model_rss_bytes_per_worker`, the production 7-worker fp16 configuration has adequate headroom.
+`worst_case_peak_bytes` is $N \times \text{per-worker-workspace} + N \times \text{model-rss} + \text{OS-HEADROOM}$. A value above $90\%$ of `available_bytes` triggers a startup `WARN`. At $74\%$ with accurate `model_rss_bytes_per_worker`, the production 7-worker fp16 configuration has adequate headroom.
 
 ## A warm-start trace (cache hit)
 

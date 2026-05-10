@@ -50,7 +50,7 @@ The bin-packer (`bin_pack` in the same file) proceeds as follows:
 1. Tokenise every text once (a separate concern; see §7).
 2. Sort the resulting list by tokenised length, ascending.
 3. Walk through the sorted list, accumulating into a "current chunk." For each text:
-   - Tentatively expand the chunk by adding this text. The chunk's new maximum sequence length is $\max(\text{current\_max}, \text{this\_text\_len})$.
+   - Tentatively expand the chunk by adding this text. The chunk's new maximum sequence length is $\max(S_{\text{cur}},\; S_{\text{new}})$.
    - Evaluate `cost_model.fits(chunk_size + 1, new_max_seq)`.
    - If true, commit the text to the chunk; otherwise emit the current chunk to ORT and start a fresh chunk containing only this text.
 4. Emit any final non-empty chunk.
@@ -61,7 +61,7 @@ The cost model must therefore be accurate in both regimes. Under-estimating $b$ 
 
 ## A worked example
 
-Suppose the probe has fitted $a = 18432$ (B/token), $b = 6.2$ (B/token²), and the workspace budget is `max_workspace_bytes = 2 GiB`. The number of texts of $S = 4096$ that fit in one chunk is the largest integer $B$ satisfying $\text{chunk\_cost}(B, 4096) \leq 2 \cdot 1024^3$:
+Suppose the probe has fitted $a = 18432$ (B/token), $b = 6.2$ (B/token²), and the workspace budget is `max_workspace_bytes = 2 GiB`. The number of texts of $S = 4096$ that fit in one chunk is the largest integer $B$ satisfying `chunk_cost`$(B, 4096) \leq 2 \cdot 1024^3$:
 
 ```
 2 GiB = 2_147_483_648 B
