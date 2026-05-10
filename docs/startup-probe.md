@@ -68,9 +68,9 @@ Three interactive Jupyter notebooks at [`tools/visuals/notebooks/`](../tools/vis
 
 The notebooks are also hosted interactively via JupyterLite — click to open in the browser, no install required:
 
-- [▶ Cost Decomposition Explorer](https://fulton-engineering-services.github.io/bge-m3-embedding-server/lab/index.html?path=01_cost_decomposition_explorer.ipynb)
-- [▶ Workspace Budget Calculator](https://fulton-engineering-services.github.io/bge-m3-embedding-server/lab/index.html?path=02_workspace_budget_calculator.ipynb)
-- [▶ Conditioning Visualiser](https://fulton-engineering-services.github.io/bge-m3-embedding-server/lab/index.html?path=03_conditioning_visualiser.ipynb)
+- [▶ Cost Decomposition Explorer](https://fulton-engineering-services.github.io/bge-m3-embedding-server/notebooks/lab/index.html?path=01_cost_decomposition_explorer.ipynb)
+- [▶ Workspace Budget Calculator](https://fulton-engineering-services.github.io/bge-m3-embedding-server/notebooks/lab/index.html?path=02_workspace_budget_calculator.ipynb)
+- [▶ Conditioning Visualiser](https://fulton-engineering-services.github.io/bge-m3-embedding-server/notebooks/lab/index.html?path=03_conditioning_visualiser.ipynb)
 
 ## Audience
 

@@ -156,7 +156,7 @@ impl CostModel {
 
 The companion notebook for this section runs interactively in the browser via JupyterLite (no install required):
 
-**[▶ Open Workspace Budget Calculator](https://fulton-engineering-services.github.io/bge-m3-embedding-server/lab/index.html?path=02_workspace_budget_calculator.ipynb)**
+**[▶ Open Workspace Budget Calculator](https://fulton-engineering-services.github.io/bge-m3-embedding-server/notebooks/lab/index.html?path=02_workspace_budget_calculator.ipynb)**
 
 The notebook computes per-worker workspace and worst-case peak memory from operator-tunable parameters: worker count, per-worker model RSS, container memory, and safety factor. A traffic-light indicator flags configurations that approach the cgroup ceiling and a stacked bar chart decomposes the worst-case allocation.
 
