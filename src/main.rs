@@ -346,7 +346,7 @@ async fn run_readiness_probe(
 
 /// Spawns the background probe task with proper permit ownership.
 ///
-/// # Serialisation protocol (rc6+)
+/// # Serialisation protocol
 ///
 /// 1. Set `probe_status = Running`.
 /// 2. Acquire `cfg_workers - 1` permits via `acquire_many_owned` — combined
@@ -357,15 +357,14 @@ async fn run_readiness_probe(
 ///    task. Its destructor is invoked just before `add_permits(cfg_workers)`
 ///    at the end of the task, restoring full traffic concurrency.
 ///
-/// **rc5 regression note:** the rc5 implementation acquired the permit in
-/// the parent function with `acquire_many` and bound it to a local
-/// `_probe_lock` variable. Because the `tokio::spawn` call returns
-/// synchronously, the permit went out of scope and was released
-/// immediately, before the spawned task could even start the probe.
-/// Real `/v1/embeddings*` traffic could therefore enter during the probe
-/// window, contaminating the per-shape RSS measurements and overshooting
-/// the cgroup limit. `acquire_many_owned` returns an `OwnedSemaphorePermit`
-/// that survives the move into the async closure, fixing the regression.
+/// **Rationale for `acquire_many_owned`:** `tokio::spawn` returns
+/// synchronously before the spawned task starts executing. A permit bound to
+/// a local variable in the parent function would be dropped immediately at
+/// the end of that function — before the probe begins — leaving the semaphore
+/// un-drained and allowing real traffic to contaminate per-shape RSS
+/// measurements. `acquire_many_owned` returns an `OwnedSemaphorePermit`
+/// independent of the source `Semaphore` lifetime, so it survives the move
+/// into the async closure and is held for the full duration of the probe.
 #[allow(clippy::too_many_arguments)]
 async fn spawn_probe_task(
     state: Arc<AppState>,
@@ -1048,8 +1047,8 @@ mod tests {
 
     #[tokio::test]
     async fn readiness_probe_does_not_set_ready_when_dense_check_fails() {
-        // With the serialised-probe design (v0.15.0-rc5), readiness checks
-        // run inside the spawned probe task rather than in the caller.
+        // With the serialised-probe design, readiness checks run inside the
+        // spawned probe task rather than in the caller.
         // run_readiness_probe returns Ok immediately; the readiness failure
         // is logged and state.ready stays false.
         let state = make_test_state(false, 256);

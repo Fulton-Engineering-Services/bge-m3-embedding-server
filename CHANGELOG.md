@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.15.0-rc1] - 2026-05-09
+## [0.15.0] - 2026-05-10
 
 ### Added
 - **Unified dense + sparse embeddings endpoint** (`POST /v1/embeddings:both`) — runs **one** ONNX `session.run()` per chunk and projects both dense (CLS-pooled, L2-normalized) and sparse (SPLADE-style) outputs from the same forward pass. Numerically equivalent to calling `/v1/embeddings` and `/v1/sparse-embeddings` separately on the same inputs, within FP rounding tolerance, but at near-zero marginal GPU cost. Existing `/v1/embeddings` and `/v1/sparse-embeddings` endpoints are unchanged.
@@ -15,6 +15,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `DualRequest` / `DualResponse` / `DualEmbeddingData` request/response types.
 - Handler-level validation tests, router-level tests, and an opt-in (`BGE_M3_EQUIVALENCE_TEST=1`) integration test verifying that the dual-pass path matches separate dense + sparse passes within FP tolerance.
 - OpenAPI documentation for the new endpoint plus `DualRequest`/`DualResponse`/`DualEmbeddingData` schemas.
+
+### Fixed
+- **Sequential worker spawning** — `EmbedPool::spawn` now loads workers sequentially (leader first, then followers one at a time) so each worker's per-model RSS delta is measured in isolation. Parallel spawning caused `/proc/self/statm` to capture cumulative multi-worker allocation on the first RSS read, producing inflated `per_worker_workspace` values that broke the probe cost-model fit.
+- **Median aggregation of per-worker RSS deltas** — `EmbedPool` now stores the median (not the max) of per-worker RSS deltas. Median is robust to a single outlier from page-cache settling or ORT arena jitter; `fetch_max` would return an inflated outlier and re-introduce the same measurement contamination on a different code path.
+- **ECS Managed Instances cgroup-v2 path-walk** — `detect_available_memory()` now reads `/proc/self/cgroup`, extracts the unified-hierarchy cgroup path, and walks ancestors until it finds a numeric limit. On Bottlerocket without `--cgroupns=private`, `/sys/fs/cgroup/memory.max` resolves to the host root where the value is `"max"`; the path-walk reaches the task's actual cgroup limit without falling back to host RAM.
+- **Probe RSS-cap absolute guard** — `run_probe` reads `current_rss` before each shape and skips it if `current_rss + 4 × chunk_cost(batch, seq) > 87.5% × cgroup_limit`, preventing the ORT session arena from accumulating past the container ceiling mid-sweep.
+- **Arena warm-up before probe sweep** — `run_probe` now runs a `(1, 64)` `session.run()` and discards the result before the measurement sweep begins. ORT lazily initialises its memory arena on the first call, contributing a ~1 GiB constant offset to `rss_after - rss_before`. The warm-up flushes this out of per-shape deltas so the OLS fitter receives meaningful signal.
+- **`OwnedSemaphorePermit` for probe serialisation** — `spawn_probe_task` uses `Arc<Semaphore>::acquire_many_owned` and moves the resulting `OwnedSemaphorePermit` into the spawned task closure. Using `acquire_many` and binding the permit to a local variable in the parent function caused the permit to be dropped immediately after `tokio::spawn` returned (synchronously), before the spawned task started — leaving the semaphore un-drained and allowing real traffic to contaminate per-shape RSS measurements.
+- **Restored 7-shape probe set** — `PROBE_SHAPES` contains 6 static shapes plus a dynamic `(1, max_seq)` shape added at runtime. The three OOM-protection layers (arena warm-up, conservative `fits()` gate, absolute-RSS guard) make the full shape set safe to sweep without risking mid-probe container kills.
 
 ## [0.14.0] - 2026-05-09
 
@@ -142,7 +151,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Multi-arch Docker images (linux/amd64, linux/arm64) via GHCR
 - Automated release workflow via GitHub Actions
 
-[Unreleased]: https://github.com/Fulton-Engineering-Services/bge-m3-embedding-server/compare/v0.14.0...HEAD
+[Unreleased]: https://github.com/Fulton-Engineering-Services/bge-m3-embedding-server/compare/v0.15.0...HEAD
+[0.15.0]: https://github.com/Fulton-Engineering-Services/bge-m3-embedding-server/compare/v0.14.0...v0.15.0
 [0.14.0]: https://github.com/Fulton-Engineering-Services/bge-m3-embedding-server/compare/v0.13.0...v0.14.0
 [0.13.0]: https://github.com/Fulton-Engineering-Services/bge-m3-embedding-server/compare/v0.12.0...v0.13.0
 [0.12.0]: https://github.com/Fulton-Engineering-Services/bge-m3-embedding-server/compare/v0.11.0...v0.12.0

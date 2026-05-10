@@ -338,23 +338,19 @@ Each shape is chosen for a reason:
 | `(1, 4096)` | Quadratic anchor | Quadratic term ~50% of total cost. Strong leverage on `b`. |
 | `(1, max_seq)` | Quadratic anchor | Dynamic — sized to the configured upper bound. Dominant `b` measurement. Doubles as a soft capability check (errors are skipped, not fatal). |
 
-### 7.1 Three independent OOM-protection layers (rc6)
+### 7.1 Three independent OOM-protection layers
 
-The rc4 incident (OOM kill 3 minutes into startup) traced to ORT session-arena *retention*: each successive probe shape's `session.run()` grew the arena and retained the pages. Cumulative process RSS climbed past the cgroup ceiling on the `(1, 4096)` shape.
-
-rc5 attempted to mitigate this by removing `(1, 4096)` and `(1, max_seq)` from the sweep — but the resulting 5-shape set produced near-flat RSS deltas (each shape registered 1–1.5 GiB of delta dominated by lazy ORT arena initialisation rather than per-shape workspace). The OLS fit returned `None` and conservative defaults under-budgeted high-seq workspace by 5–10×, leading to a different OOM under real traffic.
-
-rc6 restores the full 7-shape set behind three independent OOM-protection layers:
+ORT's memory arena retains pages across `session.run()` calls, so cumulative process RSS grows with each successive probe shape. Without countermeasures, sweeping high-seq shapes can push the process past the container's cgroup ceiling mid-probe. Three independent layers prevent this:
 
 1. **Arena warm-up** at the start of `run_probe` runs a `(1, 64)` `session.run()` BEFORE the sweep. ORT's lazy arena initialisation contributes ~1 GiB to `rss_after - rss_before` on the first call. By running the warm-up first and discarding the result, subsequent per-shape deltas reflect only the incremental allocation attributable to that shape, giving the OLS fitter a meaningful signal.
-2. **Conservative `fits()` gate** rejects shapes whose per-call workspace estimate (under `CONSERVATIVE_A=16384, CONSERVATIVE_B=8`) exceeds `rss_ceiling` (the safety-discounted budget). Same gate as rc4 — protects against pathological budget configurations.
+2. **Conservative `fits()` gate** rejects shapes whose per-call workspace estimate (under `CONSERVATIVE_A=16384, CONSERVATIVE_B=8`) exceeds `rss_ceiling` (the safety-discounted budget). Protects against pathological budget configurations.
 3. **Absolute-RSS guard** rejects any shape whose projected total RSS would breach `cgroup_limit × 87.5%`:
 
    ```
    current_rss + 4 × chunk_cost(batch, seq) > 87.5% × cgroup_limit  →  skip
    ```
 
-   The `4×` multiplier is empirically derived from the rc4 incident measurements. Even after warm-up, ORT's arena can grow further at higher seq; the guard rejects shapes that risk pushing total RSS past the cgroup ceiling regardless of the conservative model's per-call estimate.
+   The `4×` multiplier is empirically calibrated against observed ORT arena growth at mid-range shapes. Even after warm-up, ORT's arena can grow further at higher seq; the guard rejects shapes that risk pushing total RSS past the cgroup ceiling regardless of the conservative model's per-call estimate.
 
 ### 7.2 Why earlier shapes and not others
 
@@ -519,13 +515,13 @@ Even with a well-conditioned fit, measurement noise can produce values outside t
 
 A clamp is a *graceful degradation*: a fit that lands outside these bounds still produces a valid cost model, just one that is less aggressive than the noise might have suggested. Without clamping, an outlier RSS reading could push `b` to e.g. `1e9` and effectively disable batching for any sequence longer than a few tokens.
 
-### 9.2 Max-seq capability — two-stage check (rc6)
+### 9.2 Max-seq capability — two-stage check
 
-rc6 splits the capability check into two stages so that we get the diagnostic value of running an actual `session.run()` at `max_seq` without the rc4 fail-fast OOM behaviour.
+The capability check is split into two stages: a cheap synchronous shape validation at startup, followed by a live `session.run()` as part of the probe sweep.
 
 **Stage 1 — `validate_max_seq_shape` (synchronous, cheap, no session.run).** Runs at the start of `run_probe`, constructs `input_ids` and `attention_mask` ndarrays at shape `(1, max_seq)` and discards them. Confirms that `max_seq` fits within `usize` bounds and that ndarray can allocate the 2D layout. Cannot detect ONNX positional-embedding bounds.
 
-**Stage 2 — `(1, max_seq)` probe shape (dynamic, soft).** Added to the probe sweep at runtime. Runs after the warm-up and the static shapes. The error path now logs and skips, NOT fail-fast:
+**Stage 2 — `(1, max_seq)` probe shape (dynamic, soft).** Added to the probe sweep at runtime. Runs after the warm-up and the static shapes. The error path logs and skips, not fail-fast:
 
 ```
 Err(e) => {
@@ -534,12 +530,7 @@ Err(e) => {
 }
 ```
 
-If the ONNX model variant cannot run at `max_seq` (e.g. some Xenova FP16/INT8 exports with `max_position_embeddings=512`), the shape errors out, the probe continues with the data points it has, and the cost-model fit excludes the failing shape. The incompatibility then surfaces as an ORT error on the first real `/v1/embeddings` request rather than killing the container at startup.
-
-**Trade-off resolution:** in rc4, a `(1, max_seq)` failure converted to `process::exit(1)` so the operator saw the error explicitly. That worked for true model-incompatibility bugs but conflated them with arena-OOM scenarios — which produced the same `(1, max_seq) errored` signal but for a completely different reason (no ORT error, container SIGKILL'd by the kernel). rc6 separates the two concerns:
-
-- **Arena-OOM** is prevented by the three protection layers in §7.1 — the probe never reaches a state where the kernel kills the container mid-sweep.
-- **Model-incompatibility** surfaces as the first real request's ORT error, with a clear message about positional-embedding bounds.
+If the ONNX model variant cannot run at `max_seq` (e.g. some Xenova FP16/INT8 exports with `max_position_embeddings=512`), the shape errors out, the probe continues with the data points it has, and the cost-model fit excludes the failing shape. The incompatibility surfaces as an ORT error on the first real `/v1/embeddings` request rather than killing the container at startup. Arena-OOM during the probe is prevented by the three protection layers in §7.1.
 
 Operators who see "Probe shape failed; skipping" with `seq` matching their configured `max_seq` should:
 
@@ -638,11 +629,9 @@ Setting `BGE_M3_DISABLE_PROBE_CACHE=1` forces a fresh probe even when a valid ca
 
 The probe takes long enough (~120 s on a cache miss) that blocking startup on it would stall liveness probes and delay rolling-update completion. The implementation runs the probe in a Tokio task and updates the cost model atomically.
 
-### 11.0 Concurrency gate during the probe window (v0.15.0-rc6 — `OwnedSemaphorePermit`)
+### 11.0 Concurrency gate during the probe window
 
-Because the probe measures process-wide RSS deltas (`/proc/self/statm`), any concurrent `session.run()` call from real traffic pollutes the per-shape measurement. The v0.15.0-rc4 incident confirmed this: the dense + sparse readiness calls launched concurrently with the first probe shape caused the `(1, 64)` delta to read `3074 MiB` (3× the actual per-call cost), which would have driven a grossly inflated `a` coefficient.
-
-To prevent RSS contamination, the probe **holds all `cfg_workers` permits** for the duration of the probe + readiness window, blocking all incoming `/v1/embeddings*` requests at the semaphore. Requests queue rather than being rejected; `/health` still returns 200 during this window. The dense + sparse readiness checks and the `state.ready = true` flip both happen **inside** the probe task after the probe sweep completes.
+Because the probe measures process-wide RSS deltas (`/proc/self/statm`), any concurrent `session.run()` call from real traffic pollutes the per-shape measurement. To prevent RSS contamination, the probe **holds all `cfg_workers` permits** for the duration of the probe + readiness window, blocking all incoming `/v1/embeddings*` requests at the semaphore. Requests queue rather than being rejected; `/health` still returns 200 during this window. The dense + sparse readiness checks and the `state.ready = true` flip both happen **inside** the probe task after the probe sweep completes.
 
 `AppState` holds a `tokio::sync::Semaphore` (`request_permits`) that gates the three embedding handlers:
 
@@ -656,23 +645,23 @@ To prevent RSS contamination, the probe **holds all `cfg_workers` permits** for 
 
 The semaphore is initialized to `max(cfg_workers − 1, 1)` permits at startup (one slot already reserved for the probe worker). On a cache miss, `spawn_probe_task` acquires the remaining `cfg_workers − 1` permits via `Arc<Semaphore>::acquire_many_owned`, **moves the resulting `OwnedSemaphorePermit` into the spawned task closure**, and releases everything via `add_permits(cfg_workers)` once the probe + readiness work completes.
 
-#### rc5 → rc6 regression and fix
+#### Why `OwnedSemaphorePermit`, not `acquire_many`
 
-rc5 implemented permit serialisation with `Semaphore::acquire_many` bound to a local `_probe_lock` variable in the parent function:
+`tokio::spawn` returns synchronously — before the spawned task starts executing. A permit bound to a local variable in the parent function is dropped immediately at the end of that function, well before the probe begins:
 
 ```rust
-// rc5 — broken
+// broken: permit dropped immediately after tokio::spawn returns
 let _probe_lock = state.request_permits.acquire_many(...).await.ok();
 tokio::spawn(async move { /* probe runs here */ });
 return Ok(());  // _probe_lock drops here, permits released immediately
 ```
 
-The permit was dropped at the end of the parent function — synchronously, immediately after `tokio::spawn` returned and well before the spawned task started the probe. Real `/v1/embeddings*` traffic could enter the worker pool during the probe window, contaminating per-shape RSS deltas and overshooting the cgroup limit on a real production task at 04:45:12 UTC on 2026-05-09.
+Real `/v1/embeddings*` traffic could enter the worker pool during the probe window, contaminating per-shape RSS deltas.
 
-rc6 fixes this with `acquire_many_owned`, which returns a `tokio::sync::OwnedSemaphorePermit` independent of the source `Semaphore` lifetime:
+`acquire_many_owned` returns a `tokio::sync::OwnedSemaphorePermit` independent of the source `Semaphore` lifetime, so it can be moved into the closure and is held for the full duration of the probe:
 
 ```rust
-// rc6 — correct
+// correct: permit moved into the closure, lives until add_permits
 let probe_permit = Arc::clone(&state.request_permits)
     .acquire_many_owned(...).await.ok();
 tokio::spawn(async move {
@@ -682,7 +671,7 @@ tokio::spawn(async move {
 });
 ```
 
-The `OwnedSemaphorePermit` survives the move into the async closure. We call `forget()` on it (preventing its drop handler from returning the permits) and then explicitly `add_permits(cfg_workers)` at the end of the task, so the semaphore count goes from 0 (drained) directly to `cfg_workers` (full concurrency) in one operation — releasing both the explicitly-acquired permits AND the originally-reserved probe slot.
+We call `forget()` on it (preventing its drop handler from returning the permits) and then explicitly `add_permits(cfg_workers)` at the end of the task, so the semaphore count goes from 0 (drained) directly to `cfg_workers` (full concurrency) in one operation — releasing both the explicitly-acquired permits AND the originally-reserved probe slot.
 
 Override and cache-hit paths do not acquire the extra permits — they run readiness checks inline and the initial `cfg_workers − 1` + 1 permits never get drained.
 
@@ -736,7 +725,7 @@ pub enum ProbeStatus {
 
 ## 12. End-to-End Example — From Probe Run to `/health`
 
-A representative cold-start trace at default settings on a 28 GB ECS Managed Instance task (v0.15.0-rc6):
+A representative cold-start trace at default settings on a 28 GB ECS Managed Instance task (v0.15.0):
 
 ```
 [INFO] Starting bge-m3-embedding-server bind=0.0.0.0:8081 workers=7 max_seq=8192 model=Fp16
@@ -744,7 +733,7 @@ A representative cold-start trace at default settings on a 28 GB ECS Managed Ins
 [INFO] Phase 4/4 saveAll: tokenizer + dense + sparse loaded                │ leader-first
 [INFO] Leader worker ready, model cache warm rss_delta_mb=1409 (1/7)       │ §8.2 worker-reported
 [INFO] Workers 1..7 loaded from warm cache rss_delta_mb=1409 each          ┘ sequential, §8.2
-[INFO] Memory detected available_bytes=30064771072 source=cgroup_v2        ← path-walk §2 (rc5 fix)
+[INFO] Memory detected available_bytes=30064771072 source=cgroup_v2        ← path-walk §2
 [INFO] Measured model RSS per worker model_rss_per_worker_mb=1409          ← median across workers
 [INFO] Workspace budget computed worst_case_peak_mb=17537 available_mb=28672
         utilization_pct=61.2 per_worker_workspace_mb=1058                  ← §11.0
@@ -752,7 +741,7 @@ A representative cold-start trace at default settings on a 28 GB ECS Managed Ins
 [INFO] Starting memory probe max_seq=8192 rss_ceiling_mb=1058              ┐ probe task holds all
         cgroup_limit_mb=28672                                              │ cfg_workers permits
                                                                            │ (OwnedSemaphorePermit)
-[INFO] Probe: arena warm-up complete (delta excluded from fit)             ← rc6 warm-up §7.1
+[INFO] Probe: arena warm-up complete (delta excluded from fit)             ← arena warm-up §7.1
         warmup_delta_mb=994 rss_after_mb=10857 elapsed_ms=812              │
 [INFO] Probe shape measured batch=1 seq=64 rss_delta_mb=2                  │ deltas now reflect
 [INFO] Probe shape measured batch=4 seq=64 rss_delta_mb=8                  │ per-shape workspace
@@ -769,15 +758,6 @@ A representative cold-start trace at default settings on a 28 GB ECS Managed Ins
 [INFO] Sparse readiness probe passed                                       ┘ inside probe task
 [INFO] Models ready — accepting requests                                   ← permits released, traffic opens
 ```
-
-Compared to the rc5 trace (which fell back to conservative defaults because the cost-model fit failed):
-
-| | rc5 | rc6 |
-|---|---|---|
-| Per-shape rss_delta range | 994–1540 MiB | 2–720 MiB |
-| Signal-to-noise ratio | y dominated by ~1 GiB arena init | y reflects actual per-call workspace |
-| OLS fit | Returns `None` (singular Gram matrix) | Returns fitted `(a, b)` |
-| Production cost model | `CONSERVATIVE_A=16384, B=8` (under-budgets at high seq by 5–10×) | Fitted from real data |
 
 After this, `GET /health` returns:
 
@@ -836,7 +816,7 @@ Every failure path leads to one of these cells:
 | RSS reads return 0 (non-Linux) | All-zero delta detection; fit skipped | `failed` | Conservative defaults; server functional |
 | Warm-up `(1, 64)` errors | Log warning, proceed without warm-up | depends on sweep | First-shape delta will include arena init noise; fit may fail |
 | One probe shape errors mid-sweep | Skip that data point, continue | `complete` (if others succeed) | Fit may be slightly less accurate |
-| `(1, max_seq)` errors (model incompatibility) | Skip + warn (rc6 — no fail-fast) | `complete` (if others succeed) | First real `/v1/embeddings` request surfaces ORT error; operator changes model or lowers `MAX_SEQ_LENGTH` |
+| `(1, max_seq)` errors (model incompatibility) | Skip + warn (no fail-fast) | `complete` (if others succeed) | First real `/v1/embeddings` request surfaces ORT error; operator changes model or lowers `MAX_SEQ_LENGTH` |
 | All shapes skipped by RSS-cap guard | Emit diagnostic with current_rss + cgroup_limit | `failed` | Conservative defaults; check cgroup detection |
 | `validate_max_seq_shape` ndarray fails | Would be a Rust panic (usize overflow); unreachable in practice | — | — |
 | OLS Gram is singular | `fit_cost_model` returns `None` | `failed` | Conservative defaults |

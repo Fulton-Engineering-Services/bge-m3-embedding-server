@@ -26,8 +26,8 @@ type Shape = (usize, usize);
 
 /// Shapes swept by the probe.
 ///
-/// 6 static shapes (rc6 layout) plus a dynamic `(1, max_seq)` shape added
-/// at runtime for the quadratic anchor at the configured upper bound:
+/// 6 static shapes plus a dynamic `(1, max_seq)` shape added at runtime for
+/// the quadratic anchor at the configured upper bound:
 ///
 /// - `(1, 64)` and `(1, 256)` anchor the linear term at low seq.
 /// - `(4, 64)` shares `x1 = batch*seq = 256` with `(1, 256)` but has a
@@ -36,10 +36,11 @@ type Shape = (usize, usize);
 /// - `(1, 1024)` and `(1, 2048)` provide mid-range leverage.
 /// - `(1, 4096)` anchors the quadratic regime.
 ///
-/// ## Safety against OOM (rc6)
+/// ## Safety against OOM
 ///
-/// Three independent mechanisms protect the probe sweep from the v0.15.0-rc4
-/// arena-accumulation OOM:
+/// ORT's memory arena retains pages across `session.run()` calls, so
+/// cumulative process RSS grows with each successive probe shape. Three
+/// independent mechanisms keep the sweep within the container's cgroup limit:
 ///
 /// 1. **Arena warm-up** at the start of `run_probe` runs a `(1, 64)`
 ///    `session.run()` BEFORE the sweep, so the lazy ORT arena initialisation
@@ -50,10 +51,9 @@ type Shape = (usize, usize);
 ///    would push process RSS above 87.5% of the cgroup ceiling, regardless
 ///    of the conservative model's estimate.
 ///
-/// The dynamic `(1, max_seq)` shape that anchors the quadratic regime at the
-/// configured upper bound is added at runtime by `run_probe`, never as a
-/// fail-fast capability check (see rc4 incident notes — that approach OOM'd
-/// the container before producing actionable diagnostics).
+/// The dynamic `(1, max_seq)` shape is added at runtime by `run_probe`. If
+/// the model variant cannot run at `max_seq`, the shape is skipped and the
+/// error surfaces on the first real embedding request.
 ///
 /// Estimated probe time: ~120 s on aarch64 MLAS fp16 at `max_seq=8192`.
 const PROBE_SHAPES: &[Shape] = &[
@@ -778,10 +778,8 @@ mod tests {
 
     #[test]
     fn fit_cost_model_recovers_known_coefficients_from_7_probe_shapes() {
-        // Verify the rc6 7-shape set (6 static + dynamic max_seq=8192) still
-        // recovers coefficients within 5% of ground truth. The shape set was
-        // restored to its rc4 layout in rc6 because the arena warm-up plus
-        // the absolute-RSS guard make the higher-seq shapes safe again.
+        // Verify the 7-shape set (6 static + dynamic max_seq=8192) recovers
+        // coefficients within 5% of ground truth.
         let a_true = 18_500.0_f64;
         let b_true = 6.5_f64;
         let data: Vec<DataPoint> = [
