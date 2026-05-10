@@ -1,14 +1,59 @@
 use crate::binpack::CostModel;
 use crate::embedder::EmbedPool;
 use crate::sysinfo::{MemoryReading, MemorySource};
-use std::sync::atomic::AtomicBool;
-use std::sync::OnceLock;
+use arc_swap::ArcSwap;
+use std::sync::atomic::{AtomicBool, AtomicU8};
+use std::sync::{Arc, OnceLock};
+
+/// Status of the background memory probe.
+///
+/// Stored in `AppState.probe_status` as an `AtomicU8` so it can be updated
+/// from the background probe task without holding a lock.
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProbeStatus {
+    /// Probe not run — a cost-model override (`BGE_M3_DISABLE_AUTO_BUDGET`,
+    /// `BGE_M3_TOKEN_BUDGET`, or explicit A/B env vars) was in effect.
+    Disabled = 0,
+    /// Probe is running in the background; workers are using conservative defaults.
+    Running = 1,
+    /// Probe completed successfully; fitted `(a, b)` are now active.
+    Complete = 2,
+    /// Probe failed or produced invalid coefficients; conservative defaults remain.
+    Failed = 3,
+    /// Probe was skipped — valid coefficients loaded from the EFS cache file.
+    CacheHit = 4,
+}
+
+impl ProbeStatus {
+    /// Returns the JSON-serializable string representation used in `/health`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Disabled => "disabled",
+            Self::Running => "running",
+            Self::Complete => "complete",
+            Self::Failed => "failed",
+            Self::CacheHit => "cache_hit",
+        }
+    }
+
+    /// Converts a raw `u8` (from `AtomicU8::load`) back to `ProbeStatus`.
+    pub fn from_u8(v: u8) -> Self {
+        match v {
+            0 => Self::Disabled,
+            1 => Self::Running,
+            2 => Self::Complete,
+            4 => Self::CacheHit,
+            _ => Self::Failed,
+        }
+    }
+}
 
 /// Shared application state injected into every request handler via [`axum::extract::State`].
 pub struct AppState {
     /// The embedding worker pool. Handles dense and sparse embedding requests.
     pub pool: EmbedPool,
-    /// Atomic flag set to `true` once model warm-up completes.
+    /// Atomic flag set to `true` once model warm-up and readiness probes complete.
     ///
     /// Handlers check this before dispatching to the pool to return `503`
     /// while models are still loading.
@@ -22,22 +67,35 @@ pub struct AppState {
     pub total_workers: usize,
     /// Maximum tokenized sequence length in use.
     pub max_seq_length: usize,
-    /// Derived or configured workspace cost model.
+    /// Static memory-detection info written once before the probe starts.
     ///
-    /// Exposed by `/health` so operators can verify what the server derived.
-    /// Written exactly once during init (before `ready` is set) via `OnceLock`.
+    /// Written to `OnceLock` as soon as memory detection completes (before the
+    /// background probe finishes), so `/health` can show `memory_source`,
+    /// `available_bytes`, and `model_rss_bytes_per_worker` even while the probe
+    /// is still running.
     pub tuning: OnceLock<TuningInfo>,
+    /// Live cost-model coefficients.
+    ///
+    /// Initialized to conservative defaults at startup. Updated atomically by
+    /// the background probe (or cache-hit path) once fitted coefficients are
+    /// available. All workers share this same handle and observe the update
+    /// lock-free on their next `session.run()` call.
+    pub cost_model: Arc<ArcSwap<CostModel>>,
+    /// Current state of the background memory probe.
+    ///
+    /// Updated atomically from the background probe task. Read by `/health`
+    /// to expose `probe_status` in the `tuning` block.
+    pub probe_status: AtomicU8,
 }
 
-/// Workspace tuning data surfaced by the `/health` endpoint.
+/// Static workspace memory info surfaced by the `/health` endpoint.
+///
+/// Written once to [`AppState::tuning`] immediately after memory detection.
+/// The cost-model fields (`a`, `b`, `max_workspace_bytes`) are served
+/// dynamically from [`AppState::cost_model`] so they reflect the live
+/// probe result rather than the initial conservative defaults.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct TuningInfo {
-    /// Bytes per token-position (linear FFN / projection term).
-    pub a_bytes_per_token: f64,
-    /// Bytes per token-position-squared (quadratic attention term).
-    pub b_bytes_per_token_sq: f64,
-    /// Maximum workspace bytes per worker per `session.run()` call.
-    pub max_workspace_bytes: usize,
     /// Where the available-memory reading came from.
     pub memory_source: String,
     /// Total available bytes detected at startup.
@@ -47,11 +105,8 @@ pub struct TuningInfo {
 }
 
 impl TuningInfo {
-    pub fn new(cost_model: &CostModel, mem: &MemoryReading, model_rss_per_worker: usize) -> Self {
+    pub fn new(mem: &MemoryReading, model_rss_per_worker: usize) -> Self {
         Self {
-            a_bytes_per_token: cost_model.a,
-            b_bytes_per_token_sq: cost_model.b,
-            max_workspace_bytes: cost_model.max_workspace_bytes,
             memory_source: mem.source.to_string(),
             available_bytes: mem.available_bytes,
             model_rss_bytes_per_worker: model_rss_per_worker,
@@ -61,14 +116,11 @@ impl TuningInfo {
     /// Convenience builder for the case where memory detection was not possible
     /// (macOS without cgroup support, or probe disabled).
     #[allow(dead_code)]
-    pub fn unknown(cost_model: &CostModel) -> Self {
+    pub fn unknown(model_rss_per_worker: usize) -> Self {
         Self {
-            a_bytes_per_token: cost_model.a,
-            b_bytes_per_token_sq: cost_model.b,
-            max_workspace_bytes: cost_model.max_workspace_bytes,
             memory_source: MemorySource::HostRam.to_string(),
             available_bytes: 0,
-            model_rss_bytes_per_worker: 0,
+            model_rss_bytes_per_worker: model_rss_per_worker,
         }
     }
 }

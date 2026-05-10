@@ -2,6 +2,7 @@ use crate::binpack::{bin_pack, CostModel};
 use crate::config::ModelVariant;
 use crate::sysinfo;
 use anyhow::Result;
+use arc_swap::ArcSwap;
 use ndarray::ArrayView1;
 use ort::value::TensorRef;
 use std::collections::HashMap;
@@ -663,10 +664,19 @@ impl Drop for WorkerGuard {
 }
 
 /// Execution-policy configuration shared by all workers.
+///
+/// `cost_model` is an `Arc<ArcSwap<CostModel>>` so all workers share a single
+/// handle and the background probe can update the cost model atomically after
+/// fitting.  Each worker loads the current value lock-free at the start of
+/// every `session.run()` call via `config.cost_model.load()`.
 #[derive(Clone)]
 pub(crate) struct WorkerConfig {
     /// Quadratic-aware workspace cost model and per-worker budget.
-    pub cost_model: CostModel,
+    ///
+    /// Shared across all workers via `ArcSwap`.  The background probe updates
+    /// this handle once fitted coefficients are available; workers observe the
+    /// new model on their next request without any coordination or restart.
+    pub cost_model: Arc<ArcSwap<CostModel>>,
     /// Duration of inactivity before workers unload their model instances.
     pub idle_timeout: Option<Duration>,
     /// ONNX model variant to load (FP32, FP16, or INT8).
@@ -785,36 +795,37 @@ fn run_worker(
 
                 match request {
                     EmbedRequest::Dense { texts, reply } => {
+                        // Load the current cost model snapshot for this request.
+                        // ArcSwap::load() is lock-free; the guard keeps the Arc
+                        // alive for the duration of embed_dense.
+                        let cm_guard = config.cost_model.load();
                         let result = embed_dense(
                             session,
                             tokenizer,
                             &texts,
-                            &config.cost_model,
+                            &cm_guard,
                             config.model_variant,
                         )
                         .map_err(|e| anyhow::anyhow!("Dense embed error: {e}"));
                         let _ = reply.send(result);
                     }
                     EmbedRequest::Sparse { texts, reply } => {
+                        let cm_guard = config.cost_model.load();
                         let result = embed_sparse(
                             session,
                             tokenizer,
                             &texts,
-                            &config.cost_model,
+                            &cm_guard,
                             config.model_variant,
                         )
                         .map_err(|e| anyhow::anyhow!("Sparse embed error: {e}"));
                         let _ = reply.send(result);
                     }
                     EmbedRequest::Both { texts, reply } => {
-                        let result = embed_both(
-                            session,
-                            tokenizer,
-                            &texts,
-                            &config.cost_model,
-                            config.model_variant,
-                        )
-                        .map_err(|e| anyhow::anyhow!("Dual embed error: {e}"));
+                        let cm_guard = config.cost_model.load();
+                        let result =
+                            embed_both(session, tokenizer, &texts, &cm_guard, config.model_variant)
+                                .map_err(|e| anyhow::anyhow!("Dual embed error: {e}"));
                         let _ = reply.send(result);
                     }
                     EmbedRequest::Probe { texts, reply } => {
@@ -1126,8 +1137,10 @@ mod tests {
         PathBuf::from("/dev/null/impossible")
     }
 
-    fn test_cost_model() -> CostModel {
-        CostModel::conservative(CostModel::DEFAULT_MAX_WORKSPACE)
+    fn test_cost_model_handle() -> Arc<ArcSwap<CostModel>> {
+        Arc::new(ArcSwap::from_pointee(CostModel::conservative(
+            CostModel::DEFAULT_MAX_WORKSPACE,
+        )))
     }
 
     #[tokio::test]
@@ -1136,7 +1149,7 @@ mod tests {
             1,
             bad_cache_dir(),
             WorkerConfig {
-                cost_model: test_cost_model(),
+                cost_model: test_cost_model_handle(),
                 idle_timeout: None,
                 model_variant: crate::config::ModelVariant::Fp32,
                 max_seq_length: 512,
@@ -1167,7 +1180,7 @@ mod tests {
             3,
             bad_cache_dir(),
             WorkerConfig {
-                cost_model: test_cost_model(),
+                cost_model: test_cost_model_handle(),
                 idle_timeout: None,
                 model_variant: crate::config::ModelVariant::Fp32,
                 max_seq_length: 512,

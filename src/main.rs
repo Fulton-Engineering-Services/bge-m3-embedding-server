@@ -11,12 +11,13 @@ mod weights;
 
 use crate::binpack::CostModel;
 use crate::embedder::{EmbedPool, WorkerConfig, OS_HEADROOM_BYTES};
-use crate::state::{AppState, TuningInfo};
+use crate::state::{AppState, ProbeStatus, TuningInfo};
+use arc_swap::ArcSwap;
 use axum::extract::DefaultBodyLimit;
 use axum::http::HeaderValue;
 use axum::{routing::get, routing::post, Router};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::Arc;
 use tower_http::request_id::{
     MakeRequestId, PropagateRequestIdLayer, RequestId, SetRequestIdLayer,
@@ -50,12 +51,21 @@ pub(crate) fn build_router(state: Arc<AppState>) -> Router {
         .with_state(state)
 }
 
-/// Runs after all workers are loaded:
-/// 1. Detects available memory.
-/// 2. Runs the startup probe on the leader worker (unless overridden).
-/// 3. Derives the final cost model.
-/// 4. Runs dense + sparse readiness probes.
-/// 5. Sets `state.ready = true`.
+/// Runs after all workers finish loading their model instances.
+///
+/// # Sequence
+///
+/// 1. Wait for worker pool initialisation to finish.
+/// 2. Detect available memory; write static [`TuningInfo`] to `OnceLock`.
+/// 3. Resolve the cost model — one of three paths:
+///    - cost-model override set: apply immediately, `probe_status = Disabled`.
+///    - EFS cache hit: apply cached `(a, b)` via `ArcSwap`, `probe_status = CacheHit`.
+///    - cache miss: set `probe_status = Running`, launch background probe task.
+/// 4. Run dense + sparse readiness calls to confirm the worker pool is healthy.
+/// 5. Flip `state.ready = true` — `/health` returns `200 ok` from this point on.
+///    If the probe is still running in the background, the bin-packer uses
+///    conservative defaults until the `ArcSwap` is updated (typically ~120 s).
+///
 // cast_precision_loss: available_bytes and total_workspace are ≤ ~28 GB (Fargate task
 //   limit), well within f64's 2^52 mantissa (~4.5 PB); cfg_workers is ≤ 32.
 // cast_possible_truncation: per_worker_workspace is a byte budget; truncating
@@ -65,7 +75,9 @@ pub(crate) fn build_router(state: Arc<AppState>) -> Router {
 #[allow(
     clippy::cast_precision_loss,
     clippy::cast_possible_truncation,
-    clippy::cast_sign_loss
+    clippy::cast_sign_loss,
+    clippy::too_many_arguments,
+    clippy::too_many_lines
 )]
 async fn run_readiness_probe(
     init_handle: tokio::task::JoinHandle<anyhow::Result<()>>,
@@ -74,13 +86,16 @@ async fn run_readiness_probe(
     cfg_workers: usize,
     cfg_safety: f64,
     cost_model_override: Option<CostModel>,
+    cache_dir: PathBuf,
+    model_variant_str: String,
+    disable_probe_cache: bool,
 ) -> anyhow::Result<()> {
     init_handle
         .await
         .map_err(|e| anyhow::anyhow!("Worker pool task panicked: {e}"))?
         .map_err(|e| anyhow::anyhow!("Worker pool initialization failed: {e}"))?;
 
-    // --- Memory detection and probe ---
+    // --- Memory detection ---
     let mem = sysinfo::detect_available_memory();
     info!(
         available_bytes = mem.available_bytes,
@@ -89,10 +104,6 @@ async fn run_readiness_probe(
     );
 
     let pre_rss = sysinfo::read_process_rss_bytes().unwrap_or(0);
-
-    // We don't have an easy way to measure post-model-load RSS from here because
-    // the leader worker loaded its model in a blocking thread before this runs.
-    // The best approximation: difference between now and the pre-spawn baseline.
     let post_rss = sysinfo::read_process_rss_bytes().unwrap_or(pre_rss);
     let model_rss_per_worker = post_rss.saturating_sub(pre_rss);
     info!(
@@ -108,48 +119,128 @@ async fn run_readiness_probe(
     let per_worker_workspace =
         ((total_workspace as f64) * cfg_safety / (cfg_workers as f64)) as usize;
 
-    let cost_model = if let Some(cm) = cost_model_override {
+    // Write static memory info now so /health always shows memory_source,
+    // available_bytes, and model_rss_bytes_per_worker even while probe runs.
+    let _ = state
+        .tuning
+        .set(TuningInfo::new(&mem, model_rss_per_worker));
+
+    // --- Cost model resolution ---
+    if let Some(cm) = cost_model_override {
         info!(
             a = cm.a,
             b = cm.b,
             max_workspace_mb = cm.max_workspace_bytes / (1024 * 1024),
             "Using pre-configured cost model (probe skipped)"
         );
-        cm
-    } else {
-        let (a, b) = probe::run_probe(&state.pool, cfg_max_seq, per_worker_workspace).await;
-        CostModel {
-            a,
-            b,
-            max_workspace_bytes: per_worker_workspace,
+        state.cost_model.store(Arc::new(cm));
+        state
+            .probe_status
+            .store(ProbeStatus::Disabled as u8, Ordering::Release);
+    } else if !disable_probe_cache {
+        // Try to load cached coefficients from EFS.
+        if let Some((a, b)) =
+            probe::try_load_probe_cache(&cache_dir, &model_variant_str, cfg_max_seq)
+        {
+            let cm = CostModel {
+                a,
+                b,
+                max_workspace_bytes: per_worker_workspace,
+            };
+            info!(
+                a,
+                b,
+                max_workspace_mb = cm.max_workspace_bytes / (1024 * 1024),
+                "Cost model loaded from EFS cache"
+            );
+            state.cost_model.store(Arc::new(cm));
+            state
+                .probe_status
+                .store(ProbeStatus::CacheHit as u8, Ordering::Release);
+        } else {
+            // Cache miss — launch background probe.
+            state
+                .probe_status
+                .store(ProbeStatus::Running as u8, Ordering::Release);
+            let state_bg = Arc::clone(&state);
+            let model_variant_bg = model_variant_str.clone();
+            tokio::spawn(async move {
+                let (a, b) =
+                    probe::run_probe(&state_bg.pool, cfg_max_seq, per_worker_workspace).await;
+                let cm = CostModel {
+                    a,
+                    b,
+                    max_workspace_bytes: per_worker_workspace,
+                };
+                info!(
+                    a = cm.a,
+                    b = cm.b,
+                    max_workspace_mb = cm.max_workspace_bytes / (1024 * 1024),
+                    "Background probe complete — updating cost model"
+                );
+                state_bg.cost_model.store(Arc::new(cm));
+                // Distinguish real fit from conservative fallback.
+                let status = if (a - CostModel::CONSERVATIVE_A).abs() < f64::EPSILON
+                    && (b - CostModel::CONSERVATIVE_B).abs() < f64::EPSILON
+                {
+                    ProbeStatus::Failed
+                } else {
+                    probe::save_probe_cache(&cache_dir, &model_variant_bg, cfg_max_seq, a, b);
+                    ProbeStatus::Complete
+                };
+                state_bg.probe_status.store(status as u8, Ordering::Release);
+                info!(probe_status = status.as_str(), "Probe status updated");
+            });
         }
-    };
+    } else {
+        // BGE_M3_DISABLE_PROBE_CACHE=1 but no override — run probe synchronously
+        // (cache disabled, no cost model override; operator wants fresh probe without
+        // caching the result).
+        state
+            .probe_status
+            .store(ProbeStatus::Running as u8, Ordering::Release);
+        let state_bg = Arc::clone(&state);
+        let model_variant_bg = model_variant_str.clone();
+        tokio::spawn(async move {
+            let (a, b) = probe::run_probe(&state_bg.pool, cfg_max_seq, per_worker_workspace).await;
+            let cm = CostModel {
+                a,
+                b,
+                max_workspace_bytes: per_worker_workspace,
+            };
+            state_bg.cost_model.store(Arc::new(cm));
+            let status = if (a - CostModel::CONSERVATIVE_A).abs() < f64::EPSILON
+                && (b - CostModel::CONSERVATIVE_B).abs() < f64::EPSILON
+            {
+                ProbeStatus::Failed
+            } else {
+                ProbeStatus::Complete
+            };
+            state_bg.probe_status.store(status as u8, Ordering::Release);
+            info!(
+                probe_status = status.as_str(),
+                model_variant = model_variant_bg,
+                "Probe complete (cache disabled)"
+            );
+        });
+    }
 
-    info!(
-        a = cost_model.a,
-        b = cost_model.b,
-        max_workspace_mb = cost_model.max_workspace_bytes / (1024 * 1024),
-        "Final cost model"
-    );
-
-    // Store tuning info in state for /health. OnceLock guarantees exactly one write.
-    let tuning = TuningInfo::new(&cost_model, &mem, model_rss_per_worker);
-    let _ = state.tuning.set(tuning); // always succeeds (first and only write)
-
-    // Dense readiness probe.
+    // --- Readiness checks ---
     state
         .pool
         .dense(vec!["ready".into()])
         .await
         .map_err(|e| anyhow::anyhow!("Dense readiness probe failed: {e}"))?;
 
-    // Sparse readiness probe.
     state
         .pool
         .sparse(vec!["ready".into()])
         .await
         .map_err(|e| anyhow::anyhow!("Sparse readiness probe failed: {e}"))?;
 
+    // Flip the ready flag — /health starts returning 200 from here.
+    // If the background probe is still running, workers use conservative defaults
+    // until the ArcSwap is updated (typically within ~120 s).
     state.ready.store(true, Ordering::Release);
     tracing::info!("Models ready — accepting requests");
     Ok(())
@@ -175,6 +266,9 @@ async fn main() -> anyhow::Result<()> {
 
     let cfg = Config::from_env();
 
+    let disable_probe_cache = std::env::var("BGE_M3_DISABLE_PROBE_CACHE")
+        .is_ok_and(|v| matches!(v.as_str(), "1" | "true" | "yes"));
+
     info!(
         bind = %cfg.bind_addr,
         workers = cfg.workers,
@@ -185,43 +279,24 @@ async fn main() -> anyhow::Result<()> {
         model_variant = ?cfg.model_variant,
         memory_safety_factor = cfg.memory_safety_factor,
         auto_budget = cfg.cost_model_override.is_none(),
+        disable_probe_cache,
         "Starting bge-m3-embedding-server"
     );
 
-    // Use conservative defaults for the initial WorkerConfig. If auto-budget
-    // is enabled, the probe will derive better coefficients after the leader
-    // loads. Followers are spawned before the probe runs but will receive the
-    // same cost_model because they share the WorkerConfig value from spawn.
-    //
-    // Note: the probe updates the *running* cost_model after leader init by
-    // sending Probe requests through the channel. Followers use whatever
-    // cost_model was baked into their WorkerConfig at spawn time. To update
-    // followers after the probe, the simplest approach is to bake the overridden
-    // or conservative model at spawn and let followers inherit it; the probe only
-    // needs to run on the leader to derive coefficients for the cost model stored
-    // in AppState (used by /health). The binpacker in each worker uses the
-    // cost_model from its own WorkerConfig — so the worker's cost_model needs to
-    // be the same or we need to update it later.
-    //
-    // For v1: spawn all workers with conservative defaults; if auto-budget runs,
-    // the derived cost_model is stored in AppState for /health display, but
-    // workers keep using their spawn-time config. The bin-packer cost_model in
-    // workers is what actually matters for safety. On the next server restart
-    // (deploy), operators can set BGE_M3_DISABLE_AUTO_BUDGET + BGE_M3_TOKEN_BUDGET
-    // to pin the probed values.
-    //
-    // This is a pragmatic v1 tradeoff: probe-derived tuning improves observability
-    // immediately; actuating the derived cost_model into running workers requires
-    // a more complex hot-reload mechanism deferred to a future PR.
+    // Allocate one shared cost-model handle.  Conservative defaults are used
+    // until the background probe (or cache hit) updates the handle via ArcSwap.
+    // All workers share the same Arc<ArcSwap<CostModel>> so a single store()
+    // call in the probe task is immediately visible to every worker.
     let initial_cost_model = cfg
         .cost_model_override
         .unwrap_or_else(|| CostModel::conservative(CostModel::DEFAULT_MAX_WORKSPACE));
+    let cost_model_handle = Arc::new(ArcSwap::from_pointee(initial_cost_model));
 
     let (pool, init_handle) = EmbedPool::spawn(
         cfg.workers,
         PathBuf::from(&cfg.cache_dir),
         WorkerConfig {
-            cost_model: initial_cost_model,
+            cost_model: Arc::clone(&cost_model_handle),
             idle_timeout: cfg.idle_timeout,
             model_variant: cfg.model_variant,
             max_seq_length: cfg.max_seq_length,
@@ -235,6 +310,8 @@ async fn main() -> anyhow::Result<()> {
         total_workers: cfg.workers,
         max_seq_length: cfg.max_seq_length,
         tuning: std::sync::OnceLock::new(),
+        cost_model: cost_model_handle,
+        probe_status: AtomicU8::new(ProbeStatus::Running as u8),
     });
 
     let app = build_router(Arc::clone(&state));
@@ -247,6 +324,8 @@ async fn main() -> anyhow::Result<()> {
     let cfg_workers = cfg.workers;
     let cfg_safety = cfg.memory_safety_factor;
     let cost_model_override = cfg.cost_model_override;
+    let cache_dir = PathBuf::from(&cfg.cache_dir);
+    let model_variant_str = cfg.model_variant.to_string();
 
     tokio::spawn(async move {
         if let Err(e) = run_readiness_probe(
@@ -256,6 +335,9 @@ async fn main() -> anyhow::Result<()> {
             cfg_workers,
             cfg_safety,
             cost_model_override,
+            cache_dir,
+            model_variant_str,
+            disable_probe_cache,
         )
         .await
         {
@@ -275,11 +357,12 @@ async fn main() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arc_swap::ArcSwap;
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
     use axum::response::Response;
     use http_body_util::BodyExt;
-    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::{AtomicBool, AtomicU8};
     use tower::ServiceExt;
 
     fn make_test_state(ready: bool, max_batch: usize) -> Arc<AppState> {
@@ -290,6 +373,10 @@ mod tests {
             total_workers: 2,
             max_seq_length: 8192,
             tuning: std::sync::OnceLock::new(),
+            cost_model: Arc::new(ArcSwap::from_pointee(CostModel::conservative(
+                CostModel::DEFAULT_MAX_WORKSPACE,
+            ))),
+            probe_status: AtomicU8::new(ProbeStatus::Disabled as u8),
         })
     }
 
@@ -325,6 +412,10 @@ mod tests {
             total_workers: 1,
             max_seq_length: 8192,
             tuning: std::sync::OnceLock::new(),
+            cost_model: Arc::new(ArcSwap::from_pointee(CostModel::conservative(
+                CostModel::DEFAULT_MAX_WORKSPACE,
+            ))),
+            probe_status: AtomicU8::new(ProbeStatus::Disabled as u8),
         }));
         let req = Request::builder()
             .method("GET")
@@ -536,6 +627,10 @@ mod tests {
             total_workers: 1,
             max_seq_length: 8192,
             tuning: std::sync::OnceLock::new(),
+            cost_model: Arc::new(ArcSwap::from_pointee(CostModel::conservative(
+                CostModel::DEFAULT_MAX_WORKSPACE,
+            ))),
+            probe_status: AtomicU8::new(ProbeStatus::Disabled as u8),
         }));
         let body = serde_json::to_vec(&serde_json::json!({"input": ["hello"]}))
             .expect("request body should serialize");
@@ -612,11 +707,26 @@ mod tests {
         );
     }
 
+    fn test_cache_dir() -> PathBuf {
+        PathBuf::from("/tmp/bge-m3-probe-test-cache")
+    }
+
     #[tokio::test]
     async fn readiness_probe_fails_when_init_returns_error() {
         let state = make_test_state(false, 256);
         let handle = tokio::spawn(async { Err::<(), _>(anyhow::anyhow!("init failed")) });
-        let result = run_readiness_probe(handle, state, 8192, 2, 0.7, None).await;
+        let result = run_readiness_probe(
+            handle,
+            state,
+            8192,
+            2,
+            0.7,
+            None,
+            test_cache_dir(),
+            "fp16".into(),
+            true,
+        )
+        .await;
         assert!(result.is_err());
         assert!(result
             .unwrap_err()
@@ -628,7 +738,18 @@ mod tests {
     async fn readiness_probe_fails_when_init_panics() {
         let state = make_test_state(false, 256);
         let handle = tokio::spawn(async { panic!("worker panic") });
-        let result = run_readiness_probe(handle, state, 8192, 2, 0.7, None).await;
+        let result = run_readiness_probe(
+            handle,
+            state,
+            8192,
+            2,
+            0.7,
+            None,
+            test_cache_dir(),
+            "fp16".into(),
+            true,
+        )
+        .await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("panicked"));
     }
@@ -637,7 +758,18 @@ mod tests {
     async fn readiness_probe_fails_when_dense_probe_fails() {
         let state = make_test_state(false, 256);
         let handle = tokio::spawn(async { Ok::<(), anyhow::Error>(()) });
-        let result = run_readiness_probe(handle, state, 8192, 2, 0.7, None).await;
+        let result = run_readiness_probe(
+            handle,
+            state,
+            8192,
+            2,
+            0.7,
+            None,
+            test_cache_dir(),
+            "fp16".into(),
+            true,
+        )
+        .await;
         assert!(result.is_err());
     }
 
@@ -645,7 +777,18 @@ mod tests {
     async fn readiness_probe_does_not_set_ready_on_failure() {
         let state = make_test_state(false, 256);
         let handle = tokio::spawn(async { Err::<(), _>(anyhow::anyhow!("init failed")) });
-        let _ = run_readiness_probe(handle, Arc::clone(&state), 8192, 2, 0.7, None).await;
+        let _ = run_readiness_probe(
+            handle,
+            Arc::clone(&state),
+            8192,
+            2,
+            0.7,
+            None,
+            test_cache_dir(),
+            "fp16".into(),
+            true,
+        )
+        .await;
         assert!(!state.ready.load(std::sync::atomic::Ordering::Acquire));
     }
 }

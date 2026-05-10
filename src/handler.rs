@@ -7,7 +7,7 @@ use crate::models::{
     ModelEntry, ModelsResponse, SparseEmbeddingData, SparseRequest, SparseResponse, SparseValues,
     Usage,
 };
-use crate::state::AppState;
+use crate::state::{AppState, ProbeStatus};
 
 // ---------------------------------------------------------------------------
 // Internal helpers
@@ -205,15 +205,32 @@ pub async fn health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
 
     let status = if live < total { "warn" } else { "ok" };
 
-    let mut body = serde_json::json!({
+    // Read the live cost model and probe status atomically.
+    let cm = state.cost_model.load();
+    let probe_status = ProbeStatus::from_u8(state.probe_status.load(Ordering::Acquire)).as_str();
+
+    let mut tuning = serde_json::json!({
+        "a_bytes_per_token": cm.a,
+        "b_bytes_per_token_sq": cm.b,
+        "max_workspace_bytes": cm.max_workspace_bytes,
+        "probe_status": probe_status,
+    });
+
+    // Add static memory fields when available (written before probe starts).
+    if let Some(ti) = state.tuning.get() {
+        tuning["memory_source"] = serde_json::Value::String(ti.memory_source.clone());
+        tuning["available_bytes"] =
+            serde_json::Value::Number(serde_json::Number::from(ti.available_bytes));
+        tuning["model_rss_bytes_per_worker"] =
+            serde_json::Value::Number(serde_json::Number::from(ti.model_rss_bytes_per_worker));
+    }
+
+    let body = serde_json::json!({
         "status": status,
         "workers": { "live": live, "total": total },
         "max_seq_length": state.max_seq_length,
+        "tuning": tuning,
     });
-
-    if let Some(tuning) = state.tuning.get() {
-        body["tuning"] = serde_json::to_value(tuning).unwrap_or(serde_json::Value::Null);
-    }
 
     (StatusCode::OK, Json(body)).into_response()
 }
@@ -236,9 +253,11 @@ pub async fn models(State(_state): State<Arc<AppState>>) -> impl IntoResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::binpack::CostModel;
     use crate::embedder::EmbedPool;
+    use arc_swap::ArcSwap;
     use axum::body::to_bytes;
-    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::{AtomicBool, AtomicU8};
 
     fn make_state(ready: bool, max_batch: usize) -> Arc<AppState> {
         Arc::new(AppState {
@@ -248,6 +267,10 @@ mod tests {
             total_workers: 2,
             max_seq_length: 8192,
             tuning: std::sync::OnceLock::new(),
+            cost_model: Arc::new(ArcSwap::from_pointee(CostModel::conservative(
+                CostModel::DEFAULT_MAX_WORKSPACE,
+            ))),
+            probe_status: AtomicU8::new(ProbeStatus::Disabled as u8),
         })
     }
 
@@ -328,6 +351,10 @@ mod tests {
             total_workers: 1,
             max_seq_length: 8192,
             tuning: std::sync::OnceLock::new(),
+            cost_model: Arc::new(ArcSwap::from_pointee(CostModel::conservative(
+                CostModel::DEFAULT_MAX_WORKSPACE,
+            ))),
+            probe_status: AtomicU8::new(ProbeStatus::Disabled as u8),
         });
         let response = health(State(state)).await.into_response();
         assert_eq!(response.status(), StatusCode::OK);
@@ -356,19 +383,22 @@ mod tests {
 
     #[tokio::test]
     async fn health_ok_includes_max_seq_length() {
-        use crate::binpack::CostModel;
         use crate::state::TuningInfo;
         use crate::sysinfo::{MemoryReading, MemorySource};
 
-        let cm = CostModel::conservative(1024 * 1024 * 1024);
         let mem = MemoryReading {
             available_bytes: 8_000_000_000,
             source: MemorySource::CgroupV2,
         };
-        let tuning = TuningInfo::new(&cm, &mem, 500_000_000);
+        let tuning = TuningInfo::new(&mem, 500_000_000);
 
         let tuning_lock = std::sync::OnceLock::new();
         let _ = tuning_lock.set(tuning);
+        let fitted_cm = CostModel {
+            a: 18_432.0,
+            b: 6.2,
+            max_workspace_bytes: 1_073_741_824,
+        };
         let state = Arc::new(AppState {
             pool: EmbedPool::with_fixed_responses(vec![], vec![]),
             ready: AtomicBool::new(true),
@@ -376,6 +406,8 @@ mod tests {
             total_workers: 1,
             max_seq_length: 8192,
             tuning: tuning_lock,
+            cost_model: Arc::new(ArcSwap::from_pointee(fitted_cm)),
+            probe_status: AtomicU8::new(ProbeStatus::Complete as u8),
         });
         let response = health(State(state)).await.into_response();
         assert_eq!(response.status(), StatusCode::OK);
@@ -383,7 +415,13 @@ mod tests {
         let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(body["status"], "ok");
         assert_eq!(body["max_seq_length"], 8192);
-        assert!(body["tuning"].is_object(), "tuning should be present");
+        assert!(
+            body["tuning"].is_object(),
+            "tuning should always be present"
+        );
+        assert_eq!(body["tuning"]["probe_status"], "complete");
+        assert_eq!(body["tuning"]["a_bytes_per_token"], 18_432.0);
+        assert_eq!(body["tuning"]["b_bytes_per_token_sq"], 6.2);
     }
 
     // --- dense_embeddings handler (validation paths only) ---
@@ -512,6 +550,10 @@ mod tests {
             total_workers: 1,
             max_seq_length: 8192,
             tuning: std::sync::OnceLock::new(),
+            cost_model: Arc::new(ArcSwap::from_pointee(CostModel::conservative(
+                CostModel::DEFAULT_MAX_WORKSPACE,
+            ))),
+            probe_status: AtomicU8::new(ProbeStatus::Disabled as u8),
         });
         let req = DenseRequest {
             input: TextInput(vec![]),
@@ -534,6 +576,10 @@ mod tests {
             total_workers: 1,
             max_seq_length: 8192,
             tuning: std::sync::OnceLock::new(),
+            cost_model: Arc::new(ArcSwap::from_pointee(CostModel::conservative(
+                CostModel::DEFAULT_MAX_WORKSPACE,
+            ))),
+            probe_status: AtomicU8::new(ProbeStatus::Disabled as u8),
         });
         let req = DenseRequest {
             input: TextInput(vec!["a".into(), "b".into(), "c".into()]),
@@ -556,6 +602,10 @@ mod tests {
             total_workers: 1,
             max_seq_length: 8192,
             tuning: std::sync::OnceLock::new(),
+            cost_model: Arc::new(ArcSwap::from_pointee(CostModel::conservative(
+                CostModel::DEFAULT_MAX_WORKSPACE,
+            ))),
+            probe_status: AtomicU8::new(ProbeStatus::Disabled as u8),
         });
         let req = SparseRequest {
             input: TextInput(vec![]),
@@ -577,6 +627,10 @@ mod tests {
             total_workers: 1,
             max_seq_length: 8192,
             tuning: std::sync::OnceLock::new(),
+            cost_model: Arc::new(ArcSwap::from_pointee(CostModel::conservative(
+                CostModel::DEFAULT_MAX_WORKSPACE,
+            ))),
+            probe_status: AtomicU8::new(ProbeStatus::Disabled as u8),
         });
         let req = SparseRequest {
             input: TextInput(vec!["a".into(), "b".into(), "c".into()]),
@@ -623,6 +677,10 @@ mod tests {
             total_workers: 1,
             max_seq_length: 8192,
             tuning: std::sync::OnceLock::new(),
+            cost_model: Arc::new(ArcSwap::from_pointee(CostModel::conservative(
+                CostModel::DEFAULT_MAX_WORKSPACE,
+            ))),
+            probe_status: AtomicU8::new(ProbeStatus::Disabled as u8),
         });
         let req = DenseRequest {
             input: TextInput(vec!["hello".into(), "world".into()]),
@@ -678,6 +736,10 @@ mod tests {
             total_workers: 1,
             max_seq_length: 8192,
             tuning: std::sync::OnceLock::new(),
+            cost_model: Arc::new(ArcSwap::from_pointee(CostModel::conservative(
+                CostModel::DEFAULT_MAX_WORKSPACE,
+            ))),
+            probe_status: AtomicU8::new(ProbeStatus::Disabled as u8),
         });
         let req = DualRequest {
             input: TextInput(vec![]),
@@ -700,6 +762,10 @@ mod tests {
             total_workers: 1,
             max_seq_length: 8192,
             tuning: std::sync::OnceLock::new(),
+            cost_model: Arc::new(ArcSwap::from_pointee(CostModel::conservative(
+                CostModel::DEFAULT_MAX_WORKSPACE,
+            ))),
+            probe_status: AtomicU8::new(ProbeStatus::Disabled as u8),
         });
         let req = DualRequest {
             input: TextInput(vec!["a".into(), "b".into(), "c".into()]),
@@ -733,6 +799,10 @@ mod tests {
             total_workers: 1,
             max_seq_length: 8192,
             tuning: std::sync::OnceLock::new(),
+            cost_model: Arc::new(ArcSwap::from_pointee(CostModel::conservative(
+                CostModel::DEFAULT_MAX_WORKSPACE,
+            ))),
+            probe_status: AtomicU8::new(ProbeStatus::Disabled as u8),
         });
         let req = DualRequest {
             input: TextInput(vec!["hello".into(), "world".into()]),
@@ -767,6 +837,10 @@ mod tests {
             total_workers: 1,
             max_seq_length: 8192,
             tuning: std::sync::OnceLock::new(),
+            cost_model: Arc::new(ArcSwap::from_pointee(CostModel::conservative(
+                CostModel::DEFAULT_MAX_WORKSPACE,
+            ))),
+            probe_status: AtomicU8::new(ProbeStatus::Disabled as u8),
         });
         let req = SparseRequest {
             input: TextInput(vec!["hello".into()]),
