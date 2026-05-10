@@ -1,102 +1,86 @@
-# 4. OLS Fitting — Ordinary Least Squares Without an Intercept
+# 4. OLS Fitting
 
-> Once the probe has measured the workspace cost at seven `(batch, seq)` shapes, it has to turn those measurements into the two coefficients `(a, b)`. This page derives the closed-form ordinary least squares (OLS) solution and explains the two design choices that look unusual on first reading: no intercept, and only two parameters.
+After the probe sweeps its seven $(B, S)$ shapes, it has seven measurements $(x^1_i, x^2_i, y_i)$ where $x^1_i = B_i \cdot S_i$, $x^2_i = B_i \cdot S_i^2$, and $y_i$ is the observed RSS delta. The fitter must extract the two coefficients $(a, b)$ from those measurements. This page derives the closed-form ordinary least-squares (OLS) solution and justifies the two design choices that look unusual on first reading: no intercept, and exactly two parameters.
 
-## Intuition
+## OLS as a geometric problem
 
-Imagine plotting your seven measurements as dots in 3-D space, with `x₁ = B·S` on one axis, `x₂ = B·S²` on another, and `y = RSS_delta` on the vertical. The model says workspace is a *linear combination* of `x₁` and `x₂` with coefficients `a` and `b`:
+Given $n$ measurements $\{(B_i, S_i, y_i)\}$ and the two-coefficient model $y \approx a \cdot x^1 + b \cdot x^2$, the ordinary least-squares estimator $(\hat a, \hat b)$ minimises the sum of squared residuals:
 
 $$
-y \;\approx\; a \cdot x_1 \;+\; b \cdot x_2
+\mathcal{L}(a, b) \;=\; \sum_{i=1}^{n} \bigl( y_i \;-\; a \cdot x^1_i \;-\; b \cdot x^2_i \bigr)^2
 $$
 
-Geometrically, that's a **plane through the origin**. OLS finds the `(a, b)` such that this plane passes as close to all seven dots as possible — minimizing the sum of squared vertical distances (residuals) between each dot and the plane.
+For two parameters and one linear equation per measurement, the solution is closed-form: solve a $2 \times 2$ system once and the result is a pair $(\hat a, \hat b)$. There is no iterative optimiser, no learning rate, no convergence test — only one matrix inversion and a few multiplications.
 
-For two parameters and one linear equation per measurement, this is a textbook linear-algebra problem. The solution is closed-form: solve a 2×2 system once and you're done. No iterative optimizer, no learning rate, no convergence check. Just one matrix inversion and a couple of multiplies.
+![Figure 3 — OLS best-fit plane through 7 probe measurements with residuals shown as vertical green segments.](../figures/startup-probe/fig03_ols_geometry.png)
 
-The two non-obvious choices: the plane is **forced through the origin** (no intercept), and we use **exactly two parameters** (no `c·S³` term). Both choices have principled justifications below.
+Figure 3 visualises the fit as a 3-D problem. The seven probe measurements appear as coloured points in $(x^1, x^2, y)$ space. The shaded plane is the OLS best fit $y = a \cdot x^1 + b \cdot x^2$; it passes through the origin because the model has no intercept (justified below). The vertical green segments are the residuals $y_i - \hat y_i$ that OLS drives to a minimum-sum-of-squares solution. A perfect fit would place every point on the plane; real data carries small residuals due to RSS measurement noise, page granularity, and the model's inherent approximation error.
 
-## The figure
-
-![3D scatter of seven probe measurements, with a best-fit plane through the origin; vertical line segments connecting each point to the plane show the residuals OLS is minimizing](../figures/startup-probe/fig03_ols_geometry.png)
-
-**What you're looking at:** the seven probe measurements as colored dots in `(x₁, x₂, y)` space. The shaded plane is the OLS best fit `y = a·x₁ + b·x₂` — note that it passes through the origin. The vertical line segments connect each dot to the plane: those are the **residuals** the optimizer is squaring and summing. A perfect fit would have all dots on the plane (zero residuals). Real data has small residuals due to RSS measurement noise, page granularity, and the model's own approximation error.
-
-The plane is tilted because the two coefficients have very different magnitudes: `a` is in the tens of thousands (bytes per token), while `b` is single digits (bytes per token²). That tilt has consequences — see the next page on conditioning.
-
-**Why it matters:** OLS is the procedure that turns RSS measurements into the coefficients the bin-packer uses. Understanding *what* it minimizes (and what it doesn't) is the foundation for everything that comes after. The conditioning page explains *why* this same procedure fails in subtle ways at large `S`, and how a textbook preconditioner fixes it.
+The plane is tilted because the two coefficients have very different magnitudes: $a$ is in the tens of thousands (bytes per token) while $b$ is single digits (bytes per token²). This tilt has consequences for the conditioning of the solver, addressed in §5.
 
 ### Animated version
 
-![Animated: scatter points fade in one by one, then the best-fit plane materializes through them; finally the camera rotates to show the plane from multiple angles](../figures/startup-probe/animated/fig03_ols_geometry_animated.gif)
+![Figure 3a — Animation: the seven scatter points fade in sequentially, then the best-fit plane materialises through them, and finally the camera orbits to show the plane from multiple angles.](../figures/startup-probe/animated/fig03_ols_geometry_animated.gif)
 
-**What changes per frame:** the seven dots appear sequentially, then the plane materializes (representing the OLS solve), and finally the camera orbits to show that the plane is genuinely 2-dimensional — there's no warping or curvature, just an oriented flat surface in 3-D. The orbit makes the residuals visible from angles where they were hidden in the static image.
+Figure 3a constructs the fit incrementally: the seven points appear one at a time, the OLS plane materialises after the last point, and the camera then orbits to confirm that the surface is genuinely two-dimensional — flat, with no warping or curvature. The orbit reveals residuals that were hidden in the static image.
 
-## The math
+## Derivation of the closed form
 
-We have `n` measurements `{(B_i, S_i, y_i)}` where `y_i` is the observed RSS delta. We want `(a, b)` minimizing the sum of squared residuals:
+In matrix notation, define:
 
-$$
-\min_{a, b} \;\sum_{i=1}^{n} \Bigl( y_i \;-\; a \cdot (B_i \cdot S_i) \;-\; b \cdot (B_i \cdot S_i^2) \Bigr)^2
-$$
+- the design matrix $X \in \mathbb{R}^{n \times 2}$ with columns $x^1_i = B_i \cdot S_i$ and $x^2_i = B_i \cdot S_i^2$,
+- the response vector $y \in \mathbb{R}^n$ with entries $y_i$,
+- the parameter vector $\theta = (a, b)^\top$.
 
-This is ordinary least squares (OLS) with two columns and no intercept. Using the standard linear-algebra form, define:
-
-- design matrix `X ∈ ℝ^(n×2)` with columns `x¹_i = B_i · S_i` and `x²_i = B_i · S_i²`,
-- response vector `y ∈ ℝⁿ` with entries `y_i`,
-- parameter vector `θ = (a, b)ᵀ`.
-
-The least-squares solution satisfies the **normal equations**:
+The least-squares solution satisfies the normal equations:
 
 $$
 X^\top X \, \theta \;=\; X^\top y
 $$
 
-For our 2-column case `X^⊤ X` is a 2×2 matrix:
+For two columns $X^\top X$ is a $2 \times 2$ matrix:
 
 $$
 G \;=\; X^\top X \;=\; \begin{pmatrix} \sum (x^1_i)^2 & \sum x^1_i x^2_i \\ \sum x^1_i x^2_i & \sum (x^2_i)^2 \end{pmatrix}, \quad
 X^\top y \;=\; \begin{pmatrix} \sum x^1_i y_i \\ \sum x^2_i y_i \end{pmatrix}
 $$
 
-This `G` is called the **Gram matrix**. It is symmetric and positive semi-definite for any design `X`; it's positive definite (and therefore invertible) iff `X` has full column rank.
+The matrix $G$ is the *Gram matrix*; it is symmetric and positive semi-definite for any design $X$, and positive definite (hence invertible) iff $X$ has full column rank.
 
-Cramer's rule gives the closed-form solution:
+Cramer's rule gives the closed form:
 
 $$
 a \;=\; \frac{G_{22}\,(X^\top y)_1 \;-\; G_{12}\,(X^\top y)_2}{\det G}, \qquad
 b \;=\; \frac{G_{11}\,(X^\top y)_2 \;-\; G_{12}\,(X^\top y)_1}{\det G}
 $$
 
-with `det G = G₁₁ G₂₂ - G₁₂²`.
-
-This is everything. Two sums to compute the right-hand side, three sums for the Gram matrix, one division per coefficient. No iteration, no convergence test. The whole solver is a few dozen lines of straight-line arithmetic.
+with $\det G = G_{11} G_{22} - G_{12}^2$. Two sums to compute the right-hand side, three sums for the Gram matrix, one division per coefficient: a few dozen lines of straight-line arithmetic, no iteration, no convergence test.
 
 ## Why no intercept
 
-Workspace at `B = 0` is identically zero — there's no `session.run()` to allocate for. The cost model is *physically* anchored at the origin: an empty batch costs nothing. Adding a free intercept `c` to the model:
+Workspace at $B = 0$ is identically zero — there is no `session.run()` to allocate for. The cost model is physically anchored at the origin: an empty batch costs nothing. Adding a free intercept $c$ to the model,
 
 $$
-y \;\approx\; c \;+\; a \cdot x_1 \;+\; b \cdot x_2
+y \;\approx\; c \;+\; a \cdot x^1 \;+\; b \cdot x^2
 $$
 
-would let the fit absorb the (already small) ORT-arena setup cost into a constant term, which only matters for very small chunks where it doesn't hurt anything. Omitting it keeps the model two-parameter and the small-batch regime correctly underestimated by exactly the constant we don't care about.
+would let the fit absorb the (already small) ORT-arena setup cost into a constant term that only matters at very small chunks where the bin-packer's behaviour is unaffected. Omitting the intercept keeps the model two-parameter and lets the small-batch regime be correctly under-estimated by exactly the constant the bin-packer does not need.
 
-There's a second reason. With an intercept, you have three parameters but you might still only have seven probe shapes. Going from `n - p = 5` residual degrees of freedom to `n - p = 4` is a 20% reduction in the noise-rejection budget — for a parameter that captures something we can already model better elsewhere (the per-worker arena baseline, measured directly in [Measurement](07-measurement.md)).
+A second consideration is statistical. With an intercept, three parameters are fit from the same seven shapes. The residual degrees of freedom drop from $n - p = 5$ to $n - p = 4$, a $20\%$ reduction in the noise-rejection budget — for a parameter that captures something already modelled better elsewhere (the per-worker arena baseline, measured directly in §7).
 
-So the geometry, the physics, and the statistics all point the same way: anchor the plane at the origin.
+Geometry, physics, and statistics all agree: anchor the plane at the origin.
 
 ## Why exactly two parameters
 
-A 2-parameter fit needs at least 2 data points. With more, OLS minimizes the sum-of-squares — extra points serve as **noise rejection** rather than as additional degrees of freedom. The 7 probe shapes give us 5 degrees of freedom for residual estimation, which is sufficient to detect when a fit is suspect (large residuals → fall back to defaults, see [Clamps & fallback](08-clamps-fallback.md)).
+A two-parameter fit needs at least two non-degenerate data points; with more, OLS minimises the sum of squared residuals and the additional points serve as noise rejection. Seven probe shapes provide five degrees of freedom for residual estimation, sufficient to detect when a fit is suspect (large residuals trigger the fall-back path of §8).
 
-Going to three parameters (e.g., adding `c · S³`) would force more shapes (you can't fit `p` parameters from fewer than `p` non-degenerate data points), more probe time, and would mostly fit measurement noise. The two-regime decomposition in [Cost decomposition](02-cost-decomposition.md) already captures the dominant terms: linear (FFN/projection) and quadratic (attention).
+Extending to three parameters (e.g., adding $c \cdot S^3$) would force more probe shapes — fitting $p$ parameters requires at least $p$ non-degenerate data points — would lengthen the sweep, and would mostly fit measurement noise. The two-regime decomposition of §2 already captures the dominant terms: linear (FFN/projection) and quadratic (attention).
 
-If a future model architecture introduces a meaningfully cubic term (some long-context attention variants do), this is where to add it. Until then, two is the right number.
+If a future model architecture introduces a meaningfully cubic term — some long-context attention variants do — this is where to add it. Until then, two is the right number.
 
 ## Where the seven measurements come from
 
-The probe sweeps **6 fixed shapes plus a dynamic `(1, max_seq)` shape**:
+The probe sweeps six fixed shapes plus a dynamic $(1, \texttt{max\_seq})$ shape:
 
 ```
 (1,   64)    linear anchor
@@ -108,11 +92,11 @@ The probe sweeps **6 fixed shapes plus a dynamic `(1, max_seq)` shape**:
 (1, max_seq) dynamic — sized to the configured upper bound
 ```
 
-Each shape is chosen to add a distinct piece of information to the fit. Page [Probe shapes](06-probe-shapes.md) explains the *information geometry* — why these particular seven, and what would go wrong with sixteen or with an all-`B=1` set.
+Each shape contributes a distinct piece of information to the fit. §6 develops the information geometry — why these particular seven, and what would go wrong with sixteen or with an all-$B=1$ set.
 
 ## Code reference
 
-The fitter lives in `src/probe/fit.rs`. The interesting twist — column normalization to fix conditioning — is the subject of the next page, but the core OLS solve looks like:
+The fitter lives in `src/probe/fit.rs`. The interesting twist — column normalisation to fix conditioning — is the subject of §5, but the core OLS solve has the structure:
 
 ```60:80:src/probe/fit.rs
     // (Pseudo-code for the unscaled solve, before the Jacobi normalization
@@ -141,26 +125,26 @@ The fitter lives in `src/probe/fit.rs`. The interesting twist — column normali
     // let b = (g11 * gy2 - g12 * gy1) / det;
 ```
 
-In production, this naïve solve has a numerical pitfall at long sequence lengths. The next page is dedicated to that pitfall and its fix.
+In production, the naïve solve carries a numerical pitfall at long sequence lengths. §5 is dedicated to that pitfall and its fix.
 
-## What residuals tell us
+## Interpreting residuals
 
-After fitting `(a, b)`, every measurement has a **residual**: how far the model's prediction is from the actual RSS reading.
+After fitting $(a, b)$, every measurement has a residual giving the gap between the model's prediction and the observed RSS:
 
 $$
 r_i = y_i - (a \cdot x^1_i + b \cdot x^2_i)
 $$
 
-Large residuals are a warning sign:
+Large residuals are diagnostic:
 
-- A single large residual at one shape: that probe call hit unusual noise (page-cache settling, ORT arena jitter). Usually harmless; OLS averages it out.
-- Large residuals across all shapes: the model is *systematically wrong* — maybe a third regime exists, maybe RSS isn't tracking workspace, maybe the model variant has unusual memory behavior. This is when [Clamps & fallback](08-clamps-fallback.md) kicks in and the probe falls back to conservative defaults.
+- A single large residual at one shape: that probe call hit unusual noise (page-cache settling, ORT arena jitter). OLS averages it out.
+- Large residuals across all shapes: the model is systematically wrong — perhaps a third regime exists, perhaps RSS is not tracking workspace, perhaps the model variant has unusual memory behaviour. This is when the fall-back path of §8 takes over and the probe reverts to conservative defaults.
 
-The fit-quality figure on page [Measurement](07-measurement.md) shows the residuals plotted against the fitted curve.
+The fit-quality figure in §7 shows residuals plotted against the fitted curve.
 
-## What's next
+## Onward
 
-The conditioning page is where the textbook OLS solve gets interesting. At our highest probe shape `(B=1, S=8192)`, the two design columns have radically different magnitudes: `x₁ = 8192` while `x₂ = 67_108_864`. A direct solve gets dominated by one column and fails the standard `det G ≥ ε · max(diag)²` stability check. The fix is a one-line preconditioner with profound consequences for whether the probe works at all.
+At the highest probe shape $(B = 1, S = 8192)$, the two design columns differ in magnitude by roughly $8000\times$: $x^1 = 8192$ while $x^2 = 67{,}108{,}864$. A direct solve is dominated by the larger column and fails the standard $\det G \geq \varepsilon \cdot \max(\mathrm{diag})^2$ stability check. §5 derives the one-line preconditioner that fixes this.
 
 ---
 
