@@ -19,6 +19,7 @@ use axum::{routing::get, routing::post, Router};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::Arc;
+use tokio::sync::Semaphore;
 use tower_http::request_id::{
     MakeRequestId, PropagateRequestIdLayer, RequestId, SetRequestIdLayer,
 };
@@ -103,12 +104,16 @@ async fn run_readiness_probe(
         "Memory detected"
     );
 
-    let pre_rss = sysinfo::read_process_rss_bytes().unwrap_or(0);
-    let post_rss = sysinfo::read_process_rss_bytes().unwrap_or(pre_rss);
-    let model_rss_per_worker = post_rss.saturating_sub(pre_rss);
+    // Use the per-worker RSS delta reported by each worker during load_models().
+    // This is measured inside spawn_blocking immediately around the ORT session
+    // creation, so it accurately captures the model-weight footprint rather than
+    // the noisy pre/post snapshot that was taken here before (which read RSS
+    // twice in the same instant after all workers had already loaded and
+    // produced model_rss_per_worker ≈ 0 — the root cause of the 2026-05-09 OOM).
+    let model_rss_per_worker = state.pool.model_rss_max_bytes();
     info!(
         model_rss_per_worker_mb = model_rss_per_worker / (1024 * 1024),
-        "Estimated model RSS per worker"
+        "Measured model RSS per worker (max across all workers)"
     );
 
     // Compute per-worker workspace ceiling.
@@ -119,11 +124,42 @@ async fn run_readiness_probe(
     let per_worker_workspace =
         ((total_workspace as f64) * cfg_safety / (cfg_workers as f64)) as usize;
 
-    // Write static memory info now so /health always shows memory_source,
-    // available_bytes, and model_rss_bytes_per_worker even while probe runs.
-    let _ = state
-        .tuning
-        .set(TuningInfo::new(&mem, model_rss_per_worker));
+    // Compute and log worst-case peak memory when all workers run simultaneously
+    // at their per-worker budget ceiling.  This is the number that must stay
+    // below available_bytes to avoid OOM.
+    let worst_case_peak = cfg_workers
+        .saturating_mul(per_worker_workspace)
+        .saturating_add(cfg_workers.saturating_mul(model_rss_per_worker))
+        .saturating_add(OS_HEADROOM_BYTES);
+    #[allow(clippy::cast_precision_loss)]
+    let utilization_pct = if mem.available_bytes > 0 {
+        (worst_case_peak as f64 / mem.available_bytes as f64) * 100.0
+    } else {
+        0.0
+    };
+    info!(
+        worst_case_peak_mb = worst_case_peak / (1024 * 1024),
+        available_mb = mem.available_bytes / (1024 * 1024),
+        utilization_pct = format!("{utilization_pct:.1}"),
+        per_worker_workspace_mb = per_worker_workspace / (1024 * 1024),
+        "Workspace budget computed (worst-case all-workers-peak)"
+    );
+    if utilization_pct > 90.0 {
+        tracing::warn!(
+            utilization_pct = format!("{utilization_pct:.1}"),
+            "Worst-case workspace peak exceeds 90% of available memory; \
+             consider lowering BGE_M3_MEMORY_SAFETY_FACTOR or BGE_M3_WORKERS"
+        );
+    }
+
+    // Write static memory + budget info now so /health always shows these fields
+    // even while the background probe is still running.
+    let _ = state.tuning.set(TuningInfo::new(
+        &mem,
+        model_rss_per_worker,
+        worst_case_peak,
+        utilization_pct,
+    ));
 
     // --- Cost model resolution ---
     if let Some(cm) = cost_model_override {
@@ -137,6 +173,8 @@ async fn run_readiness_probe(
         state
             .probe_status
             .store(ProbeStatus::Disabled as u8, Ordering::Release);
+        // No background probe — release the reserved worker slot immediately.
+        state.request_permits.add_permits(1);
     } else if !disable_probe_cache {
         // Try to load cached coefficients from EFS.
         if let Some((a, b)) =
@@ -157,6 +195,8 @@ async fn run_readiness_probe(
             state
                 .probe_status
                 .store(ProbeStatus::CacheHit as u8, Ordering::Release);
+            // Cache hit — no probe needed, release the reserved worker slot.
+            state.request_permits.add_permits(1);
         } else {
             // Cache miss — launch background probe.
             state
@@ -189,13 +229,14 @@ async fn run_readiness_probe(
                     ProbeStatus::Complete
                 };
                 state_bg.probe_status.store(status as u8, Ordering::Release);
+                // Probe is done (success or failure) — release the reserved worker slot
+                // so all cfg_workers permits are now available to request traffic.
+                state_bg.request_permits.add_permits(1);
                 info!(probe_status = status.as_str(), "Probe status updated");
             });
         }
     } else {
-        // BGE_M3_DISABLE_PROBE_CACHE=1 but no override — run probe synchronously
-        // (cache disabled, no cost model override; operator wants fresh probe without
-        // caching the result).
+        // BGE_M3_DISABLE_PROBE_CACHE=1 but no override — run probe without caching.
         state
             .probe_status
             .store(ProbeStatus::Running as u8, Ordering::Release);
@@ -217,6 +258,8 @@ async fn run_readiness_probe(
                 ProbeStatus::Complete
             };
             state_bg.probe_status.store(status as u8, Ordering::Release);
+            // Probe done — release the reserved worker slot.
+            state_bg.request_permits.add_permits(1);
             info!(
                 probe_status = status.as_str(),
                 model_variant = model_variant_bg,
@@ -292,6 +335,14 @@ async fn main() -> anyhow::Result<()> {
         .unwrap_or_else(|| CostModel::conservative(CostModel::DEFAULT_MAX_WORKSPACE));
     let cost_model_handle = Arc::new(ArcSwap::from_pointee(initial_cost_model));
 
+    // Request concurrency limiter.  Start with cfg_workers - 1 permits so the
+    // background probe always has a worker slot free.  The probe (or any terminal
+    // probe bypass) calls add_permits(1) to raise to cfg_workers once the probe
+    // lifecycle ends.  Minimum is 1 so a single-worker deployment always accepts
+    // at least one concurrent request (at the cost of a shared probe slot).
+    let initial_permits = cfg.workers.saturating_sub(1).max(1);
+    let request_permits = Arc::new(Semaphore::new(initial_permits));
+
     let (pool, init_handle) = EmbedPool::spawn(
         cfg.workers,
         PathBuf::from(&cfg.cache_dir),
@@ -312,6 +363,7 @@ async fn main() -> anyhow::Result<()> {
         tuning: std::sync::OnceLock::new(),
         cost_model: cost_model_handle,
         probe_status: AtomicU8::new(ProbeStatus::Running as u8),
+        request_permits,
     });
 
     let app = build_router(Arc::clone(&state));
@@ -377,6 +429,9 @@ mod tests {
                 CostModel::DEFAULT_MAX_WORKSPACE,
             ))),
             probe_status: AtomicU8::new(ProbeStatus::Disabled as u8),
+            // Tests use an effectively-uncapped semaphore so permit acquisition
+            // never blocks existing test scenarios.
+            request_permits: Arc::new(Semaphore::new(usize::MAX >> 3)),
         })
     }
 
@@ -416,6 +471,7 @@ mod tests {
                 CostModel::DEFAULT_MAX_WORKSPACE,
             ))),
             probe_status: AtomicU8::new(ProbeStatus::Disabled as u8),
+            request_permits: Arc::new(Semaphore::new(usize::MAX >> 3)),
         }));
         let req = Request::builder()
             .method("GET")
@@ -631,6 +687,7 @@ mod tests {
                 CostModel::DEFAULT_MAX_WORKSPACE,
             ))),
             probe_status: AtomicU8::new(ProbeStatus::Disabled as u8),
+            request_permits: Arc::new(Semaphore::new(usize::MAX >> 3)),
         }));
         let body = serde_json::to_vec(&serde_json::json!({"input": ["hello"]}))
             .expect("request body should serialize");

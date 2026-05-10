@@ -4,6 +4,7 @@ use crate::sysinfo::{MemoryReading, MemorySource};
 use arc_swap::ArcSwap;
 use std::sync::atomic::{AtomicBool, AtomicU8};
 use std::sync::{Arc, OnceLock};
+use tokio::sync::Semaphore;
 
 /// Status of the background memory probe.
 ///
@@ -86,6 +87,17 @@ pub struct AppState {
     /// Updated atomically from the background probe task. Read by `/health`
     /// to expose `probe_status` in the `tuning` block.
     pub probe_status: AtomicU8,
+    /// Concurrency gate for in-flight embedding requests.
+    ///
+    /// Initialized to `max(cfg_workers - 1, 1)` permits, reserving one worker
+    /// slot for the background auto-budget probe.  Raised to `cfg_workers`
+    /// atomically on every terminal probe-status transition (`Disabled`,
+    /// `CacheHit`, `Complete`, `Failed`) so full concurrency is available once
+    /// the probe no longer needs a reserved worker.
+    ///
+    /// Test helpers set this to `usize::MAX` (effectively uncapped) so that
+    /// existing tests do not need to acquire a permit.
+    pub request_permits: Arc<Semaphore>,
 }
 
 /// Static workspace memory info surfaced by the `/health` endpoint.
@@ -100,16 +112,35 @@ pub struct TuningInfo {
     pub memory_source: String,
     /// Total available bytes detected at startup.
     pub available_bytes: usize,
-    /// Estimated model session RSS delta (bytes loaded by one worker).
+    /// Measured model session RSS delta (bytes) — max across all workers.
+    ///
+    /// Accurate on Linux via `/proc/self/status`; `0` on other platforms.
     pub model_rss_bytes_per_worker: usize,
+    /// Worst-case total peak memory (bytes) when all workers run simultaneously
+    /// at their per-worker workspace ceiling.
+    ///
+    /// Formula: `cfg_workers × per_worker_workspace + cfg_workers × model_rss + OS_HEADROOM`.
+    pub worst_case_peak_bytes: usize,
+    /// Worst-case peak as a percentage of detected available memory.
+    ///
+    /// A value above 90% triggers a startup `WARN` log.
+    pub utilization_pct: f64,
 }
 
 impl TuningInfo {
-    pub fn new(mem: &MemoryReading, model_rss_per_worker: usize) -> Self {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        mem: &MemoryReading,
+        model_rss_per_worker: usize,
+        worst_case_peak_bytes: usize,
+        utilization_pct: f64,
+    ) -> Self {
         Self {
             memory_source: mem.source.to_string(),
             available_bytes: mem.available_bytes,
             model_rss_bytes_per_worker: model_rss_per_worker,
+            worst_case_peak_bytes,
+            utilization_pct,
         }
     }
 
@@ -121,6 +152,8 @@ impl TuningInfo {
             memory_source: MemorySource::HostRam.to_string(),
             available_bytes: 0,
             model_rss_bytes_per_worker: model_rss_per_worker,
+            worst_case_peak_bytes: 0,
+            utilization_pct: 0.0,
         }
     }
 }

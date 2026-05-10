@@ -690,7 +690,7 @@ fn run_worker(
     id: usize,
     cache_dir: PathBuf,
     rx: Arc<Mutex<mpsc::Receiver<EmbedRequest>>>,
-    ready_tx: mpsc::Sender<Result<()>>,
+    ready_tx: mpsc::Sender<Result<usize>>,
     live_workers: Arc<AtomicUsize>,
     loaded_workers: Arc<AtomicUsize>,
     config: WorkerConfig,
@@ -702,6 +702,10 @@ fn run_worker(
     info!("Loading models (worker {id})...");
     let load_start = std::time::Instant::now();
     let rt = Handle::current();
+
+    // Measure RSS before loading so the delta accurately reflects this
+    // worker's model-weight contribution, not accumulated OS noise.
+    let pre_load_rss = sysinfo::read_process_rss_bytes().unwrap_or(0);
     let initial_models = match load_models(
         &cache_dir,
         id == 0,
@@ -709,8 +713,10 @@ fn run_worker(
         config.max_seq_length,
     ) {
         Ok(models) => {
+            let post_load_rss = sysinfo::read_process_rss_bytes().unwrap_or(pre_load_rss);
             tracing::info!(
                 elapsed_ms = load_start.elapsed().as_millis(),
+                rss_delta_mb = post_load_rss.saturating_sub(pre_load_rss) / (1024 * 1024),
                 "Models loaded (worker {id})"
             );
             models
@@ -722,8 +728,15 @@ fn run_worker(
         }
     };
 
-    info!("Worker {id} models loaded — signaling ready");
-    let _ = rt.block_on(ready_tx.send(Ok(())));
+    // Report the RSS delta so EmbedPool can derive the true per-worker
+    // model footprint for workspace-budget calculations.
+    let post_load_rss = sysinfo::read_process_rss_bytes().unwrap_or(pre_load_rss);
+    let rss_delta = post_load_rss.saturating_sub(pre_load_rss);
+    info!(
+        "Worker {id} models loaded — signaling ready (rss_delta_mb={})",
+        rss_delta / (1024 * 1024)
+    );
+    let _ = rt.block_on(ready_tx.send(Ok(rss_delta)));
 
     let mut models: Option<(ort::session::Session, tokenizers::Tokenizer)> = Some(initial_models);
 
@@ -871,6 +884,18 @@ pub struct EmbedPool {
     live_workers: Arc<AtomicUsize>,
     /// Number of workers that currently have model instances loaded in memory.
     loaded_workers: Arc<AtomicUsize>,
+    /// Maximum RSS delta observed across all workers during model load (bytes).
+    ///
+    /// Each worker measures its own RSS before and after `load_models()` and
+    /// reports the delta via `ready_tx`. The pool takes the max across all
+    /// workers as a conservative estimate — resilient to the occasional noisy
+    /// single reading — and exposes it via [`EmbedPool::model_rss_max_bytes`].
+    ///
+    /// Used by `run_readiness_probe` to correctly deduct the model-weight
+    /// footprint from the available workspace before computing per-worker
+    /// budget.  Defaults to 0 on non-Linux targets where RSS measurement is
+    /// unavailable.
+    model_rss_max_bytes: Arc<AtomicUsize>,
 }
 
 impl EmbedPool {
@@ -885,19 +910,23 @@ impl EmbedPool {
         let (tx, rx) = mpsc::channel::<EmbedRequest>(capacity);
         let rx = Arc::new(Mutex::new(rx));
 
-        let (ready_tx, mut ready_rx) = mpsc::channel::<Result<()>>(n);
+        // Channel carries Result<usize> where the Ok variant is the RSS delta
+        // (bytes) measured by each worker around load_models().
+        let (ready_tx, mut ready_rx) = mpsc::channel::<Result<usize>>(n);
 
         let live_workers = Arc::new(AtomicUsize::new(n));
         let loaded_workers = Arc::new(AtomicUsize::new(0));
+        let model_rss_max_bytes = Arc::new(AtomicUsize::new(0));
         let live_workers_for_init = Arc::clone(&live_workers);
         let loaded_workers_for_init = Arc::clone(&loaded_workers);
+        let model_rss_max_for_init = Arc::clone(&model_rss_max_bytes);
 
         let init_handle = tokio::task::spawn(
             async move {
                 let mut worker_handles = Vec::with_capacity(n);
 
                 let spawn_worker = |id: usize,
-                                    ready_tx_clone: mpsc::Sender<Result<()>>,
+                                    ready_tx_clone: mpsc::Sender<Result<usize>>,
                                     worker_config: WorkerConfig|
                  -> JoinHandle<Result<()>> {
                     let rx_clone = Arc::clone(&rx);
@@ -921,9 +950,13 @@ impl EmbedPool {
                 worker_handles.push(spawn_worker(0, ready_tx.clone(), config.clone()));
 
                 match ready_rx.recv().await {
-                    Some(Ok(())) => {
+                    Some(Ok(delta)) => {
+                        model_rss_max_for_init.fetch_max(delta, Ordering::AcqRel);
                         loaded_workers_for_init.fetch_add(1, Ordering::AcqRel);
-                        info!("Leader worker ready, model cache warm (1/{n})");
+                        info!(
+                            rss_delta_mb = delta / (1024 * 1024),
+                            "Leader worker ready, model cache warm (1/{n})"
+                        );
                     }
                     Some(Err(e)) => {
                         return Err(anyhow::anyhow!("Leader worker failed to load models: {e}"));
@@ -944,7 +977,8 @@ impl EmbedPool {
 
                 for i in 1..n {
                     match ready_rx.recv().await {
-                        Some(Ok(())) => {
+                        Some(Ok(delta)) => {
+                            model_rss_max_for_init.fetch_max(delta, Ordering::AcqRel);
                             loaded_workers_for_init.fetch_add(1, Ordering::AcqRel);
                             info!("Follower worker signaled ready ({}/{n})", i + 1);
                         }
@@ -971,6 +1005,7 @@ impl EmbedPool {
                 tx,
                 live_workers,
                 loaded_workers,
+                model_rss_max_bytes,
             },
             init_handle,
         )
@@ -1048,6 +1083,18 @@ impl EmbedPool {
     pub fn loaded_worker_count(&self) -> usize {
         self.loaded_workers.load(Ordering::Acquire)
     }
+
+    /// Returns the maximum RSS delta (bytes) observed across all workers during
+    /// model load.
+    ///
+    /// This is the accurate per-worker model-weight footprint used by the
+    /// workspace-budget formula in `run_readiness_probe`.  Returns `0` on
+    /// non-Linux targets where RSS measurement is unavailable, or before any
+    /// worker has reported its delta.
+    #[must_use]
+    pub fn model_rss_max_bytes(&self) -> usize {
+        self.model_rss_max_bytes.load(Ordering::Acquire)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1063,6 +1110,7 @@ impl EmbedPool {
             tx,
             live_workers: Arc::new(AtomicUsize::new(0)),
             loaded_workers: Arc::new(AtomicUsize::new(0)),
+            model_rss_max_bytes: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -1111,6 +1159,7 @@ impl EmbedPool {
             tx,
             live_workers: Arc::new(AtomicUsize::new(1)),
             loaded_workers: Arc::new(AtomicUsize::new(1)),
+            model_rss_max_bytes: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -1120,6 +1169,7 @@ impl EmbedPool {
             tx,
             live_workers: Arc::new(AtomicUsize::new(1)),
             loaded_workers: Arc::new(AtomicUsize::new(0)),
+            model_rss_max_bytes: Arc::new(AtomicUsize::new(0)),
         }
     }
 }
@@ -1265,6 +1315,31 @@ mod tests {
         let pool = EmbedPool::idle_for_test();
         assert_eq!(pool.live_worker_count(), 1);
         assert_eq!(pool.loaded_worker_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn model_rss_max_bytes_returns_zero_for_test_pool() {
+        // Test helpers initialize model_rss_max_bytes to 0 since no real
+        // load_models() runs; the getter must reflect that.
+        let pool = EmbedPool::closed_for_test();
+        assert_eq!(pool.model_rss_max_bytes(), 0);
+        let pool2 = EmbedPool::with_fixed_responses(vec![], vec![]);
+        assert_eq!(pool2.model_rss_max_bytes(), 0);
+    }
+
+    #[test]
+    fn model_rss_max_bytes_tracks_maximum_across_workers() {
+        // Directly verify that the AtomicUsize fetch_max semantics are correct:
+        // the pool keeps the highest delta seen across any worker.
+        let rss = Arc::new(AtomicUsize::new(0));
+        rss.fetch_max(500_000_000, Ordering::AcqRel); // worker 0: 500 MB
+        rss.fetch_max(1_100_000_000, Ordering::AcqRel); // worker 1: 1.1 GB
+        rss.fetch_max(800_000_000, Ordering::AcqRel); // worker 2: 800 MB
+        assert_eq!(
+            rss.load(Ordering::Acquire),
+            1_100_000_000,
+            "model_rss_max should be the maximum delta across all workers"
+        );
     }
 
     // -----------------------------------------------------------------------

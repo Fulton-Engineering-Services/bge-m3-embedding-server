@@ -76,6 +76,13 @@ pub async fn dense_embeddings(
 
     let prompt_tokens: usize = texts.iter().map(|t| t.chars().count() / 4 + 1).sum();
 
+    // Acquire a concurrency permit before dispatching to the worker pool.
+    // This is released on drop when the handler returns (success or error).
+    let _permit = Arc::clone(&state.request_permits)
+        .acquire_owned()
+        .await
+        .expect("request semaphore is never closed");
+
     let embeddings = state.pool.dense(texts).await?;
 
     let data = embeddings
@@ -110,6 +117,11 @@ pub async fn sparse_embeddings(
     validate_input(&texts, state.max_batch)?;
     tracing::Span::current().record("batch_size", texts.len());
 
+    let _permit = Arc::clone(&state.request_permits)
+        .acquire_owned()
+        .await
+        .expect("request semaphore is never closed");
+
     let embeddings = state.pool.sparse(texts).await?;
 
     let data = embeddings
@@ -140,6 +152,11 @@ pub async fn both_embeddings(
     tracing::Span::current().record("batch_size", texts.len());
 
     let prompt_tokens: usize = texts.iter().map(|t| t.chars().count() / 4 + 1).sum();
+
+    let _permit = Arc::clone(&state.request_permits)
+        .acquire_owned()
+        .await
+        .expect("request semaphore is never closed");
 
     let pairs = state.pool.both(texts).await?;
 
@@ -258,6 +275,7 @@ mod tests {
     use arc_swap::ArcSwap;
     use axum::body::to_bytes;
     use std::sync::atomic::{AtomicBool, AtomicU8};
+    use tokio::sync::Semaphore;
 
     fn make_state(ready: bool, max_batch: usize) -> Arc<AppState> {
         Arc::new(AppState {
@@ -271,6 +289,7 @@ mod tests {
                 CostModel::DEFAULT_MAX_WORKSPACE,
             ))),
             probe_status: AtomicU8::new(ProbeStatus::Disabled as u8),
+            request_permits: Arc::new(Semaphore::new(usize::MAX >> 3)),
         })
     }
 
@@ -355,6 +374,7 @@ mod tests {
                 CostModel::DEFAULT_MAX_WORKSPACE,
             ))),
             probe_status: AtomicU8::new(ProbeStatus::Disabled as u8),
+            request_permits: Arc::new(Semaphore::new(usize::MAX >> 3)),
         });
         let response = health(State(state)).await.into_response();
         assert_eq!(response.status(), StatusCode::OK);
@@ -390,7 +410,7 @@ mod tests {
             available_bytes: 8_000_000_000,
             source: MemorySource::CgroupV2,
         };
-        let tuning = TuningInfo::new(&mem, 500_000_000);
+        let tuning = TuningInfo::new(&mem, 500_000_000, 22_000_000_000, 78.5);
 
         let tuning_lock = std::sync::OnceLock::new();
         let _ = tuning_lock.set(tuning);
@@ -408,6 +428,7 @@ mod tests {
             tuning: tuning_lock,
             cost_model: Arc::new(ArcSwap::from_pointee(fitted_cm)),
             probe_status: AtomicU8::new(ProbeStatus::Complete as u8),
+            request_permits: Arc::new(Semaphore::new(usize::MAX >> 3)),
         });
         let response = health(State(state)).await.into_response();
         assert_eq!(response.status(), StatusCode::OK);
@@ -554,6 +575,7 @@ mod tests {
                 CostModel::DEFAULT_MAX_WORKSPACE,
             ))),
             probe_status: AtomicU8::new(ProbeStatus::Disabled as u8),
+            request_permits: Arc::new(Semaphore::new(usize::MAX >> 3)),
         });
         let req = DenseRequest {
             input: TextInput(vec![]),
@@ -580,6 +602,7 @@ mod tests {
                 CostModel::DEFAULT_MAX_WORKSPACE,
             ))),
             probe_status: AtomicU8::new(ProbeStatus::Disabled as u8),
+            request_permits: Arc::new(Semaphore::new(usize::MAX >> 3)),
         });
         let req = DenseRequest {
             input: TextInput(vec!["a".into(), "b".into(), "c".into()]),
@@ -606,6 +629,7 @@ mod tests {
                 CostModel::DEFAULT_MAX_WORKSPACE,
             ))),
             probe_status: AtomicU8::new(ProbeStatus::Disabled as u8),
+            request_permits: Arc::new(Semaphore::new(usize::MAX >> 3)),
         });
         let req = SparseRequest {
             input: TextInput(vec![]),
@@ -631,6 +655,7 @@ mod tests {
                 CostModel::DEFAULT_MAX_WORKSPACE,
             ))),
             probe_status: AtomicU8::new(ProbeStatus::Disabled as u8),
+            request_permits: Arc::new(Semaphore::new(usize::MAX >> 3)),
         });
         let req = SparseRequest {
             input: TextInput(vec!["a".into(), "b".into(), "c".into()]),
@@ -681,6 +706,7 @@ mod tests {
                 CostModel::DEFAULT_MAX_WORKSPACE,
             ))),
             probe_status: AtomicU8::new(ProbeStatus::Disabled as u8),
+            request_permits: Arc::new(Semaphore::new(usize::MAX >> 3)),
         });
         let req = DenseRequest {
             input: TextInput(vec!["hello".into(), "world".into()]),
@@ -740,6 +766,7 @@ mod tests {
                 CostModel::DEFAULT_MAX_WORKSPACE,
             ))),
             probe_status: AtomicU8::new(ProbeStatus::Disabled as u8),
+            request_permits: Arc::new(Semaphore::new(usize::MAX >> 3)),
         });
         let req = DualRequest {
             input: TextInput(vec![]),
@@ -766,6 +793,7 @@ mod tests {
                 CostModel::DEFAULT_MAX_WORKSPACE,
             ))),
             probe_status: AtomicU8::new(ProbeStatus::Disabled as u8),
+            request_permits: Arc::new(Semaphore::new(usize::MAX >> 3)),
         });
         let req = DualRequest {
             input: TextInput(vec!["a".into(), "b".into(), "c".into()]),
@@ -803,6 +831,7 @@ mod tests {
                 CostModel::DEFAULT_MAX_WORKSPACE,
             ))),
             probe_status: AtomicU8::new(ProbeStatus::Disabled as u8),
+            request_permits: Arc::new(Semaphore::new(usize::MAX >> 3)),
         });
         let req = DualRequest {
             input: TextInput(vec!["hello".into(), "world".into()]),
@@ -841,6 +870,7 @@ mod tests {
                 CostModel::DEFAULT_MAX_WORKSPACE,
             ))),
             probe_status: AtomicU8::new(ProbeStatus::Disabled as u8),
+            request_permits: Arc::new(Semaphore::new(usize::MAX >> 3)),
         });
         let req = SparseRequest {
             input: TextInput(vec!["hello".into()]),
@@ -854,5 +884,125 @@ mod tests {
         assert_eq!(resp.data.len(), 1);
         assert_eq!(resp.data[0].sparse_values.indices, vec![42u32]);
         assert_eq!(resp.data[0].sparse_values.values, vec![0.5f32]);
+    }
+
+    // -----------------------------------------------------------------------
+    // Permit-gating tests
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn dense_embeddings_blocks_when_no_permits_available() {
+        use crate::models::TextInput;
+        use std::time::Duration;
+        // Semaphore with 0 permits — all requests must queue.
+        let permits = Arc::new(Semaphore::new(0));
+        let state = Arc::new(AppState {
+            pool: EmbedPool::with_fixed_responses(vec![vec![0.1f32]], vec![]),
+            ready: AtomicBool::new(true),
+            max_batch: 256,
+            total_workers: 1,
+            max_seq_length: 8192,
+            tuning: std::sync::OnceLock::new(),
+            cost_model: Arc::new(ArcSwap::from_pointee(CostModel::conservative(
+                CostModel::DEFAULT_MAX_WORKSPACE,
+            ))),
+            probe_status: AtomicU8::new(ProbeStatus::Disabled as u8),
+            request_permits: Arc::clone(&permits),
+        });
+        let req = DenseRequest {
+            input: TextInput(vec!["hello".into()]),
+            model: None,
+        };
+        // Fire the request in a background task.
+        let state_clone = Arc::clone(&state);
+        let handle =
+            tokio::spawn(async move { dense_embeddings(State(state_clone), Json(req)).await });
+        // Give the task time to start and attempt permit acquisition.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(
+            !handle.is_finished(),
+            "request should still be blocked on 0 permits"
+        );
+        // Release a permit — request should now complete.
+        permits.add_permits(1);
+        let result = tokio::time::timeout(Duration::from_secs(1), handle)
+            .await
+            .expect("request should complete after permit is released")
+            .expect("task should not panic");
+        assert!(
+            result.is_ok(),
+            "dense_embeddings should succeed once permitted"
+        );
+    }
+
+    #[tokio::test]
+    async fn request_permits_rises_after_probe_complete() {
+        // Verify the semaphore protocol: starting at N-1 permits, add_permits(1)
+        // after probe completion brings it to N.
+        let n: usize = 7;
+        let initial = n.saturating_sub(1).max(1);
+        let permits = Arc::new(Semaphore::new(initial));
+        assert_eq!(
+            permits.available_permits(),
+            initial,
+            "initial permits should be cfg_workers - 1"
+        );
+        permits.add_permits(1);
+        assert_eq!(
+            permits.available_permits(),
+            n,
+            "after probe completes, permits should equal cfg_workers"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Worst-case budget invariant
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn worst_case_peak_below_available_when_correctly_budgeted() {
+        // Production config: 28 GB Fargate task, 7 fp16 workers, 0.7 safety.
+        // With accurate model_rss_per_worker the formula must stay under the limit.
+        use crate::embedder::OS_HEADROOM_BYTES;
+
+        let available_bytes: usize = 28 * 1024 * 1024 * 1024; // 28 GB
+        let cfg_workers: usize = 7;
+        let model_rss_per_worker: usize = 1_080_000_000; // ~1.08 GB fp16
+        let memory_safety_factor: f64 = 0.7;
+
+        #[allow(
+            clippy::cast_precision_loss,
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss
+        )]
+        let total_workspace = available_bytes
+            .saturating_sub(cfg_workers.saturating_mul(model_rss_per_worker))
+            .saturating_sub(OS_HEADROOM_BYTES);
+        #[allow(
+            clippy::cast_precision_loss,
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss
+        )]
+        let per_worker_workspace =
+            ((total_workspace as f64) * memory_safety_factor / (cfg_workers as f64)) as usize;
+
+        let worst_case_peak = cfg_workers
+            .saturating_mul(per_worker_workspace)
+            .saturating_add(cfg_workers.saturating_mul(model_rss_per_worker))
+            .saturating_add(OS_HEADROOM_BYTES);
+
+        assert!(
+            worst_case_peak < available_bytes,
+            "worst_case_peak ({} MB) must be below available ({} MB)",
+            worst_case_peak / (1024 * 1024),
+            available_bytes / (1024 * 1024),
+        );
+
+        #[allow(clippy::cast_precision_loss)]
+        let utilization_pct = (worst_case_peak as f64 / available_bytes as f64) * 100.0;
+        assert!(
+            utilization_pct < 90.0,
+            "utilization_pct ({utilization_pct:.1}%) must be below the 90% WARN threshold"
+        );
     }
 }
