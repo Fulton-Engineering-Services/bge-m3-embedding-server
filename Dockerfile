@@ -24,7 +24,7 @@ WORKDIR /app
 # Cache dependency compilation by building a dummy binary first.
 # benches/ stubs are required for all [[bench]] targets because Cargo validates source
 # paths at manifest parse time, even though cargo build --release skips bench compilation.
-COPY Cargo.toml Cargo.lock ./
+COPY Cargo.toml Cargo.lock build.rs ./
 RUN mkdir src && echo "fn main(){}" > src/main.rs \
     && mkdir benches && touch benches/embeddings.rs benches/coreml.rs \
     && cargo build --release \
