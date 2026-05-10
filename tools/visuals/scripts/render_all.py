@@ -15,7 +15,7 @@
 """
 render_all.py — render all 10 probe-visual figures and report results.
 
-Run from tools/probe-visuals/ with:
+Run from tools/visuals/ with:
     uv run python scripts/render_all.py
     uv run python scripts/render_all.py --animated
 """
@@ -25,8 +25,8 @@ import sys
 import time
 import traceback
 
-from probe_visuals.common import OUT_DIR
-from probe_visuals.figures import (
+from visuals.common import OUT_DIR
+from visuals.figures import (
     fig01_cost_decomposition,
     fig02_workspace_surface,
     fig03_ols_geometry,
@@ -93,7 +93,7 @@ def main() -> int:
     # Animated GIFs (optional)
     if args.animated:
         print("\n--- Animated GIFs ---")
-        from probe_visuals.figures import (  # noqa: PLC0415
+        from visuals.figures import (  # noqa: PLC0415
             fig02_workspace_surface_animated,
             fig03_ols_geometry_animated,
             fig04_loss_landscape_animated,

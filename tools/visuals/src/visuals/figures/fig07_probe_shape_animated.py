@@ -32,7 +32,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.animation import FuncAnimation
 
-from probe_visuals.common import (
+from visuals.common import (
     C_BLUE,
     C_GREEN,
     C_GREY,

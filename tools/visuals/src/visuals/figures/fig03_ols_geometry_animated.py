@@ -27,7 +27,7 @@ import numpy as np
 from matplotlib.animation import FuncAnimation
 from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
 
-from probe_visuals.common import (
+from visuals.common import (
     C_BLUE,
     C_GREEN,
     C_RED,

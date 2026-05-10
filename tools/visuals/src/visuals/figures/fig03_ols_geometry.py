@@ -26,7 +26,7 @@ import numpy as np
 from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
 from mpl_toolkits.mplot3d.art3d import Line3DCollection  # noqa: F401
 
-from probe_visuals.common import (
+from visuals.common import (
     C_BLUE,
     C_GREEN,
     C_RED,

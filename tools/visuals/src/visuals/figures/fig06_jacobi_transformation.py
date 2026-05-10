@@ -26,7 +26,7 @@ The scaling matrix D = diag(n_max, m_max) is shown as a text box.
 import matplotlib.pyplot as plt
 import numpy as np
 
-from probe_visuals.common import C_BLUE, C_GREY, C_RED, PROBE_SHAPES, SIZE_2D, save
+from visuals.common import C_BLUE, C_GREY, C_RED, PROBE_SHAPES, SIZE_2D, save
 
 
 def main() -> None:

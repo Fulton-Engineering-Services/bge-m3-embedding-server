@@ -26,7 +26,7 @@ import numpy as np
 from matplotlib import cm
 from mpl_toolkits.mplot3d import Axes3D  # noqa: F401 (registers 3-D projection)
 
-from probe_visuals.common import A_FIT, B_FIT, C_BLUE, C_RED, SIZE_3D, save
+from visuals.common import A_FIT, B_FIT, C_BLUE, C_RED, SIZE_3D, save
 
 
 def main() -> None:

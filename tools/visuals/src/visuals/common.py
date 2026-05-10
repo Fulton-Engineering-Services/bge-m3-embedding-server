@@ -13,7 +13,7 @@
 # limitations under the License.
 
 """
-common.py — shared style, constants, and helpers for probe-visuals figures.
+common.py — shared style, constants, and helpers for visuals figures.
 """
 
 from pathlib import Path
@@ -86,10 +86,10 @@ MEASURED_RSS_MB = {
 }
 
 # ---------------------------------------------------------------------------
-# Output directory — tools/probe-visuals/out/
+# Output directory — tools/visuals/out/
 # ---------------------------------------------------------------------------
-# __file__ is tools/probe-visuals/src/probe_visuals/common.py
-# .parent.parent.parent → tools/probe-visuals/
+# __file__ is tools/visuals/src/visuals/common.py
+# .parent.parent.parent → tools/visuals/
 OUT_DIR: Path = Path(__file__).parent.parent.parent / "out"
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 

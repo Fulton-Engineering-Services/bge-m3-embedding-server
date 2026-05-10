@@ -79,13 +79,13 @@ until all gates are green.
 
 ## Visualisation tools
 
-The `tools/probe-visuals/` directory contains Python scripts that generate the figures in
+The `tools/visuals/` directory contains Python scripts that generate the figures in
 [`docs/startup-probe.md`](docs/startup-probe.md). If you are editing that document or adding
-new figures, see [`tools/probe-visuals/README.md`](tools/probe-visuals/README.md) for
+new figures, see [`tools/visuals/README.md`](tools/visuals/README.md) for
 prerequisites, quick start, and the figure index.
 
 ```bash
-cd tools/probe-visuals
+cd tools/visuals
 uv sync
 uv run python scripts/render_all.py
 ```

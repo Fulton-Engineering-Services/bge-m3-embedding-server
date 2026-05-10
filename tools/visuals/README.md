@@ -1,4 +1,4 @@
-# Probe Visualisation Scripts
+# Startup-Probe Visualisations
 
 This directory contains ten Python figure scripts that produce the mathematical diagrams
 supplementing [`docs/startup-probe.md`](../../docs/startup-probe.md). Each figure illustrates
@@ -29,7 +29,7 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 ## Quick start
 
 ```bash
-cd tools/probe-visuals
+cd tools/visuals
 
 # Install dependencies into an isolated .venv
 uv sync
@@ -62,7 +62,7 @@ PNGs appear in `out/`. The script prints each figure name, elapsed time, and fin
 ## Running a single figure
 
 ```bash
-uv run python src/probe_visuals/figures/fig01_cost_decomposition.py
+uv run python src/visuals/figures/fig01_cost_decomposition.py
 ```
 
 Each figure script has a `main()` function and a standard `if __name__ == "__main__": main()`
@@ -90,8 +90,8 @@ uv run ruff format --check src scripts
 
 ## Adding a new figure
 
-1. Create `src/probe_visuals/figures/figNN_descriptive_name.py` following the existing pattern:
-   - Import shared constants/helpers from `probe_visuals.common`
+1. Create `src/visuals/figures/figNN_descriptive_name.py` following the existing pattern:
+   - Import shared constants/helpers from `visuals.common`
    - Wrap all plotting code inside `def main() -> None:`
    - Add `if __name__ == "__main__": main()` at the bottom
    - Call `save(fig, "figNN_descriptive_name")` to write to `out/`
@@ -135,14 +135,14 @@ Notebooks use the `ipympl` backend — each widget interaction redraws the live 
 
 ### Terminal + Browser (recommended — always works)
 
-This is the confirmed reliable path. Run from the `tools/probe-visuals/` directory:
+This is the confirmed reliable path. Run from the `tools/visuals/` directory:
 
 ```bash
 # 1. Install all notebook dependencies (first time only)
 uv sync --group notebooks
 
 # 2. Register the kernel so Jupyter can find it (first time only, or after recreating the venv)
-uv run python -m ipykernel install --user --name bge-m3-probe-visuals --display-name "BGE-M3 Probe Visuals"
+uv run python -m ipykernel install --user --name bge-m3-visuals --display-name "BGE-M3 Visuals"
 
 # 3. Launch Jupyter in the browser
 uv run jupyter notebook notebooks/
@@ -154,7 +154,7 @@ Jupyter opens at `http://localhost:8888` with a file browser. Click any notebook
 
 ### VS Code / Cursor
 
-After running the `ipykernel install` command above, VS Code offers **"BGE-M3 Probe Visuals"** in the kernel picker (top-right of the notebook). Select it, then **Run All**.
+After running the `ipykernel install` command above, VS Code offers **"BGE-M3 Visuals"** in the kernel picker (top-right of the notebook). Select it, then **Run All**.
 
 If VS Code does not show the kernel: `Ctrl+Shift+P` → **Developer: Reload Window**, then reopen the notebook.
 
@@ -164,14 +164,25 @@ If VS Code does not show the kernel: `Ctrl+Shift+P` → **Developer: Reload Wind
 rm -rf .venv
 uv venv --python /opt/homebrew/bin/python3.13
 uv sync --group dev --group notebooks
-uv run python -m ipykernel install --user --name bge-m3-probe-visuals --display-name "BGE-M3 Probe Visuals"
+uv run python -m ipykernel install --user --name bge-m3-visuals --display-name "BGE-M3 Visuals"
+```
+
+### Migrating from the old `bge-m3-probe-visuals` kernel
+
+The kernel was renamed from `bge-m3-probe-visuals` to `bge-m3-visuals` (display name
+"BGE-M3 Visuals") when the tool moved from `tools/probe-visuals/` to `tools/visuals/`.
+If you previously registered the old kernel, remove it and register the new one:
+
+```bash
+uv run jupyter kernelspec remove -y bge-m3-probe-visuals
+uv run python -m ipykernel install --user --name bge-m3-visuals --display-name "BGE-M3 Visuals"
 ```
 
 ### Troubleshooting
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| `ModuleNotFoundError: No module named 'matplotlib'` | Wrong kernel selected | Select "BGE-M3 Probe Visuals" kernel or use terminal path |
+| `ModuleNotFoundError: No module named 'matplotlib'` | Wrong kernel selected | Select "BGE-M3 Visuals" kernel or use terminal path |
 | `'widget' is not a recognised backend name` | ipympl not in active kernel | Same as above |
 | `FigureCanvasAgg is non-interactive` | Old cached output | Restart kernel and run all cells |
 | Figure clipped in browser | Browser window too narrow | Widen browser window or zoom out |
@@ -181,7 +192,7 @@ uv run python -m ipykernel install --user --name bge-m3-probe-visuals --display-
 
 ## Source-of-truth constants
 
-All figures share the constants defined in `src/probe_visuals/common.py`.
+All figures share the constants defined in `src/visuals/common.py`.
 
 | Constant | Value | Meaning |
 |----------|-------|---------|

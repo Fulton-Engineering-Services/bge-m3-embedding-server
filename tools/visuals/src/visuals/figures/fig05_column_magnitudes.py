@@ -24,7 +24,7 @@ Panel B (linear): same after Jacobi normalisation → both columns in [0,1].
 import matplotlib.pyplot as plt
 import numpy as np
 
-from probe_visuals.common import C_BLUE, C_RED, PROBE_SHAPES, SIZE_2D, save
+from visuals.common import C_BLUE, C_RED, PROBE_SHAPES, SIZE_2D, save
 
 
 def main() -> None:

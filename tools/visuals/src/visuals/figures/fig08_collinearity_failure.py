@@ -28,7 +28,7 @@ parameter space to visualise the ellipse / valley.
 import matplotlib.pyplot as plt
 import numpy as np
 
-from probe_visuals.common import A_FIT, B_FIT, MEASURED_RSS_MB, PROBE_SHAPES, SIZE_2D, save
+from visuals.common import A_FIT, B_FIT, MEASURED_RSS_MB, PROBE_SHAPES, SIZE_2D, save
 
 
 def gram_det_normalised(shapes: list[tuple[int, int]]) -> float:

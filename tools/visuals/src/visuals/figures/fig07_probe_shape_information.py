@@ -26,7 +26,7 @@ import matplotlib.patches as mpatches
 import matplotlib.pyplot as plt
 import numpy as np
 
-from probe_visuals.common import C_BLUE, C_GREEN, C_GREY, C_RED, PROBE_SHAPES, SIZE_2D, save
+from visuals.common import C_BLUE, C_GREEN, C_GREY, C_RED, PROBE_SHAPES, SIZE_2D, save
 
 
 def main() -> None:

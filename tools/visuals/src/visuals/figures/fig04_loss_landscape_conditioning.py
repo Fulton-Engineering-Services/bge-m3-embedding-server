@@ -35,7 +35,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib import ticker
 
-from probe_visuals.common import (
+from visuals.common import (
     A_FIT,
     B_FIT,
     C_BLUE,

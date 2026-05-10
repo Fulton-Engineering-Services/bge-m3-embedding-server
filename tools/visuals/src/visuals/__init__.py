@@ -12,4 +12,4 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""probe_visuals — figure scripts for docs/startup-probe.md."""
+"""visuals — figure scripts for docs/startup-probe.md."""

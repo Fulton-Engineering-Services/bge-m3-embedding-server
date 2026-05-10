@@ -133,7 +133,7 @@ wheels = [
 ]
 
 [[package]]
-name = "bge-m3-probe-visuals"
+name = "bge-m3-visuals"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [

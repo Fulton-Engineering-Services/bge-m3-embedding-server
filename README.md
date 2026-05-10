@@ -494,9 +494,9 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for the full development guide.
 
 ### Visualisation tools
 
-The `tools/probe-visuals/` directory contains Python scripts that generate
+The `tools/visuals/` directory contains Python scripts that generate
 the mathematical figures in [`docs/startup-probe.md`](docs/startup-probe.md).
-See [`tools/probe-visuals/README.md`](tools/probe-visuals/README.md) for
+See [`tools/visuals/README.md`](tools/visuals/README.md) for
 setup and usage.
 
 ## Versioning

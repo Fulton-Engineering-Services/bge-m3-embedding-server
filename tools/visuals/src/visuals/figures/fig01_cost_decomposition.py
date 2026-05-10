@@ -27,7 +27,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib import ticker
 
-from probe_visuals.common import A_FIT, B_FIT, C_BLUE, C_GREEN, C_GREY, C_RED, SIZE_2D, save
+from visuals.common import A_FIT, B_FIT, C_BLUE, C_GREEN, C_GREY, C_RED, SIZE_2D, save
 
 
 def main() -> None:
