@@ -1,0 +1,8 @@
+<script>
+  (function () {
+    if (!localStorage.getItem("rustdoc-theme")) {
+      var prefersDark = window.matchMedia("(prefers-color-scheme: dark)").matches;
+      localStorage.setItem("rustdoc-theme", prefersDark ? "ayu" : "light");
+    }
+  })();
+</script>

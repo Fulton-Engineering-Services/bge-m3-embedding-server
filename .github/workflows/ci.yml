@@ -107,7 +107,7 @@ jobs:
           toolchain: stable
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4  # v2
       - name: Check docs
-        run: RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --document-private-items
+        run: RUSTDOCFLAGS="-D warnings --default-theme light --html-in-header docs/rustdoc-theme-init.html" cargo doc --no-deps --document-private-items
 
   license-headers:
     name: License Headers

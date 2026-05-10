@@ -69,7 +69,7 @@ jobs:
           toolchain: stable
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4  # v2
       - name: Check docs
-        run: RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --document-private-items
+        run: RUSTDOCFLAGS="-D warnings --default-theme light --html-in-header docs/rustdoc-theme-init.html" cargo doc --no-deps --document-private-items
 
   license-headers:
     name: License Headers
@@ -276,7 +276,7 @@ jobs:
           toolchain: stable
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4  # v2
       - name: Build docs
-        run: RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --document-private-items
+        run: RUSTDOCFLAGS="-D warnings --default-theme light --html-in-header docs/rustdoc-theme-init.html" cargo doc --no-deps --document-private-items
       - name: Add redirect index
         run: echo '<meta http-equiv="refresh" content="0;url=bge_m3_embedding_server/index.html">' > target/doc/index.html
       - name: Setup Pages
