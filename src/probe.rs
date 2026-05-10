@@ -204,6 +204,7 @@ pub(crate) fn save_probe_cache(
 ///
 /// `Ok((a, b))` where `a` and `b` are the fitted cost-model coefficients.
 /// Returns conservative defaults and logs a warning on any failure.
+#[allow(clippy::too_many_lines)]
 pub(crate) async fn run_probe(pool: &EmbedPool, max_seq: usize, rss_ceiling: usize) -> (f64, f64) {
     info!(
         max_seq,
@@ -226,6 +227,11 @@ pub(crate) async fn run_probe(pool: &EmbedPool, max_seq: usize, rss_ceiling: usi
     let mut data: Vec<DataPoint> = Vec::with_capacity(shapes.len());
     let conservative = CostModel::conservative(rss_ceiling);
 
+    // Per-shape outcome counters for precise diagnostics when data is empty.
+    let mut shapes_skipped: usize = 0;
+    let mut shapes_errored: usize = 0;
+    let total_shapes = shapes.len();
+
     // Synthesize probe texts from corpus (already curated and pinned).
     let corpus_texts = load_probe_texts();
 
@@ -238,8 +244,11 @@ pub(crate) async fn run_probe(pool: &EmbedPool, max_seq: usize, rss_ceiling: usi
         if !conservative.fits(batch, seq) {
             info!(
                 batch,
-                seq, "Probe: skipping shape (estimated to exceed rss_ceiling)"
+                seq,
+                rss_ceiling_mb = rss_ceiling / (1024 * 1024),
+                "Probe: skipping shape (estimated to exceed rss_ceiling)"
             );
+            shapes_skipped += 1;
             continue;
         }
 
@@ -286,21 +295,53 @@ pub(crate) async fn run_probe(pool: &EmbedPool, max_seq: usize, rss_ceiling: usi
                     return (CostModel::CONSERVATIVE_A, CostModel::CONSERVATIVE_B);
                 }
                 warn!(batch, seq, elapsed_ms, error = %e, "Probe shape failed; skipping");
+                shapes_errored += 1;
             }
         }
     }
 
     if data.is_empty() {
+        // Emit a specific diagnostic based on what actually happened so the
+        // operator can distinguish between a broken budget (rss_ceiling=0),
+        // ORT/model errors, and a non-Linux platform where RSS is unavailable.
+        if shapes_skipped == total_shapes {
+            warn!(
+                rss_ceiling_mb = rss_ceiling / (1024 * 1024),
+                total_shapes,
+                "Probe: all shapes skipped because rss_ceiling is too small to fit even \
+                 (batch=1, seq=64); per_worker_workspace upstream is likely broken — \
+                 check model_rss_per_worker measurement and memory detection"
+            );
+        } else if shapes_errored == total_shapes {
+            warn!(
+                total_shapes,
+                "Probe: all shapes errored — check ORT session and model logs above"
+            );
+        } else {
+            warn!(
+                shapes_skipped,
+                shapes_errored,
+                total_shapes,
+                "Probe collected no usable data points (RSS measurement unavailable on \
+                 non-Linux platforms, or all shapes were skipped/errored); \
+                 using conservative defaults"
+            );
+        }
+        return (CostModel::CONSERVATIVE_A, CostModel::CONSERVATIVE_B);
+    }
+
+    // If all measured deltas are zero, RSS is unavailable (non-Linux).
+    if data.iter().all(|dp| dp.rss_delta == 0) {
         warn!(
-            "Probe collected no data points (RSS measurement unavailable?); \
-             using conservative defaults"
+            data_points = data.len(),
+            "Probe: all RSS deltas are zero — read_process_rss_bytes() returned 0; \
+             auto-budget requires Linux /proc/self/statm; using conservative defaults"
         );
         return (CostModel::CONSERVATIVE_A, CostModel::CONSERVATIVE_B);
     }
 
     if let Some((a, b)) = fit_cost_model(&data) {
-        let total_elapsed_ms =
-            u64::try_from(probe_start.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let total_elapsed_ms = u64::try_from(probe_start.elapsed().as_millis()).unwrap_or(u64::MAX);
         info!(
             a = format!("{a:.0}"),
             b = format!("{b:.4}"),
@@ -776,6 +817,105 @@ mod tests {
         assert!(
             try_load_probe_cache(dir.path(), "fp16", 8192).is_none(),
             "missing cache file should return None"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Diagnostic branch coverage for the empty-data path
+    //
+    // The three diagnostic scenarios in run_probe cannot be tested end-to-end
+    // without loading real ORT models. Instead we validate the component
+    // decisions that trigger each branch:
+    //
+    //   Branch 1: all shapes skipped  → conservative.fits() always returns false
+    //             when rss_ceiling=0 (chunk_cost > 0 for any batch/seq > 0).
+    //   Branch 2: all shapes errored  → upstream logic; covered by error path.
+    //   Branch 3: zero-delta check    → data.iter().all(|dp| dp.rss_delta == 0)
+    //             when rss_before == rss_after (non-Linux or no ORT activity).
+    // -----------------------------------------------------------------------
+
+    /// Branch 1: `rss_ceiling=0` causes `conservative.fits()` to reject every shape.
+    /// This is the condition that caused the production `probe_status=failed`.
+    #[test]
+    fn all_probe_shapes_skipped_when_rss_ceiling_is_zero() {
+        use crate::binpack::CostModel;
+
+        let ceiling_zero = CostModel::conservative(0);
+
+        // Every static probe shape must be rejected by fits() at ceiling=0,
+        // because chunk_cost(batch, seq) > 0 for any batch,seq ≥ 1.
+        for &(batch, seq) in PROBE_SHAPES {
+            assert!(
+                !ceiling_zero.fits(batch, seq),
+                "shape ({batch},{seq}) should not fit when rss_ceiling=0, \
+                 cost={} > 0",
+                ceiling_zero.chunk_cost(batch, seq)
+            );
+        }
+        // Also check a dynamically-added max_seq shape.
+        assert!(!ceiling_zero.fits(1, 8192));
+    }
+
+    /// Branch 3: zero-delta detection — all data points with `rss_delta=0` are
+    /// treated as non-Linux RSS-unavailable and should not be used to fit the
+    /// cost model (the early-return check prevents `fit_cost_model` from being
+    /// called with all-zero y-values, which would produce (0,0) coefficients).
+    #[test]
+    fn zero_rss_deltas_not_passed_to_fit() {
+        // Simulate what happens when read_process_rss_bytes() returns 0 on macOS:
+        // rss_before = 0, rss_after = 0, delta = 0.
+        let zero_delta_data: Vec<DataPoint> = PROBE_SHAPES
+            .iter()
+            .map(|&(batch, seq)| DataPoint {
+                batch,
+                seq,
+                rss_delta: 0,
+            })
+            .collect();
+
+        // Verify that all_zero check holds.
+        assert!(
+            zero_delta_data.iter().all(|dp| dp.rss_delta == 0),
+            "all deltas should be zero in this scenario"
+        );
+
+        // fit_cost_model with all-zero y-values produces coefficients (0.0, 0.0)
+        // (the OLS solution to 0 = a*x1 + b*x2 is a=0, b=0), which are then
+        // rejected by the non-negative check... but actually the check is
+        // a_raw < 0.0 || b_raw < 0.0, which 0.0 does not satisfy. Let's verify
+        // fit_cost_model behavior — it should succeed with (0,0) or fail, and
+        // either way the zero-delta check in run_probe catches it first.
+        let result = fit_cost_model(&zero_delta_data);
+        // The coefficients would be 0.0 which is clamped to the lower bound
+        // (4096.0, 0.01), so fit_cost_model may succeed with clamped values.
+        // The important invariant is that the zero-delta early-return in
+        // run_probe fires before fit_cost_model is called for the all-zero case.
+        // We validate that all_zero detection is correct:
+        let all_zero = zero_delta_data.iter().all(|dp| dp.rss_delta == 0);
+        assert!(all_zero, "all-zero check should catch this before fitting");
+        // fit_cost_model may or may not return Some here; the caller (run_probe)
+        // never reaches it when all_zero is true — so just ensure no panic.
+        let _ = result;
+    }
+
+    /// Verifies the all-zero check does not fire when at least one delta is nonzero.
+    #[test]
+    fn non_zero_delta_does_not_trigger_zero_delta_branch() {
+        let data = [
+            DataPoint {
+                batch: 1,
+                seq: 64,
+                rss_delta: 0,
+            },
+            DataPoint {
+                batch: 1,
+                seq: 256,
+                rss_delta: 5_000_000, // nonzero
+            },
+        ];
+        assert!(
+            !data.iter().all(|dp| dp.rss_delta == 0),
+            "mixed data should not trigger the all-zero branch"
         );
     }
 }

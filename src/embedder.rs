@@ -1088,18 +1088,19 @@ pub struct EmbedPool {
     live_workers: Arc<AtomicUsize>,
     /// Number of workers that currently have model instances loaded in memory.
     loaded_workers: Arc<AtomicUsize>,
-    /// Maximum RSS delta observed across all workers during model load (bytes).
+    /// Median RSS delta (bytes) measured across all workers during sequential
+    /// model load.
     ///
-    /// Each worker measures its own RSS before and after `load_models()` and
-    /// reports the delta via `ready_tx`. The pool takes the max across all
-    /// workers as a conservative estimate — resilient to the occasional noisy
-    /// single reading — and exposes it via [`EmbedPool::model_rss_max_bytes`].
+    /// Workers load one at a time (leader first, then followers in sequence).
+    /// Each reports its own RSS before/after `load_models()` via `ready_tx`.
+    /// The pool stores the median once all workers have signaled ready — robust
+    /// to one outlier from page-cache settling or ORT arena init jitter.
     ///
     /// Used by `run_readiness_probe` to correctly deduct the model-weight
     /// footprint from the available workspace before computing per-worker
-    /// budget.  Defaults to 0 on non-Linux targets where RSS measurement is
-    /// unavailable.
-    model_rss_max_bytes: Arc<AtomicUsize>,
+    /// budget. Returns `0` on non-Linux targets where RSS measurement is
+    /// unavailable, or before the init task has completed.
+    model_rss_per_worker_bytes: Arc<AtomicUsize>,
 }
 
 impl EmbedPool {
@@ -1120,10 +1121,10 @@ impl EmbedPool {
 
         let live_workers = Arc::new(AtomicUsize::new(n));
         let loaded_workers = Arc::new(AtomicUsize::new(0));
-        let model_rss_max_bytes = Arc::new(AtomicUsize::new(0));
+        let model_rss_per_worker_bytes = Arc::new(AtomicUsize::new(0));
         let live_workers_for_init = Arc::clone(&live_workers);
         let loaded_workers_for_init = Arc::clone(&loaded_workers);
-        let model_rss_max_for_init = Arc::clone(&model_rss_max_bytes);
+        let model_rss_for_init = Arc::clone(&model_rss_per_worker_bytes);
 
         let init_handle = tokio::task::spawn(
             async move {
@@ -1150,13 +1151,19 @@ impl EmbedPool {
                     })
                 };
 
+                // Collect per-worker RSS deltas for median aggregation.
+                // Median is robust to one outlier from transient kernel snapshot
+                // quirk (page-cache settling, ORT arena init jitter) while still
+                // using all N independent measurements.
+                let mut rss_deltas: Vec<usize> = Vec::with_capacity(n);
+
                 // --- Phase 1: spawn leader worker (may download models) ---
                 worker_handles.push(spawn_worker(0, ready_tx.clone(), config.clone()));
 
                 match ready_rx.recv().await {
                     Some(Ok(delta)) => {
-                        model_rss_max_for_init.fetch_max(delta, Ordering::AcqRel);
                         loaded_workers_for_init.fetch_add(1, Ordering::AcqRel);
+                        rss_deltas.push(delta);
                         info!(
                             rss_delta_mb = delta / (1024 * 1024),
                             "Leader worker ready, model cache warm (1/{n})"
@@ -1172,32 +1179,54 @@ impl EmbedPool {
                     }
                 }
 
-                // --- Phase 2: spawn follower workers (load from warm cache) ---
+                // --- Phase 2: spawn follower workers one at a time.
+                //
+                // Workers load sequentially: spawn one, await its ready signal,
+                // then spawn the next. This ensures each worker's RSS delta
+                // (pre/post load_models) reflects only that worker's ORT session
+                // allocation — not the cumulative effect of other workers loading
+                // in parallel. Parallel loading caused the 2026-05-09 measurement
+                // contamination bug: all followers read post_load_rss after most
+                // other sessions had already mmap'd, producing an inflated
+                // rss_delta ≈ N × model_size and driving per_worker_workspace to 0.
+                //
+                // Startup cost: ~4-6s per worker × 6 followers ≈ 24-36s total,
+                // well within the configured startPeriod (300s).
                 for id in 1..n {
                     worker_handles.push(spawn_worker(id, ready_tx.clone(), config.clone()));
-                }
 
-                drop(ready_tx);
-
-                for i in 1..n {
                     match ready_rx.recv().await {
                         Some(Ok(delta)) => {
-                            model_rss_max_for_init.fetch_max(delta, Ordering::AcqRel);
                             loaded_workers_for_init.fetch_add(1, Ordering::AcqRel);
-                            info!("Follower worker signaled ready ({}/{n})", i + 1);
+                            rss_deltas.push(delta);
+                            info!(
+                                rss_delta_mb = delta / (1024 * 1024),
+                                "Follower worker signaled ready ({}/{n})",
+                                id + 1
+                            );
                         }
                         Some(Err(e)) => {
-                            return Err(anyhow::anyhow!("Worker failed to load models: {e}"));
+                            return Err(anyhow::anyhow!("Worker {id} failed to load models: {e}"));
                         }
                         None => {
                             return Err(anyhow::anyhow!(
-                                "Worker exited before signaling readiness (got {i}/{n})"
+                                "Worker {id} exited before signaling readiness ({id}/{n})"
                             ));
                         }
                     }
                 }
 
+                drop(ready_tx);
                 drop(worker_handles);
+
+                // Compute and store the median delta as the per-worker model footprint.
+                let median = median_usize(&mut rss_deltas);
+                model_rss_for_init.store(median, Ordering::Release);
+                info!(
+                    median_rss_mb = median / (1024 * 1024),
+                    samples = rss_deltas.len(),
+                    "All workers ready — per-worker model RSS median computed"
+                );
 
                 Ok(())
             }
@@ -1209,7 +1238,7 @@ impl EmbedPool {
                 tx,
                 live_workers,
                 loaded_workers,
-                model_rss_max_bytes,
+                model_rss_per_worker_bytes,
             },
             init_handle,
         )
@@ -1295,17 +1324,33 @@ impl EmbedPool {
         self.tx.max_capacity().saturating_sub(self.tx.capacity())
     }
 
-    /// Returns the maximum RSS delta (bytes) observed across all workers during
-    /// model load.
+    /// Returns the median RSS delta (bytes) measured across all workers during
+    /// sequential model load.
     ///
-    /// This is the accurate per-worker model-weight footprint used by the
-    /// workspace-budget formula in `run_readiness_probe`.  Returns `0` on
-    /// non-Linux targets where RSS measurement is unavailable, or before any
-    /// worker has reported its delta.
+    /// This is the per-worker model-weight footprint used by
+    /// `run_readiness_probe` to compute the per-worker workspace budget.
+    /// Returns `0` on non-Linux targets where RSS measurement is unavailable,
+    /// or before the init task has completed.
     #[must_use]
-    pub fn model_rss_max_bytes(&self) -> usize {
-        self.model_rss_max_bytes.load(Ordering::Acquire)
+    pub fn model_rss_per_worker_bytes(&self) -> usize {
+        self.model_rss_per_worker_bytes.load(Ordering::Acquire)
     }
+}
+
+// ---------------------------------------------------------------------------
+// Aggregation helpers
+// ---------------------------------------------------------------------------
+
+/// Computes the median of a `Vec<usize>` in-place (sorts the slice).
+///
+/// Returns `0` for empty input. For even-length inputs returns the lower
+/// of the two middle elements (no floating-point required).
+fn median_usize(values: &mut [usize]) -> usize {
+    if values.is_empty() {
+        return 0;
+    }
+    values.sort_unstable();
+    values[values.len() / 2]
 }
 
 // ---------------------------------------------------------------------------
@@ -1321,7 +1366,7 @@ impl EmbedPool {
             tx,
             live_workers: Arc::new(AtomicUsize::new(0)),
             loaded_workers: Arc::new(AtomicUsize::new(0)),
-            model_rss_max_bytes: Arc::new(AtomicUsize::new(0)),
+            model_rss_per_worker_bytes: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -1370,7 +1415,7 @@ impl EmbedPool {
             tx,
             live_workers: Arc::new(AtomicUsize::new(1)),
             loaded_workers: Arc::new(AtomicUsize::new(1)),
-            model_rss_max_bytes: Arc::new(AtomicUsize::new(0)),
+            model_rss_per_worker_bytes: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -1380,8 +1425,16 @@ impl EmbedPool {
             tx,
             live_workers: Arc::new(AtomicUsize::new(1)),
             loaded_workers: Arc::new(AtomicUsize::new(0)),
-            model_rss_max_bytes: Arc::new(AtomicUsize::new(0)),
+            model_rss_per_worker_bytes: Arc::new(AtomicUsize::new(0)),
         }
+    }
+
+    /// Returns the raw `Arc<AtomicUsize>` backing `model_rss_per_worker_bytes`.
+    ///
+    /// Test-only; allows injecting a specific value to assert aggregation logic
+    /// without running actual model loads.
+    pub(crate) fn model_rss_per_worker_bytes_atomic(&self) -> Arc<AtomicUsize> {
+        Arc::clone(&self.model_rss_per_worker_bytes)
     }
 }
 
@@ -1529,28 +1582,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn model_rss_max_bytes_returns_zero_for_test_pool() {
-        // Test helpers initialize model_rss_max_bytes to 0 since no real
+    async fn model_rss_per_worker_bytes_returns_zero_for_test_pool() {
+        // Test helpers initialize model_rss_per_worker_bytes to 0 since no real
         // load_models() runs; the getter must reflect that.
         let pool = EmbedPool::closed_for_test();
-        assert_eq!(pool.model_rss_max_bytes(), 0);
+        assert_eq!(pool.model_rss_per_worker_bytes(), 0);
         let pool2 = EmbedPool::with_fixed_responses(vec![], vec![]);
-        assert_eq!(pool2.model_rss_max_bytes(), 0);
-    }
-
-    #[test]
-    fn model_rss_max_bytes_tracks_maximum_across_workers() {
-        // Directly verify that the AtomicUsize fetch_max semantics are correct:
-        // the pool keeps the highest delta seen across any worker.
-        let rss = Arc::new(AtomicUsize::new(0));
-        rss.fetch_max(500_000_000, Ordering::AcqRel); // worker 0: 500 MB
-        rss.fetch_max(1_100_000_000, Ordering::AcqRel); // worker 1: 1.1 GB
-        rss.fetch_max(800_000_000, Ordering::AcqRel); // worker 2: 800 MB
-        assert_eq!(
-            rss.load(Ordering::Acquire),
-            1_100_000_000,
-            "model_rss_max should be the maximum delta across all workers"
-        );
+        assert_eq!(pool2.model_rss_per_worker_bytes(), 0);
     }
 
     // -----------------------------------------------------------------------
@@ -1847,7 +1885,10 @@ mod tests {
             .await
             .expect("fixture pool should succeed");
         // Fixture always returns EmbedStats::default() — all zero.
-        assert_eq!(stats.chunks, 0, "fixture pool stats should be default zeros");
+        assert_eq!(
+            stats.chunks, 0,
+            "fixture pool stats should be default zeros"
+        );
         assert_eq!(stats.inference_ms, 0);
     }
 
@@ -1863,5 +1904,75 @@ mod tests {
         let pool = EmbedPool::closed_for_test();
         // Closed pool has a dropped receiver; capacity reports max - 0 pending = 0.
         assert_eq!(pool.queue_depth(), 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // median_usize
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn median_usize_empty_returns_zero() {
+        let mut v: Vec<usize> = vec![];
+        assert_eq!(median_usize(&mut v), 0);
+    }
+
+    #[test]
+    fn median_usize_single_element() {
+        let mut v = vec![42usize];
+        assert_eq!(median_usize(&mut v), 42);
+    }
+
+    #[test]
+    fn median_usize_odd_count() {
+        let mut v = vec![3usize, 1, 2];
+        assert_eq!(median_usize(&mut v), 2);
+    }
+
+    #[test]
+    fn median_usize_even_count_returns_lower_middle() {
+        // For even-length: returns the lower of the two middle elements.
+        let mut v = vec![1usize, 3, 5, 7];
+        // sorted: [1, 3, 5, 7]; len/2 = 2 → v[2] = 5
+        assert_eq!(median_usize(&mut v), 5);
+    }
+
+    #[test]
+    fn median_usize_outlier_does_not_inflate_result() {
+        // Simulates the production scenario: 5 clean readings ~1100 MB
+        // and one contaminated reading at 8459 MB (parallel-load artifact).
+        // Before the fix, fetch_max returned 8459; median returns 1100.
+        let mut v = vec![
+            1_100usize * 1024 * 1024,
+            1_080usize * 1024 * 1024,
+            1_100usize * 1024 * 1024,
+            8_459usize * 1024 * 1024, // outlier
+            1_090usize * 1024 * 1024,
+        ];
+        let median = median_usize(&mut v);
+        // sorted: [1080, 1090, 1100, 1100, 8459]; len/2 = 2 → v[2] = 1100 MiB
+        assert_eq!(median, 1_100 * 1024 * 1024);
+        assert!(
+            median < 2_000 * 1024 * 1024,
+            "median ({} MiB) should be nowhere near the outlier (8459 MiB)",
+            median / (1024 * 1024)
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // model_rss_per_worker_bytes accessor
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn model_rss_per_worker_bytes_defaults_to_zero() {
+        let pool = EmbedPool::closed_for_test();
+        assert_eq!(pool.model_rss_per_worker_bytes(), 0);
+    }
+
+    #[test]
+    fn model_rss_per_worker_bytes_reflects_stored_value() {
+        let pool = EmbedPool::closed_for_test();
+        let atomic = pool.model_rss_per_worker_bytes_atomic();
+        atomic.store(1_234_567, Ordering::Release);
+        assert_eq!(pool.model_rss_per_worker_bytes(), 1_234_567);
     }
 }

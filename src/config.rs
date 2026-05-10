@@ -505,6 +505,9 @@ mod tests {
     fn heartbeat_secs_invalid_falls_back_to_default() {
         let map = HashMap::from([("BGE_M3_HEARTBEAT_SECS", "not_a_number")]);
         let cfg = Config::from_lookup(lookup_from(&map));
-        assert_eq!(cfg.heartbeat_secs, 60, "invalid value should fall back to default");
+        assert_eq!(
+            cfg.heartbeat_secs, 60,
+            "invalid value should fall back to default"
+        );
     }
 }

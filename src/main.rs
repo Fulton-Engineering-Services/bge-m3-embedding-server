@@ -94,27 +94,81 @@ pub(crate) fn build_router(state: Arc<AppState>) -> Router {
         .with_state(state)
 }
 
+/// Computes per-worker workspace budget and derived stats from memory inputs.
+///
+/// # Returns
+///
+/// `(per_worker_workspace, worst_case_peak, utilization_pct)` where:
+/// - `per_worker_workspace`: bytes available to one worker for a single
+///   `session.run()` call (passed as `rss_ceiling` to the probe).
+/// - `worst_case_peak`: total bytes consumed when all workers run
+///   simultaneously at budget ceiling (used for the 90% OOM warning).
+/// - `utilization_pct`: `worst_case_peak / available_bytes × 100`.
+///
+/// Extracted as a pure function so the budget logic is unit-testable
+/// independently of the async readiness probe machinery.
+//
+// cast_precision_loss: available_bytes ≤ ~28 GB (Fargate limit), total_workspace
+//   similarly bounded; f64 has 2^52 mantissa (~4.5 PB) — no precision loss.
+// cast_possible_truncation: per_worker_workspace is a byte budget; truncating
+//   sub-byte fractions is intentional and harmless.
+// cast_sign_loss: total_workspace is derived from saturating_sub — always ≥ 0.
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss
+)]
+fn compute_workspace_budget(
+    available_bytes: usize,
+    n_workers: usize,
+    model_rss_per_worker: usize,
+    safety_factor: f64,
+) -> (usize, usize, f64) {
+    let total_workspace = available_bytes
+        .saturating_sub(n_workers.saturating_mul(model_rss_per_worker))
+        .saturating_sub(OS_HEADROOM_BYTES);
+    let per_worker_workspace = (total_workspace as f64 * safety_factor / n_workers as f64) as usize;
+
+    let worst_case_peak = n_workers
+        .saturating_mul(per_worker_workspace)
+        .saturating_add(n_workers.saturating_mul(model_rss_per_worker))
+        .saturating_add(OS_HEADROOM_BYTES);
+
+    let utilization_pct = if available_bytes > 0 {
+        worst_case_peak as f64 / available_bytes as f64 * 100.0
+    } else {
+        0.0
+    };
+
+    (per_worker_workspace, worst_case_peak, utilization_pct)
+}
+
 /// Runs after all workers finish loading their model instances.
 ///
 /// # Sequence
 ///
 /// 1. Wait for worker pool initialisation to finish.
-/// 2. Detect available memory; write static [`TuningInfo`] to `OnceLock`.
-/// 3. Resolve the cost model — one of three paths:
+/// 2. Read `pool.model_rss_per_worker_bytes()` — the median RSS delta measured
+///    inside each worker's `spawn_blocking` closure around `load_models()`.
+///    Workers load sequentially (one at a time), so each delta reflects only
+///    that worker's ORT session allocation with no parallel-load contamination.
+/// 3. Detect available memory; compute `per_worker_workspace` via
+///    `compute_workspace_budget`. Fail fast if the budget is below the
+///    physics-based floor (cannot fit even one text at `max_seq_length`).
+/// 4. Write static [`TuningInfo`] to `OnceLock`.
+/// 5. Resolve the cost model — one of three paths:
 ///    - cost-model override set: apply immediately, `probe_status = Disabled`.
 ///    - EFS cache hit: apply cached `(a, b)` via `ArcSwap`, `probe_status = CacheHit`.
 ///    - cache miss: set `probe_status = Running`, launch background probe task.
-/// 4. Run dense + sparse readiness calls to confirm the worker pool is healthy.
-/// 5. Flip `state.ready = true` — `/health` returns `200 ok` from this point on.
+/// 6. Run dense + sparse readiness calls to confirm the worker pool is healthy.
+/// 7. Flip `state.ready = true` — `/health` returns `200 ok` from this point on.
 ///    If the probe is still running in the background, the bin-packer uses
 ///    conservative defaults until the `ArcSwap` is updated (typically ~120 s).
 ///
-// cast_precision_loss: available_bytes and total_workspace are ≤ ~28 GB (Fargate task
-//   limit), well within f64's 2^52 mantissa (~4.5 PB); cfg_workers is ≤ 32.
-// cast_possible_truncation: per_worker_workspace is a byte budget; truncating
-//   sub-byte fractions is intentional and harmless.
-// cast_sign_loss: total_workspace is derived from saturating_sub so it is always
-//   ≥ 0 before the float multiplication.
+// cast_possible_truncation: physics_floor is a u128 workspace estimate; truncating
+//   to usize is safe because per_worker_workspace is itself bounded by available_bytes
+//   which fits comfortably in usize on any 64-bit target.
+// cast_precision_loss / cast_sign_loss: delegated to compute_workspace_budget.
 #[allow(
     clippy::cast_precision_loss,
     clippy::cast_possible_truncation,
@@ -146,39 +200,24 @@ async fn run_readiness_probe(
         "Memory detected"
     );
 
-    // Use the per-worker RSS delta reported by each worker during load_models().
-    // This is measured inside spawn_blocking immediately around the ORT session
-    // creation, so it accurately captures the model-weight footprint rather than
-    // the noisy pre/post snapshot that was taken here before (which read RSS
-    // twice in the same instant after all workers had already loaded and
-    // produced model_rss_per_worker ≈ 0 — the root cause of the 2026-05-09 OOM).
-    let model_rss_per_worker = state.pool.model_rss_max_bytes();
+    // Per-worker model RSS is the median of per-worker deltas collected by
+    // EmbedPool::spawn. Workers load sequentially (one at a time) so each
+    // delta reflects only that worker's ORT session allocation. The median
+    // is robust to one outlier from page-cache settling or ORT arena jitter.
+    let model_rss_per_worker = state.pool.model_rss_per_worker_bytes();
     info!(
         model_rss_per_worker_mb = model_rss_per_worker / (1024 * 1024),
-        "Measured model RSS per worker (max across all workers)"
+        "Measured model RSS per worker (median across all workers)"
     );
 
     // Compute per-worker workspace ceiling.
-    let total_workspace = mem
-        .available_bytes
-        .saturating_sub(cfg_workers.saturating_mul(model_rss_per_worker))
-        .saturating_sub(OS_HEADROOM_BYTES);
-    let per_worker_workspace =
-        ((total_workspace as f64) * cfg_safety / (cfg_workers as f64)) as usize;
+    let (per_worker_workspace, worst_case_peak, utilization_pct) = compute_workspace_budget(
+        mem.available_bytes,
+        cfg_workers,
+        model_rss_per_worker,
+        cfg_safety,
+    );
 
-    // Compute and log worst-case peak memory when all workers run simultaneously
-    // at their per-worker budget ceiling.  This is the number that must stay
-    // below available_bytes to avoid OOM.
-    let worst_case_peak = cfg_workers
-        .saturating_mul(per_worker_workspace)
-        .saturating_add(cfg_workers.saturating_mul(model_rss_per_worker))
-        .saturating_add(OS_HEADROOM_BYTES);
-    #[allow(clippy::cast_precision_loss)]
-    let utilization_pct = if mem.available_bytes > 0 {
-        (worst_case_peak as f64 / mem.available_bytes as f64) * 100.0
-    } else {
-        0.0
-    };
     info!(
         worst_case_peak_mb = worst_case_peak / (1024 * 1024),
         available_mb = mem.available_bytes / (1024 * 1024),
@@ -192,6 +231,30 @@ async fn run_readiness_probe(
             "Worst-case workspace peak exceeds 90% of available memory; \
              consider lowering BGE_M3_MEMORY_SAFETY_FACTOR or BGE_M3_WORKERS"
         );
+    }
+
+    // Physics-based safety floor: the minimum workspace required to run a
+    // single text at the configured max sequence length under conservative
+    // cost-model coefficients. If the computed per_worker_workspace falls
+    // below this floor, the measurement upstream is broken (e.g. inflated
+    // model_rss_per_worker driving total_workspace to zero via saturating_sub).
+    // Continuing in this state degrades bin_pack to batch=1 and produces
+    // silent throughput collapse — fail fast instead so ECS restarts the task
+    // and the operator sees a clear error rather than a degraded service.
+    let physics_floor = CostModel::conservative(0).chunk_cost(1, cfg_max_seq) as usize;
+    if per_worker_workspace < physics_floor {
+        return Err(anyhow::anyhow!(
+            "Computed per_worker_workspace ({per_worker_workspace} B = {} MiB) is below the \
+             physics-based minimum ({physics_floor} B = {} MiB) needed to run one text at \
+             max_seq_length={cfg_max_seq}. Likely causes: model_rss_per_worker ({} MiB) is \
+             over-estimated (parallel-load contamination), BGE_M3_MEMORY_SAFETY_FACTOR too low \
+             ({cfg_safety}), BGE_M3_WORKERS too high ({cfg_workers}) for available memory \
+             ({} MiB), or BGE_M3_AVAILABLE_MEMORY_BYTES override too small.",
+            per_worker_workspace / (1024 * 1024),
+            physics_floor / (1024 * 1024),
+            model_rss_per_worker / (1024 * 1024),
+            mem.available_bytes / (1024 * 1024),
+        ));
     }
 
     // Write static memory + budget info now so /health always shows these fields
@@ -363,7 +426,11 @@ async fn main() -> anyhow::Result<()> {
         git_sha = env!("BGE_M3_GIT_SHA"),
         target_arch = std::env::consts::ARCH,
         target_os = std::env::consts::OS,
-        profile = if cfg!(debug_assertions) { "debug" } else { "release" },
+        profile = if cfg!(debug_assertions) {
+            "debug"
+        } else {
+            "release"
+        },
         "bge-m3-embedding-server build info"
     );
 
@@ -464,8 +531,7 @@ async fn main() -> anyhow::Result<()> {
     if heartbeat_secs > 0 {
         let state_hb = Arc::clone(&state);
         tokio::spawn(async move {
-            let mut tick =
-                tokio::time::interval(Duration::from_secs(heartbeat_secs));
+            let mut tick = tokio::time::interval(Duration::from_secs(heartbeat_secs));
             // Skip the first (immediate) tick so we don't log at t=0 before
             // the server has finished starting up.
             tick.tick().await;
@@ -478,10 +544,9 @@ async fn main() -> anyhow::Result<()> {
                     loaded_workers = state_hb.pool.loaded_worker_count(),
                     queue_depth = state_hb.pool.queue_depth(),
                     available_permits = state_hb.request_permits.available_permits(),
-                    probe_status = ProbeStatus::from_u8(
-                        state_hb.probe_status.load(Ordering::Acquire)
-                    )
-                    .as_str(),
+                    probe_status =
+                        ProbeStatus::from_u8(state_hb.probe_status.load(Ordering::Acquire))
+                            .as_str(),
                     "heartbeat"
                 );
             }
@@ -937,5 +1002,80 @@ mod tests {
         )
         .await;
         assert!(!state.ready.load(std::sync::atomic::Ordering::Acquire));
+    }
+
+    // -----------------------------------------------------------------------
+    // compute_workspace_budget
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn compute_workspace_budget_sane_inputs() {
+        // 28 GiB available, 7 workers, ~1.6 GiB model RSS, 0.7 safety.
+        let avail = 28_672usize * 1024 * 1024;
+        let model_rss = 1_628usize * 1024 * 1024;
+        let (ws, peak, pct) = compute_workspace_budget(avail, 7, model_rss, 0.7);
+        // total_workspace = 28672 - 7*1628 - 256 ≈ 17,060 MiB
+        // per_worker = 17060 * 0.7 / 7 ≈ 1,706 MiB
+        assert!(
+            ws > 1_000 * 1024 * 1024,
+            "per_worker_workspace ({} MiB) should be well over 1 GiB",
+            ws / (1024 * 1024)
+        );
+        assert!(ws < avail, "per_worker_workspace must not exceed available");
+        // Worst-case peak should be < available (sanity).
+        assert!(
+            peak < avail * 2,
+            "peak ({} MiB) seems unreasonably large",
+            peak / (1024 * 1024)
+        );
+        assert!(
+            pct > 0.0 && pct < 200.0,
+            "utilization_pct {pct:.1}% out of range"
+        );
+    }
+
+    #[test]
+    fn compute_workspace_budget_saturates_gracefully_when_model_rss_inflated() {
+        // Reproduces the production failure: inflated model_rss_per_worker from
+        // parallel-load contamination drives total_workspace to 0 via saturating_sub.
+        let avail = 20_543usize * 1024 * 1024; // ~what MemAvailable reported
+        let model_rss = 8_459usize * 1024 * 1024; // contaminated median from old code
+        let (ws, _peak, _pct) = compute_workspace_budget(avail, 7, model_rss, 0.7);
+        // 7 * 8459 = 59213 MiB >> 20543 MiB → saturates to 0 → ws = 0.
+        assert_eq!(
+            ws, 0,
+            "saturated budget should be 0 (physics_floor check will catch this)"
+        );
+    }
+
+    #[test]
+    fn compute_workspace_budget_physics_floor_detection() {
+        // Verify that the physics floor catches the zero-workspace case.
+        // physics_floor = chunk_cost(1, 8192) under conservative defaults.
+        use crate::binpack::CostModel;
+        let physics_floor = CostModel::conservative(0).chunk_cost(1, 8192) as usize;
+        assert!(
+            physics_floor > 0,
+            "physics_floor must be positive (conservative model costs > 0)"
+        );
+        // A zero workspace is below the floor.
+        assert!(
+            0 < physics_floor,
+            "workspace=0 must be caught by the physics_floor guard"
+        );
+    }
+
+    #[test]
+    fn compute_workspace_budget_single_worker() {
+        // n=1: all available workspace (minus model RSS and headroom) goes to that worker.
+        let avail = 8_192usize * 1024 * 1024;
+        let model_rss = 1_100usize * 1024 * 1024;
+        let (ws, _peak, _pct) = compute_workspace_budget(avail, 1, model_rss, 1.0);
+        // total_workspace = 8192 - 1100 - 256 = 6836 MiB; per_worker = 6836 * 1.0 / 1
+        assert!(
+            ws > 6_000 * 1024 * 1024,
+            "single worker should get ~6836 MiB workspace, got {} MiB",
+            ws / (1024 * 1024)
+        );
     }
 }

@@ -64,7 +64,18 @@ fn check_ready(state: &AppState) -> Result<(), AppError> {
 // Public handlers
 // ---------------------------------------------------------------------------
 
-#[tracing::instrument(skip(state, req), fields(batch_size, prompt_tokens, chunks, max_chunk_seq, tokenize_ms, inference_ms, total_ms))]
+#[tracing::instrument(
+    skip(state, req),
+    fields(
+        batch_size,
+        prompt_tokens,
+        chunks,
+        max_chunk_seq,
+        tokenize_ms,
+        inference_ms,
+        total_ms
+    )
+)]
 pub async fn dense_embeddings(
     State(state): State<Arc<AppState>>,
     Json(req): Json<DenseRequest>,
@@ -132,7 +143,10 @@ pub async fn dense_embeddings(
 }
 
 #[allow(clippy::cast_possible_truncation)]
-#[tracing::instrument(skip(state, req), fields(batch_size, chunks, max_chunk_seq, tokenize_ms, inference_ms, total_ms))]
+#[tracing::instrument(
+    skip(state, req),
+    fields(batch_size, chunks, max_chunk_seq, tokenize_ms, inference_ms, total_ms)
+)]
 pub async fn sparse_embeddings(
     State(state): State<Arc<AppState>>,
     Json(req): Json<SparseRequest>,
@@ -187,7 +201,18 @@ pub async fn sparse_embeddings(
 }
 
 #[allow(clippy::cast_possible_truncation)]
-#[tracing::instrument(skip(state, req), fields(batch_size, prompt_tokens, chunks, max_chunk_seq, tokenize_ms, inference_ms, total_ms))]
+#[tracing::instrument(
+    skip(state, req),
+    fields(
+        batch_size,
+        prompt_tokens,
+        chunks,
+        max_chunk_seq,
+        tokenize_ms,
+        inference_ms,
+        total_ms
+    )
+)]
 pub async fn both_embeddings(
     State(state): State<Arc<AppState>>,
     Json(req): Json<DualRequest>,
