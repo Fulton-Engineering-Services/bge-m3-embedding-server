@@ -120,11 +120,18 @@ Interactive ipywidgets notebooks for hands-on exploration. Require Jupyter and i
 ### Setup
 
 ```bash
-uv sync --group notebooks   # installs jupyter, ipywidgets, ipympl
-uv run jupyter notebook
+uv sync --group notebooks
+
+# Register the kernel so VS Code/Cursor finds it automatically
+uv run python -m ipykernel install --user --name bge-m3-probe-visuals --display-name "BGE-M3 Probe Visuals"
 ```
 
-Then open the `notebooks/` directory in the Jupyter file browser.
+After running the install command, VS Code will offer **"BGE-M3 Probe Visuals"** in the kernel selector — no manual path entry needed. The notebooks embed this kernel name in their metadata.
+
+To run via terminal instead:
+```bash
+uv run jupyter notebook notebooks/
+```
 
 Notebooks use the `ipympl` backend — each widget interaction redraws the live matplotlib canvas in-cell. Pan and zoom work on all figure panels.
 
