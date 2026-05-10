@@ -108,6 +108,23 @@ struct ModelFiles {
 }
 
 /// Downloads BGE-M3 model files from Hugging Face Hub (or returns cached paths).
+/// Returns `true` when the primary ONNX model file already exists in the
+/// hf-hub snapshot cache, meaning `repo.get()` will return immediately
+/// without fetching from the network.
+///
+/// hf-hub 0.5.x cache layout:
+/// `{cache_dir}/hub/models--{owner}--{name}/snapshots/{revision}/{filename}`
+fn is_model_cached(cache_dir: &Path, repo_id: &str, revision: &str, onnx_filename: &str) -> bool {
+    let repo_dir = format!("models--{}", repo_id.replace('/', "--"));
+    cache_dir
+        .join("hub")
+        .join(repo_dir)
+        .join("snapshots")
+        .join(revision)
+        .join(onnx_filename)
+        .exists()
+}
+
 fn download_model_files(
     cache_dir: &Path,
     show_progress: bool,
@@ -117,6 +134,31 @@ fn download_model_files(
         ModelVariant::Fp32 => (REPO_ID, REPO_REVISION),
         ModelVariant::Fp16 | ModelVariant::Int8 => (XENOVA_REPO_ID, XENOVA_REPO_REVISION),
     };
+
+    // Check the hf-hub snapshot directory for the primary ONNX file before
+    // touching the network.  This lets us log a clear "from cache" message
+    // rather than silence while hf-hub resolves files.
+    let onnx_filename = match variant {
+        ModelVariant::Fp32 => "onnx/model.onnx",
+        ModelVariant::Fp16 => "onnx/model_fp16.onnx",
+        ModelVariant::Int8 => "onnx/model_int8.onnx",
+    };
+    let cached = is_model_cached(cache_dir, repo_id, repo_revision, onnx_filename);
+    if cached {
+        info!(
+            repo_id,
+            revision = repo_revision,
+            model_variant = %variant,
+            "Model files found in local cache — no download needed"
+        );
+    } else {
+        info!(
+            repo_id,
+            revision = repo_revision,
+            model_variant = %variant,
+            "Model files not in local cache — downloading from HuggingFace Hub"
+        );
+    }
 
     let api = hf_hub::api::sync::ApiBuilder::new()
         .with_cache_dir(cache_dir.to_path_buf())
