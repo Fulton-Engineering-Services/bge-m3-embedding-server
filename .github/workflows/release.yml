@@ -261,7 +261,7 @@ jobs:
   pages:
     name: Publish Docs
     needs: [version, docs]
-    if: needs.version.outputs.exists == 'false'
+    if: needs.version.outputs.exists == 'false' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     environment:
       name: github-pages
