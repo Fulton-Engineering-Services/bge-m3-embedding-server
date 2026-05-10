@@ -15,3 +15,6 @@ tmp/
 # Visuals tool — generated PNGs and virtual environment
 tools/visuals/out/
 tools/visuals/.venv/
+
+# JupyterLite build output — served via GitHub Pages Actions artifact, not git
+_output/
