@@ -120,11 +120,13 @@ Interactive ipywidgets notebooks for hands-on exploration. Require Jupyter and i
 ### Setup
 
 ```bash
-uv sync --group notebooks
+uv sync --group notebooks   # installs jupyter, ipywidgets, ipympl
 uv run jupyter notebook
 ```
 
 Then open the `notebooks/` directory in the Jupyter file browser.
+
+Notebooks use the `ipympl` backend — each widget interaction redraws the live matplotlib canvas in-cell. Pan and zoom work on all figure panels.
 
 ### Available notebooks
 
