@@ -9,8 +9,9 @@ SPLADE-style sparse token weights.
 
 Key capabilities:
 - **Long-context embeddings** — supports up to 8192 tokens (BGE-M3's full positional range), configurable via `BGE_M3_MAX_SEQ_LENGTH`.
-- **Memory-aware auto-tuning** — detects container/cgroup memory at startup, runs a workspace probe, and derives a safe batch size automatically. No manual `ONNX_BATCH_SIZE` knob needed.
+- **Memory-aware auto-tuning** — detects container/cgroup memory at startup, runs a workspace probe, and derives a safe workspace budget automatically. No manual `ONNX_BATCH_SIZE` knob needed.
 - **Length-aware bin-packing** — tokens within each `session.run()` call are padded only to the longest sequence in that chunk, not the global maximum. Short-text batches pack densely; long-text batches split appropriately.
+- **Single-pass dual embeddings** — `/v1/embeddings:both` produces dense and sparse vectors in one ONNX `session.run()` on all three model variants. BGE-M3's transformer runs once per chunk and both representations are derived from its output — unlike hybrid retrieval setups that run a separate dense encoder and a sparse model in sequence.
 
 ## Quick Start
 
@@ -28,8 +29,11 @@ BGE_M3_CACHE_DIR=/tmp/bge-m3-cache cargo run --release
 ```
 
 Wait for the log line `"Models ready — accepting requests"` before sending requests. On first
-run this takes a minute or two while the ONNX model files download. On Linux, an additional
-startup probe runs (up to ~60 s) to measure workspace cost — this is normal.
+run this takes a minute or two while the ONNX model files download. On Linux, the server
+returns ready as soon as the leader worker loads, then an additional **startup workspace probe**
+(~120 s on a cache miss, milliseconds on a cache hit) runs in the background to measure the
+auto-budget cost-model coefficients — see [docs/startup-probe.md](docs/startup-probe.md) for
+the full theory primer.
 
 ### Verify
 
@@ -46,6 +50,11 @@ curl -s http://localhost:8081/v1/embeddings \
 curl -s http://localhost:8081/v1/sparse-embeddings \
   -H "Content-Type: application/json" \
   -d '{"input": ["what is Rust?"]}' | jq .
+
+# Dense + sparse in one forward pass (preferred for ingestion pipelines)
+curl -s http://localhost:8081/v1/embeddings:both \
+  -H "Content-Type: application/json" \
+  -d '{"input": "passage: what is Rust?", "model": "bge-m3"}' | jq .
 ```
 
 ## API Reference
@@ -56,6 +65,7 @@ Full OpenAPI 3.1 specification: [`openapi.yaml`](./openapi.yaml)
 |----------|--------|-------------|
 | `/v1/embeddings` | `POST` | Dense embeddings — OpenAI-compatible |
 | `/v1/sparse-embeddings` | `POST` | Sparse embeddings — BGE-M3 SPLADE-style |
+| `/v1/embeddings:both` | `POST` | Dense + sparse in a single forward pass |
 | `/v1/models` | `GET` | Fleet discovery — returns the `bge-m3` model entry |
 | `/health` | `GET` | Readiness probe with worker pool status and tuning data |
 
@@ -86,6 +96,7 @@ curl http://localhost:8081/health
     "a_bytes_per_token": 18432.0,
     "b_bytes_per_token_sq": 6.2,
     "max_workspace_bytes": 2500000000,
+    "probe_status": "complete",
     "memory_source": "cgroup_v2",
     "available_bytes": 28991029248,
     "model_rss_bytes_per_worker": 1100000000
@@ -94,6 +105,8 @@ curl http://localhost:8081/health
 ```
 
 The `tuning` object lets operators verify what the server derived at startup without scraping logs.
+`probe_status` is one of `disabled`, `running`, `complete`, `failed`, or `cache_hit`. See
+[docs/startup-probe.md](docs/startup-probe.md) for what each state means and how to act on it.
 
 **Response (`loading`)**
 
@@ -192,7 +205,81 @@ Each entry in `data` corresponds to one input string. `indices` are vocabulary t
 
 ---
 
-## Configuration
+### `POST /v1/embeddings:both`
+
+Produces both dense and sparse embeddings for each input in a single ONNX forward pass.
+
+**Why this matters — BGE-M3's unified backbone**
+
+BGE-M3 achieves single-pass dual embeddings on all three model variants, though
+the ONNX graph topology differs:
+
+- **FP32 (`BAAI/bge-m3`, `BGE_M3_MODEL=fp32`):** The ONNX graph has two explicit
+  named output heads — `sentence_embedding` [batch, 1024] for the pooled dense
+  vector, and `token_embeddings` [batch, seq, 1024] for token-level hidden states.
+  One `session.run()` emits both tensors; the server extracts dense and sparse
+  base directly from their respective named outputs.
+- **FP16 / INT8 (`Xenova/bge-m3`, default and quantized):** The ONNX graph
+  exposes a single `last_hidden_state` [batch, seq, 1024] output. One
+  `session.run()` emits it; the server derives the dense vector from the CLS token
+  at position 0, and the sparse base from all token positions of the same tensor.
+  Still one forward pass — the transformer runs exactly once per chunk.
+
+In all three cases the transformer executes once per chunk. The cost of producing
+both representations is nearly identical to producing just one.
+
+Contrast this with common alternatives: running a dense-only model alongside BM25,
+pairing an OpenAI embedding call with a separate sparse encoder, or sequentially
+calling `/v1/embeddings` and `/v1/sparse-embeddings` — all of which require two
+model invocations. For ingestion pipelines that index both representations, this
+endpoint halves transformer compute.
+
+The colon (`:`) in the path follows [AIP-136](https://google.aip.dev/136) custom-verb convention.
+
+**Request**
+
+```bash
+curl -s http://localhost:8081/v1/embeddings:both \
+  -H "Content-Type: application/json" \
+  -d '{
+    "input": ["passage: Rust is a systems programming language.", "passage: Axum is a web framework."],
+    "model": "bge-m3"
+  }'
+```
+
+`input` accepts a single string or an array of strings. Prefix passage inputs with `"passage: "`
+and query inputs with `"query: "` for best retrieval quality.
+
+**Response**
+
+```json
+{
+  "object": "list",
+  "model": "bge-m3",
+  "data": [
+    {
+      "index": 0,
+      "embedding": [0.0123, -0.0456, 0.0789],
+      "sparse_values": {
+        "indices": [42, 100, 3527],
+        "values": [0.5, 0.8, 0.3]
+      }
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 7,
+    "total_tokens": 7
+  }
+}
+```
+
+Each entry in `data` carries the 1024-dimensional `embedding` (L2-normalized) and the
+`sparse_values` map (`indices` are vocabulary token IDs, `values` are the corresponding
+SPLADE weights) for the same input string.
+
+---
+
+
 
 All configuration is via environment variables. The server reads them once at startup; changes
 require a restart.
@@ -204,6 +291,7 @@ require a restart.
 | `BGE_M3_CACHE_DIR` | `/cache` | Directory where ONNX model files are cached |
 | `BGE_M3_BIND` | `0.0.0.0:8081` | TCP bind address |
 | `BGE_M3_WORKERS` | `2` | Worker thread count (each loads its own model; min 1) |
+| `BGE_M3_INTRA_THREADS` | `1` | Intra-op threads each ORT session may use per `session.run()` call (min 1). Default `1` keeps per-worker RSS predictable for the workspace probe; raise to `floor(num_cpus / workers)` on under-utilized hosts to fan out matmul/attention kernels across cores. Re-run the probe after changing. |
 | `BGE_M3_MAX_BATCH` | `256` | Maximum texts per request (min 1) |
 | `BGE_M3_MAX_SEQ_LENGTH` | `8192` | Maximum tokenized sequence length, range `[1, 8192]`. Lower values reduce memory; `8192` is BGE-M3's published maximum. |
 | `BGE_M3_IDLE_TIMEOUT_SECS` | `300` | Seconds of inactivity before models are unloaded from memory; `0` disables idle unloading |
@@ -213,11 +301,15 @@ require a restart.
 ### Auto-Budget Tuning (Linux)
 
 On Linux, the server automatically detects available memory and derives a safe workspace budget
-via a startup probe. No manual batch-size tuning is needed.
+via a startup probe. No manual batch-size tuning is needed. The probe fits a quadratic cost model
+`workspace ≈ a · (batch · seq) + b · (batch · seq²)` from a small set of measured `(batch, seq)`
+shapes — see [docs/startup-probe.md](docs/startup-probe.md) for the math primer (transformer
+workspace decomposition, normalized OLS, conditioning, persistent caching, lock-free handoff).
 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `BGE_M3_DISABLE_AUTO_BUDGET` | unset | Set to `1` to skip the probe; uses conservative defaults |
+| `BGE_M3_DISABLE_PROBE_CACHE` | unset | Set to `1` to force a fresh probe even when a fingerprint-matching cache file exists at `{cache_dir}/probe-coefficients.json` |
 | `BGE_M3_AVAILABLE_MEMORY_BYTES` | detected | Override memory detection (cgroup v2 → v1 → `/proc/meminfo`) |
 | `BGE_M3_MEMORY_SAFETY_FACTOR` | `0.7` | Fraction `[0.1, 1.0]` of detected workspace to use; provides headroom for ORT arena fragmentation |
 | `BGE_M3_TOKEN_BUDGET` | unset | Pin `max_workspace_bytes` directly (replaces the legacy `BGE_M3_ONNX_BATCH_SIZE` approach) |
@@ -386,7 +478,8 @@ flowchart TD
 
 - **Tokenize-once, bin-pack:** each request tokenizes all input texts in a single pass (no padding), then `binpack::bin_pack()` groups them into `session.run()` calls where each chunk is padded only to its own longest sequence. This eliminates the "one long text pads the whole batch" inefficiency.
 - **Quadratic cost model:** workspace per `session.run()` call is estimated as `a × (batch × seq) + b × (batch × seq²)`. At `MAX_SEQ_LENGTH=8192`, the quadratic attention term dominates; the bin-packer automatically assigns fewer texts per chunk for long sequences.
-- **Memory-aware startup probe (Linux):** after the leader worker loads its model, the server sweeps 18 `(batch, seq)` shapes, measures peak RSS deltas, and fits cost-model coefficients `a` and `b` via least squares. Conservative defaults apply when the probe cannot run.
+- **Memory-aware startup probe (Linux):** after the leader worker loads its model, the server sweeps 7 `(batch, seq)` shapes (6 fixed + the configured `max_seq` capability check), measures peak RSS deltas via `/proc/self/statm`, and fits cost-model coefficients `a` and `b` via normalized ordinary least squares. The probe runs in a background task — workers serve requests immediately with conservative defaults and pick up the fitted coefficients lock-free via `Arc<ArcSwap<CostModel>>` once the fit completes. Fitted coefficients are cached to `{cache_dir}/probe-coefficients.json` (fingerprinted by `version × model × max_seq × arch`) so warm starts skip the probe entirely. Conservative defaults apply when the probe cannot run. See [docs/startup-probe.md](docs/startup-probe.md) for the full theory primer.
+- **Single forward pass for dual embeddings:** BGE-M3's ONNX graph exposes the data needed for both dense and sparse embeddings from one `session.run()`. For fp32, the graph has explicit named output heads (`sentence_embedding` + `token_embeddings`). For fp16/int8, both are derived from the single `last_hidden_state` output — dense from the CLS position, sparse base from all token positions. In both cases the transformer executes once per chunk for the `/v1/embeddings:both` handler.
 - Each worker runs on a Tokio `spawn_blocking` thread, loading its own ORT session and tokenizer.
 - The shared `Arc<Mutex<Receiver>>` provides natural load balancing without a separate dispatcher.
 - An `AtomicBool` readiness flag is set only after all workers have loaded **and** a warm-up probe completes. The `/health` endpoint returns `503 loading` until then.

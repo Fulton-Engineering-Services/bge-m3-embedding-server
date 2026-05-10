@@ -86,6 +86,24 @@ pub struct Config {
     /// Set with `BGE_M3_WORKERS`. Defaults to `2`. Minimum effective value is `1`.
     /// Each worker loads its own model instance.
     pub workers: usize,
+    /// Number of intra-op threads each ORT session may use for a single
+    /// `session.run()` call (matmul / attention kernels).
+    ///
+    /// Set with `BGE_M3_INTRA_THREADS`. Defaults to `1`. Minimum effective
+    /// value is `1`.
+    ///
+    /// The default of `1` preserves predictable per-worker RSS (the workspace
+    /// probe and quadratic cost model are calibrated against single-threaded
+    /// MLAS runs). Raise this on under-utilized hosts where `BGE_M3_WORKERS *
+    /// intra_threads <= num_cpus`: e.g. on an 8 vCPU task with `workers=2`,
+    /// setting `intra_threads=4` lets each worker fan out to four cores during
+    /// inference, taking CPU utilization from ~25% to ~100% under load. Going
+    /// above `floor(num_cpus / workers)` causes thread oversubscription and
+    /// hurts throughput.
+    ///
+    /// Re-run the startup probe (do not pin coefficients) after changing this
+    /// value so the cost model captures any new scratch-buffer overhead.
+    pub intra_threads: usize,
     /// Maximum number of input texts accepted in a single request.
     ///
     /// Set with `BGE_M3_MAX_BATCH`. Defaults to `256`. Minimum effective value is `1`.
@@ -134,6 +152,15 @@ pub struct Config {
     /// - `BGE_M3_COST_MODEL_A` and `BGE_M3_COST_MODEL_B` are both set with
     ///   `BGE_M3_AVAILABLE_MEMORY_BYTES` (full explicit override).
     pub cost_model_override: Option<CostModel>,
+    /// Interval (seconds) between periodic heartbeat log events.
+    ///
+    /// Set with `BGE_M3_HEARTBEAT_SECS`. Defaults to `60`.
+    /// Set to `0` to disable heartbeat logging entirely.
+    ///
+    /// Heartbeat events log RSS, live/loaded worker counts, queue depth,
+    /// available request permits, and current probe status — useful for
+    /// detecting slow memory leaks or queue saturation between requests.
+    pub heartbeat_secs: u64,
 }
 
 impl Config {
@@ -149,6 +176,11 @@ impl Config {
         let workers = lookup("BGE_M3_WORKERS")
             .and_then(|v| v.parse::<usize>().ok())
             .unwrap_or(2)
+            .max(1);
+
+        let intra_threads = lookup("BGE_M3_INTRA_THREADS")
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(1)
             .max(1);
 
         let max_batch = lookup("BGE_M3_MAX_BATCH")
@@ -209,16 +241,22 @@ impl Config {
             );
         }
 
+        let heartbeat_secs = lookup("BGE_M3_HEARTBEAT_SECS")
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(60);
+
         Self {
             cache_dir: lookup("BGE_M3_CACHE_DIR").unwrap_or_else(|| "/cache".to_string()),
             bind_addr: lookup("BGE_M3_BIND").unwrap_or_else(|| "0.0.0.0:8081".to_string()),
             workers,
+            intra_threads,
             max_batch,
             max_seq_length,
             idle_timeout,
             model_variant,
             memory_safety_factor,
             cost_model_override,
+            heartbeat_secs,
         }
     }
 }
@@ -306,6 +344,7 @@ mod tests {
         assert_eq!(cfg.cache_dir, "/cache");
         assert_eq!(cfg.bind_addr, "0.0.0.0:8081");
         assert_eq!(cfg.workers, 2);
+        assert_eq!(cfg.intra_threads, 1);
         assert_eq!(cfg.max_batch, 256);
         assert_eq!(cfg.max_seq_length, MODEL_MAX_SEQ);
         assert_eq!(cfg.idle_timeout, Some(Duration::from_secs(300)));
@@ -315,6 +354,7 @@ mod tests {
             cfg.cost_model_override.is_none(),
             "probe should run by default"
         );
+        assert_eq!(cfg.heartbeat_secs, 60);
     }
 
     #[test]
@@ -322,6 +362,34 @@ mod tests {
         let map = HashMap::from([("BGE_M3_WORKERS", "0")]);
         let cfg = Config::from_lookup(lookup_from(&map));
         assert_eq!(cfg.workers, 1);
+    }
+
+    #[test]
+    fn intra_threads_defaults_to_1() {
+        let map = HashMap::new();
+        let cfg = Config::from_lookup(lookup_from(&map));
+        assert_eq!(cfg.intra_threads, 1);
+    }
+
+    #[test]
+    fn intra_threads_custom_value() {
+        let map = HashMap::from([("BGE_M3_INTRA_THREADS", "4")]);
+        let cfg = Config::from_lookup(lookup_from(&map));
+        assert_eq!(cfg.intra_threads, 4);
+    }
+
+    #[test]
+    fn intra_threads_clamps_to_minimum_1() {
+        let map = HashMap::from([("BGE_M3_INTRA_THREADS", "0")]);
+        let cfg = Config::from_lookup(lookup_from(&map));
+        assert_eq!(cfg.intra_threads, 1);
+    }
+
+    #[test]
+    fn intra_threads_invalid_falls_back_to_default() {
+        let map = HashMap::from([("BGE_M3_INTRA_THREADS", "not_a_number")]);
+        let cfg = Config::from_lookup(lookup_from(&map));
+        assert_eq!(cfg.intra_threads, 1);
     }
 
     #[test]
@@ -463,5 +531,36 @@ mod tests {
         assert_eq!(ModelVariant::Fp32.to_string(), "fp32");
         assert_eq!(ModelVariant::Fp16.to_string(), "fp16");
         assert_eq!(ModelVariant::Int8.to_string(), "int8");
+    }
+
+    #[test]
+    fn heartbeat_secs_defaults_to_60() {
+        let map = HashMap::new();
+        let cfg = Config::from_lookup(lookup_from(&map));
+        assert_eq!(cfg.heartbeat_secs, 60);
+    }
+
+    #[test]
+    fn heartbeat_secs_custom_value() {
+        let map = HashMap::from([("BGE_M3_HEARTBEAT_SECS", "120")]);
+        let cfg = Config::from_lookup(lookup_from(&map));
+        assert_eq!(cfg.heartbeat_secs, 120);
+    }
+
+    #[test]
+    fn heartbeat_secs_disabled_when_zero() {
+        let map = HashMap::from([("BGE_M3_HEARTBEAT_SECS", "0")]);
+        let cfg = Config::from_lookup(lookup_from(&map));
+        assert_eq!(cfg.heartbeat_secs, 0);
+    }
+
+    #[test]
+    fn heartbeat_secs_invalid_falls_back_to_default() {
+        let map = HashMap::from([("BGE_M3_HEARTBEAT_SECS", "not_a_number")]);
+        let cfg = Config::from_lookup(lookup_from(&map));
+        assert_eq!(
+            cfg.heartbeat_secs, 60,
+            "invalid value should fall back to default"
+        );
     }
 }

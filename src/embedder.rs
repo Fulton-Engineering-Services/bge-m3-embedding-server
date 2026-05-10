@@ -2,6 +2,7 @@ use crate::binpack::{bin_pack, CostModel};
 use crate::config::ModelVariant;
 use crate::sysinfo;
 use anyhow::Result;
+use arc_swap::ArcSwap;
 use ndarray::ArrayView1;
 use ort::value::TensorRef;
 use std::collections::HashMap;
@@ -39,19 +40,47 @@ pub struct SparseEmbedding {
     pub values: Vec<f32>,
 }
 
+/// Paired dense + sparse embeddings produced from a single forward pass.
+#[derive(Debug, Clone)]
+pub struct DualEmbedding {
+    pub dense: Vec<f32>,
+    pub sparse: SparseEmbedding,
+}
+
 /// OS headroom reserved for kernel, stack, ORT arena, and other non-model
 /// allocations. Subtracted from available memory before computing
 /// per-worker workspace.
 pub(crate) const OS_HEADROOM_BYTES: usize = 256 * 1024 * 1024; // 256 MiB
 
+/// Per-request diagnostic statistics captured inside the worker and forwarded
+/// to the handler layer for inclusion in the completion log event.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct EmbedStats {
+    /// Number of bin-packed chunks the batch was split into.
+    pub chunks: usize,
+    /// Maximum tokenized sequence length across all chunks.
+    pub max_chunk_seq: usize,
+    /// Total token-positions processed (sum of `seq_len` for all inputs).
+    pub total_token_positions: usize,
+    /// Time spent tokenizing all inputs (milliseconds).
+    pub tokenize_ms: u64,
+    /// Total time spent in ORT `session.run()` across all chunks (milliseconds).
+    pub inference_ms: u64,
+}
+
 pub enum EmbedRequest {
     Dense {
         texts: Vec<String>,
-        reply: oneshot::Sender<Result<Vec<Vec<f32>>>>,
+        reply: oneshot::Sender<Result<(Vec<Vec<f32>>, EmbedStats)>>,
     },
     Sparse {
         texts: Vec<String>,
-        reply: oneshot::Sender<Result<Vec<SparseEmbedding>>>,
+        reply: oneshot::Sender<Result<(Vec<SparseEmbedding>, EmbedStats)>>,
+    },
+    /// Computes dense and sparse embeddings from a single forward pass per chunk.
+    Both {
+        texts: Vec<String>,
+        reply: oneshot::Sender<Result<(Vec<DualEmbedding>, EmbedStats)>>,
     },
     /// Internal: used during startup probe to run a single batch and measure
     /// peak RSS delta. Workers only process this before `ready` is set.
@@ -94,7 +123,26 @@ struct ModelFiles {
     tokenizer_path: PathBuf,
 }
 
-/// Downloads BGE-M3 model files from Hugging Face Hub (or returns cached paths).
+/// Returns `true` when the primary ONNX model file already exists in the
+/// hf-hub snapshot cache, meaning `repo.get()` will return immediately
+/// without fetching from the network.
+///
+/// hf-hub 0.5.x layout when constructed with `ApiBuilder::with_cache_dir(p)`:
+/// `{p}/models--{owner}--{name}/snapshots/{revision}/{filename}`
+///
+/// Note: this differs from Python `huggingface_hub`, which appends a `hub/`
+/// segment when `HF_HOME` is set. The Rust crate treats `with_cache_dir`
+/// as `HF_HUB_CACHE` directly — no `hub/` subdirectory is added.
+fn is_model_cached(cache_dir: &Path, repo_id: &str, revision: &str, onnx_filename: &str) -> bool {
+    let repo_dir = format!("models--{}", repo_id.replace('/', "--"));
+    cache_dir
+        .join(repo_dir)
+        .join("snapshots")
+        .join(revision)
+        .join(onnx_filename)
+        .exists()
+}
+
 fn download_model_files(
     cache_dir: &Path,
     show_progress: bool,
@@ -104,6 +152,31 @@ fn download_model_files(
         ModelVariant::Fp32 => (REPO_ID, REPO_REVISION),
         ModelVariant::Fp16 | ModelVariant::Int8 => (XENOVA_REPO_ID, XENOVA_REPO_REVISION),
     };
+
+    // Check the hf-hub snapshot directory for the primary ONNX file before
+    // touching the network.  This lets us log a clear "from cache" message
+    // rather than silence while hf-hub resolves files.
+    let onnx_filename = match variant {
+        ModelVariant::Fp32 => "onnx/model.onnx",
+        ModelVariant::Fp16 => "onnx/model_fp16.onnx",
+        ModelVariant::Int8 => "onnx/model_int8.onnx",
+    };
+    let cached = is_model_cached(cache_dir, repo_id, repo_revision, onnx_filename);
+    if cached {
+        info!(
+            repo_id,
+            revision = repo_revision,
+            model_variant = %variant,
+            "Model files found in local cache — no download needed"
+        );
+    } else {
+        info!(
+            repo_id,
+            revision = repo_revision,
+            model_variant = %variant,
+            "Model files not in local cache — downloading from HuggingFace Hub"
+        );
+    }
 
     let api = hf_hub::api::sync::ApiBuilder::new()
         .with_cache_dir(cache_dir.to_path_buf())
@@ -168,9 +241,16 @@ fn load_tokenizer(tokenizer_path: &Path, max_seq_length: usize) -> Result<tokeni
 }
 
 /// Builds an ORT session from the ONNX model file with the given execution providers.
+///
+/// `intra_threads` controls intra-op parallelism for matmul / attention kernels
+/// inside a single `session.run()` call. The default (`1`) keeps per-worker RSS
+/// predictable for the workspace probe; raise it to `floor(num_cpus / workers)`
+/// on under-utilized hosts to recover CPU headroom. See
+/// [`crate::config::Config::intra_threads`] for the operator-facing knob.
 fn load_session(
     model_path: &Path,
     eps: Vec<ort::ep::ExecutionProviderDispatch>,
+    intra_threads: usize,
 ) -> Result<ort::session::Session> {
     let mut builder = ort::session::Session::builder().map_err(ort_err)?;
     if !eps.is_empty() {
@@ -179,7 +259,7 @@ fn load_session(
     let session = builder
         .with_optimization_level(ort::session::builder::GraphOptimizationLevel::Level3)
         .map_err(ort_err)?
-        .with_intra_threads(1)
+        .with_intra_threads(intra_threads.max(1))
         .map_err(ort_err)?
         .commit_from_file(model_path)
         .map_err(ort_err)?;
@@ -307,16 +387,22 @@ fn embed_dense(
     texts: &[String],
     cost_model: &CostModel,
     model_variant: ModelVariant,
-) -> Result<Vec<Vec<f32>>> {
+) -> Result<(Vec<Vec<f32>>, EmbedStats)> {
+    let tokenize_start = std::time::Instant::now();
     let encodings = tokenize_no_pad(tokenizer, texts)?;
     let seq_lens: Vec<usize> = encodings.iter().map(|e| e.get_ids().len()).collect();
+    let tokenize_ms = u64::try_from(tokenize_start.elapsed().as_millis()).unwrap_or(u64::MAX);
 
+    let total_token_positions: usize = seq_lens.iter().sum();
     let chunks = bin_pack(&seq_lens, cost_model);
 
     // Pre-allocate output slots (one per input text, filled below).
     let mut all_embeddings: Vec<Vec<f32>> = (0..texts.len()).map(|_| Vec::new()).collect();
 
-    for chunk_indices in &chunks {
+    let mut max_chunk_seq: usize = 0;
+    let mut inference_ms: u64 = 0;
+
+    for (chunk_idx, chunk_indices) in chunks.iter().enumerate() {
         let chunk_max = chunk_indices
             .iter()
             .map(|&i| seq_lens[i])
@@ -324,18 +410,39 @@ fn embed_dense(
             .unwrap_or(1)
             .max(1); // guard: at least 1 to avoid 0-dim tensors
 
+        max_chunk_seq = max_chunk_seq.max(chunk_max);
+
         let (ids_array, mask_array) = build_chunk_arrays(&encodings, chunk_indices, chunk_max)?;
         let batch_len = ids_array.nrows();
 
         let ids_tensor = TensorRef::from_array_view(ids_array.view()).map_err(ort_err)?;
         let mask_tensor = TensorRef::from_array_view(mask_array.view()).map_err(ort_err)?;
 
-        let outputs = session
-            .run(ort::inputs! {
-                "input_ids" => ids_tensor,
-                "attention_mask" => mask_tensor,
-            })
-            .map_err(ort_err)?;
+        let chunk_start = std::time::Instant::now();
+        let outputs = {
+            let _span = tracing::debug_span!(
+                "chunk",
+                chunk_idx,
+                batch = chunk_indices.len(),
+                max_seq = chunk_max
+            )
+            .entered();
+            session
+                .run(ort::inputs! {
+                    "input_ids" => ids_tensor,
+                    "attention_mask" => mask_tensor,
+                })
+                .map_err(ort_err)?
+        };
+        let chunk_ms = u64::try_from(chunk_start.elapsed().as_millis()).unwrap_or(u64::MAX);
+        inference_ms = inference_ms.saturating_add(chunk_ms);
+        tracing::debug!(
+            chunk_idx,
+            batch = chunk_indices.len(),
+            max_seq = chunk_max,
+            elapsed_ms = chunk_ms,
+            "dense chunk inference complete"
+        );
 
         // FP32: sentence_embedding [batch, 1024] — pre-pooled CLS output.
         // FP16/INT8: last_hidden_state [batch, seq, 1024] — CLS token at position 0.
@@ -364,7 +471,15 @@ fn embed_dense(
         }
     }
 
-    Ok(all_embeddings)
+    let stats = EmbedStats {
+        chunks: chunks.len(),
+        max_chunk_seq,
+        total_token_positions,
+        tokenize_ms,
+        inference_ms,
+    };
+
+    Ok((all_embeddings, stats))
 }
 
 /// Produces sparse embeddings via the BGE-M3 sparse-linear projection.
@@ -378,18 +493,24 @@ fn embed_sparse(
     texts: &[String],
     cost_model: &CostModel,
     model_variant: ModelVariant,
-) -> Result<Vec<SparseEmbedding>> {
+) -> Result<(Vec<SparseEmbedding>, EmbedStats)> {
     let (weight, bias) = crate::weights::sparse_linear();
     let weight_view = weight.view();
 
+    let tokenize_start = std::time::Instant::now();
     let encodings = tokenize_no_pad(tokenizer, texts)?;
     let seq_lens: Vec<usize> = encodings.iter().map(|e| e.get_ids().len()).collect();
+    let tokenize_ms = u64::try_from(tokenize_start.elapsed().as_millis()).unwrap_or(u64::MAX);
 
+    let total_token_positions: usize = seq_lens.iter().sum();
     let chunks = bin_pack(&seq_lens, cost_model);
 
     let mut all_sparse: Vec<Option<SparseEmbedding>> = (0..texts.len()).map(|_| None).collect();
 
-    for chunk_indices in &chunks {
+    let mut max_chunk_seq: usize = 0;
+    let mut inference_ms: u64 = 0;
+
+    for (chunk_idx, chunk_indices) in chunks.iter().enumerate() {
         let chunk_max = chunk_indices
             .iter()
             .map(|&i| seq_lens[i])
@@ -397,17 +518,38 @@ fn embed_sparse(
             .unwrap_or(1)
             .max(1);
 
+        max_chunk_seq = max_chunk_seq.max(chunk_max);
+
         let (ids_array, mask_array) = build_chunk_arrays(&encodings, chunk_indices, chunk_max)?;
 
         let ids_tensor = TensorRef::from_array_view(ids_array.view()).map_err(ort_err)?;
         let mask_tensor = TensorRef::from_array_view(mask_array.view()).map_err(ort_err)?;
 
-        let outputs = session
-            .run(ort::inputs! {
-                "input_ids" => ids_tensor,
-                "attention_mask" => mask_tensor,
-            })
-            .map_err(ort_err)?;
+        let chunk_start = std::time::Instant::now();
+        let outputs = {
+            let _span = tracing::debug_span!(
+                "chunk",
+                chunk_idx,
+                batch = chunk_indices.len(),
+                max_seq = chunk_max
+            )
+            .entered();
+            session
+                .run(ort::inputs! {
+                    "input_ids" => ids_tensor,
+                    "attention_mask" => mask_tensor,
+                })
+                .map_err(ort_err)?
+        };
+        let chunk_ms = u64::try_from(chunk_start.elapsed().as_millis()).unwrap_or(u64::MAX);
+        inference_ms = inference_ms.saturating_add(chunk_ms);
+        tracing::debug!(
+            chunk_idx,
+            batch = chunk_indices.len(),
+            max_seq = chunk_max,
+            elapsed_ms = chunk_ms,
+            "sparse chunk inference complete"
+        );
 
         // FP32: token_embeddings [batch, seq, 1024].
         // FP16/INT8: last_hidden_state [batch, seq, 1024] — same shape, different key.
@@ -441,10 +583,173 @@ fn embed_sparse(
         }
     }
 
-    Ok(all_sparse
-        .into_iter()
-        .map(|s| s.expect("every slot must be filled"))
-        .collect())
+    let stats = EmbedStats {
+        chunks: chunks.len(),
+        max_chunk_seq,
+        total_token_positions,
+        tokenize_ms,
+        inference_ms,
+    };
+
+    Ok((
+        all_sparse
+            .into_iter()
+            .map(|s| s.expect("every slot must be filled"))
+            .collect(),
+        stats,
+    ))
+}
+
+/// Produces paired dense + sparse embeddings using **one** `session.run()` per chunk.
+///
+/// Both projections are derived from the same forward pass:
+/// - **FP32**: extracts both `sentence_embedding` (dense) and `token_embeddings`
+///   (sparse base) from the model's dual outputs.
+/// - **FP16/INT8**: extracts dense from the CLS token (position 0) of
+///   `last_hidden_state`, and sparse from the full hidden states of the same
+///   tensor. This avoids a second forward pass.
+///
+/// Numerically equivalent to calling [`embed_dense`] and [`embed_sparse`]
+/// separately, within FP rounding tolerance.
+#[allow(clippy::cast_possible_truncation, clippy::too_many_lines)]
+fn embed_both(
+    session: &mut ort::session::Session,
+    tokenizer: &tokenizers::Tokenizer,
+    texts: &[String],
+    cost_model: &CostModel,
+    model_variant: ModelVariant,
+) -> Result<(Vec<DualEmbedding>, EmbedStats)> {
+    let (weight, bias) = crate::weights::sparse_linear();
+    let weight_view = weight.view();
+
+    let tokenize_start = std::time::Instant::now();
+    let encodings = tokenize_no_pad(tokenizer, texts)?;
+    let seq_lens: Vec<usize> = encodings.iter().map(|e| e.get_ids().len()).collect();
+    let tokenize_ms = u64::try_from(tokenize_start.elapsed().as_millis()).unwrap_or(u64::MAX);
+
+    let total_token_positions: usize = seq_lens.iter().sum();
+    let chunks = bin_pack(&seq_lens, cost_model);
+
+    let mut all_dual: Vec<Option<DualEmbedding>> = (0..texts.len()).map(|_| None).collect();
+
+    let mut max_chunk_seq: usize = 0;
+    let mut inference_ms: u64 = 0;
+
+    for (chunk_idx, chunk_indices) in chunks.iter().enumerate() {
+        let chunk_max = chunk_indices
+            .iter()
+            .map(|&i| seq_lens[i])
+            .max()
+            .unwrap_or(1)
+            .max(1);
+
+        max_chunk_seq = max_chunk_seq.max(chunk_max);
+
+        let (ids_array, mask_array) = build_chunk_arrays(&encodings, chunk_indices, chunk_max)?;
+
+        let ids_tensor = TensorRef::from_array_view(ids_array.view()).map_err(ort_err)?;
+        let mask_tensor = TensorRef::from_array_view(mask_array.view()).map_err(ort_err)?;
+
+        let chunk_start = std::time::Instant::now();
+        let outputs = {
+            let _span = tracing::debug_span!(
+                "chunk",
+                chunk_idx,
+                batch = chunk_indices.len(),
+                max_seq = chunk_max
+            )
+            .entered();
+            session
+                .run(ort::inputs! {
+                    "input_ids" => ids_tensor,
+                    "attention_mask" => mask_tensor,
+                })
+                .map_err(ort_err)?
+        };
+        let chunk_ms = u64::try_from(chunk_start.elapsed().as_millis()).unwrap_or(u64::MAX);
+        inference_ms = inference_ms.saturating_add(chunk_ms);
+        tracing::debug!(
+            chunk_idx,
+            batch = chunk_indices.len(),
+            max_seq = chunk_max,
+            elapsed_ms = chunk_ms,
+            "both chunk inference complete"
+        );
+
+        // Extract dense + token-level hidden states from the same outputs.
+        // FP32: separate sentence_embedding + token_embeddings outputs.
+        // FP16/INT8: derive dense (CLS) and sparse-base from last_hidden_state.
+        let (dense_emb, token_emb) = match model_variant {
+            ModelVariant::Fp32 => {
+                let dense = outputs["sentence_embedding"]
+                    .try_extract_array::<f32>()
+                    .map_err(ort_err)?
+                    .to_owned();
+                let tokens = outputs["token_embeddings"]
+                    .try_extract_array::<f32>()
+                    .map_err(ort_err)?
+                    .to_owned();
+                (dense, tokens)
+            }
+            ModelVariant::Fp16 | ModelVariant::Int8 => {
+                let lhs = outputs["last_hidden_state"]
+                    .try_extract_array::<f32>()
+                    .map_err(ort_err)?;
+                let dense = lhs.index_axis(ndarray::Axis(1), 0).to_owned();
+                let tokens = lhs.to_owned();
+                (dense, tokens)
+            }
+        };
+
+        for (chunk_pos, &orig_idx) in chunk_indices.iter().enumerate() {
+            // Dense: CLS row, L2-normalized.
+            let dense_row = dense_emb.index_axis(ndarray::Axis(0), chunk_pos);
+            let mut dense_vec = dense_row
+                .as_slice()
+                .expect("dense embedding should be contiguous")
+                .to_vec();
+            normalize_l2(&mut dense_vec);
+
+            // Sparse: project each token's hidden state, then max-pool.
+            let enc = &encodings[orig_idx];
+            let ids = enc.get_ids();
+            let mask = enc.get_attention_mask();
+            let batch_hidden = token_emb.index_axis(ndarray::Axis(0), chunk_pos);
+
+            let scores: Vec<f32> = (0..ids.len())
+                .map(|j| {
+                    let hidden = batch_hidden.index_axis(ndarray::Axis(0), j);
+                    let hidden_slice = hidden
+                        .as_slice()
+                        .expect("hidden state should be contiguous");
+                    sparse_project(hidden_slice, &weight_view, *bias)
+                })
+                .collect();
+
+            let (indices, values) = sparse_maxpool(ids, mask, &scores);
+
+            all_dual[orig_idx] = Some(DualEmbedding {
+                dense: dense_vec,
+                sparse: SparseEmbedding { indices, values },
+            });
+        }
+    }
+
+    let stats = EmbedStats {
+        chunks: chunks.len(),
+        max_chunk_seq,
+        total_token_positions,
+        tokenize_ms,
+        inference_ms,
+    };
+
+    Ok((
+        all_dual
+            .into_iter()
+            .map(|d| d.expect("every slot must be filled"))
+            .collect(),
+        stats,
+    ))
 }
 
 /// Runs a single `session.run()` for the probe, measuring RSS before and after.
@@ -514,11 +819,12 @@ fn load_models(
     show_download_progress: bool,
     model_variant: ModelVariant,
     max_seq_length: usize,
+    intra_threads: usize,
 ) -> Result<(ort::session::Session, tokenizers::Tokenizer)> {
     let files = download_model_files(cache_dir, show_download_progress, model_variant)?;
     let tokenizer = load_tokenizer(&files.tokenizer_path, max_seq_length)?;
     let eps = execution_providers(cache_dir);
-    let session = load_session(&files.onnx_path, eps)?;
+    let session = load_session(&files.onnx_path, eps, intra_threads)?;
     Ok((session, tokenizer))
 }
 
@@ -537,16 +843,29 @@ impl Drop for WorkerGuard {
 }
 
 /// Execution-policy configuration shared by all workers.
+///
+/// `cost_model` is an `Arc<ArcSwap<CostModel>>` so all workers share a single
+/// handle and the background probe can update the cost model atomically after
+/// fitting.  Each worker loads the current value lock-free at the start of
+/// every `session.run()` call via `config.cost_model.load()`.
 #[derive(Clone)]
 pub(crate) struct WorkerConfig {
     /// Quadratic-aware workspace cost model and per-worker budget.
-    pub cost_model: CostModel,
+    ///
+    /// Shared across all workers via `ArcSwap`.  The background probe updates
+    /// this handle once fitted coefficients are available; workers observe the
+    /// new model on their next request without any coordination or restart.
+    pub cost_model: Arc<ArcSwap<CostModel>>,
     /// Duration of inactivity before workers unload their model instances.
     pub idle_timeout: Option<Duration>,
     /// ONNX model variant to load (FP32, FP16, or INT8).
     pub model_variant: ModelVariant,
     /// Maximum tokenized sequence length.
     pub max_seq_length: usize,
+    /// Number of intra-op threads each ORT session may use for a single
+    /// `session.run()` call. Plumbed through to `load_session` at model load
+    /// time. See [`crate::config::Config::intra_threads`] for sizing guidance.
+    pub intra_threads: usize,
 }
 
 #[allow(clippy::needless_pass_by_value, clippy::too_many_lines)]
@@ -554,7 +873,7 @@ fn run_worker(
     id: usize,
     cache_dir: PathBuf,
     rx: Arc<Mutex<mpsc::Receiver<EmbedRequest>>>,
-    ready_tx: mpsc::Sender<Result<()>>,
+    ready_tx: mpsc::Sender<Result<usize>>,
     live_workers: Arc<AtomicUsize>,
     loaded_workers: Arc<AtomicUsize>,
     config: WorkerConfig,
@@ -566,15 +885,52 @@ fn run_worker(
     info!("Loading models (worker {id})...");
     let load_start = std::time::Instant::now();
     let rt = Handle::current();
+
+    // Measure RSS before loading so the delta accurately reflects this
+    // worker's model-weight + arena-baseline contribution, not accumulated
+    // OS noise.
+    let pre_load_rss = sysinfo::read_process_rss_bytes().unwrap_or(0);
     let initial_models = match load_models(
         &cache_dir,
         id == 0,
         config.model_variant,
         config.max_seq_length,
+        config.intra_threads,
     ) {
-        Ok(models) => {
+        Ok(mut models) => {
+            // Prime the ORT session arena with a tiny session.run() BEFORE
+            // measuring post-load RSS. ORT lazily allocates ~1 GiB of arena
+            // bookkeeping on the first run() call regardless of input size;
+            // priming here folds that allocation into the per-worker model
+            // RSS measurement so the workspace-budget math on the main thread
+            // sees the realistic per-worker memory footprint, AND so the
+            // probe sweep's per-shape `rss_delta` readings reflect only the
+            // incremental workspace attributable to that shape.
+            //
+            // Without per-worker priming, the probe could dispatch shapes to
+            // workers that have not yet done a session.run(), and each such
+            // first-touch contributes ~1 GiB of arena init noise to its
+            // delta — which buries the per-shape workspace signal in the
+            // OLS fit.
+            let prime_ids = ndarray::Array2::<i64>::zeros((1, 8));
+            let prime_mask = ndarray::Array2::<i64>::ones((1, 8));
+            match probe_run_dense(&mut models.0, &prime_ids, &prime_mask) {
+                Ok(_) => {
+                    tracing::debug!("Worker {id} arena primed");
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "Worker {id} arena prime failed; first probe shape on this \
+                         worker will include arena init delta"
+                    );
+                }
+            }
+
+            let post_load_rss = sysinfo::read_process_rss_bytes().unwrap_or(pre_load_rss);
             tracing::info!(
                 elapsed_ms = load_start.elapsed().as_millis(),
+                rss_delta_mb = post_load_rss.saturating_sub(pre_load_rss) / (1024 * 1024),
                 "Models loaded (worker {id})"
             );
             models
@@ -586,8 +942,15 @@ fn run_worker(
         }
     };
 
-    info!("Worker {id} models loaded — signaling ready");
-    let _ = rt.block_on(ready_tx.send(Ok(())));
+    // Report the RSS delta so EmbedPool can derive the true per-worker
+    // model footprint for workspace-budget calculations.
+    let post_load_rss = sysinfo::read_process_rss_bytes().unwrap_or(pre_load_rss);
+    let rss_delta = post_load_rss.saturating_sub(pre_load_rss);
+    info!(
+        "Worker {id} models loaded — signaling ready (rss_delta_mb={})",
+        rss_delta / (1024 * 1024)
+    );
+    let _ = rt.block_on(ready_tx.send(Ok(rss_delta)));
 
     let mut models: Option<(ort::session::Session, tokenizers::Tokenizer)> = Some(initial_models);
 
@@ -623,8 +986,22 @@ fn run_worker(
                         false,
                         config.model_variant,
                         config.max_seq_length,
+                        config.intra_threads,
                     ) {
-                        Ok(m) => {
+                        Ok(mut m) => {
+                            // Prime the freshly-loaded session arena so the
+                            // first incoming request after idle reload doesn't
+                            // pay the ~1 GiB lazy-arena-init cost. Same
+                            // rationale as the startup priming in the
+                            // load-models Ok arm above.
+                            let prime_ids = ndarray::Array2::<i64>::zeros((1, 8));
+                            let prime_mask = ndarray::Array2::<i64>::ones((1, 8));
+                            if let Err(e) = probe_run_dense(&mut m.0, &prime_ids, &prime_mask) {
+                                tracing::warn!(
+                                    error = %e,
+                                    "Worker {id} post-reload arena prime failed"
+                                );
+                            }
                             models = Some(m);
                             loaded_workers.fetch_add(1, Ordering::AcqRel);
                             tracing::info!(
@@ -642,6 +1019,9 @@ fn run_worker(
                                 EmbedRequest::Sparse { reply, .. } => {
                                     let _ = reply.send(Err(err));
                                 }
+                                EmbedRequest::Both { reply, .. } => {
+                                    let _ = reply.send(Err(err));
+                                }
                                 EmbedRequest::Probe { reply, .. } => {
                                     let _ = reply.send(Err(err));
                                 }
@@ -656,25 +1036,70 @@ fn run_worker(
 
                 match request {
                     EmbedRequest::Dense { texts, reply } => {
+                        // Load the current cost model snapshot for this request.
+                        // ArcSwap::load() is lock-free; the guard keeps the Arc
+                        // alive for the duration of embed_dense.
+                        let cm_guard = config.cost_model.load();
                         let result = embed_dense(
                             session,
                             tokenizer,
                             &texts,
-                            &config.cost_model,
+                            &cm_guard,
                             config.model_variant,
                         )
                         .map_err(|e| anyhow::anyhow!("Dense embed error: {e}"));
+                        if let Ok((_, ref stats)) = result {
+                            tracing::info!(
+                                worker_id = id,
+                                chunks = stats.chunks,
+                                max_chunk_seq = stats.max_chunk_seq,
+                                total_token_positions = stats.total_token_positions,
+                                tokenize_ms = stats.tokenize_ms,
+                                inference_ms = stats.inference_ms,
+                                "worker: dense embed complete"
+                            );
+                        }
                         let _ = reply.send(result);
                     }
                     EmbedRequest::Sparse { texts, reply } => {
+                        let cm_guard = config.cost_model.load();
                         let result = embed_sparse(
                             session,
                             tokenizer,
                             &texts,
-                            &config.cost_model,
+                            &cm_guard,
                             config.model_variant,
                         )
                         .map_err(|e| anyhow::anyhow!("Sparse embed error: {e}"));
+                        if let Ok((_, ref stats)) = result {
+                            tracing::info!(
+                                worker_id = id,
+                                chunks = stats.chunks,
+                                max_chunk_seq = stats.max_chunk_seq,
+                                total_token_positions = stats.total_token_positions,
+                                tokenize_ms = stats.tokenize_ms,
+                                inference_ms = stats.inference_ms,
+                                "worker: sparse embed complete"
+                            );
+                        }
+                        let _ = reply.send(result);
+                    }
+                    EmbedRequest::Both { texts, reply } => {
+                        let cm_guard = config.cost_model.load();
+                        let result =
+                            embed_both(session, tokenizer, &texts, &cm_guard, config.model_variant)
+                                .map_err(|e| anyhow::anyhow!("Dual embed error: {e}"));
+                        if let Ok((_, ref stats)) = result {
+                            tracing::info!(
+                                worker_id = id,
+                                chunks = stats.chunks,
+                                max_chunk_seq = stats.max_chunk_seq,
+                                total_token_positions = stats.total_token_positions,
+                                tokenize_ms = stats.tokenize_ms,
+                                inference_ms = stats.inference_ms,
+                                "worker: both embed complete"
+                            );
+                        }
                         let _ = reply.send(result);
                     }
                     EmbedRequest::Probe { texts, reply } => {
@@ -720,6 +1145,19 @@ pub struct EmbedPool {
     live_workers: Arc<AtomicUsize>,
     /// Number of workers that currently have model instances loaded in memory.
     loaded_workers: Arc<AtomicUsize>,
+    /// Median RSS delta (bytes) measured across all workers during sequential
+    /// model load.
+    ///
+    /// Workers load one at a time (leader first, then followers in sequence).
+    /// Each reports its own RSS before/after `load_models()` via `ready_tx`.
+    /// The pool stores the median once all workers have signaled ready — robust
+    /// to one outlier from page-cache settling or ORT arena init jitter.
+    ///
+    /// Used by `run_readiness_probe` to correctly deduct the model-weight
+    /// footprint from the available workspace before computing per-worker
+    /// budget. Returns `0` on non-Linux targets where RSS measurement is
+    /// unavailable, or before the init task has completed.
+    model_rss_per_worker_bytes: Arc<AtomicUsize>,
 }
 
 impl EmbedPool {
@@ -734,19 +1172,23 @@ impl EmbedPool {
         let (tx, rx) = mpsc::channel::<EmbedRequest>(capacity);
         let rx = Arc::new(Mutex::new(rx));
 
-        let (ready_tx, mut ready_rx) = mpsc::channel::<Result<()>>(n);
+        // Channel carries Result<usize> where the Ok variant is the RSS delta
+        // (bytes) measured by each worker around load_models().
+        let (ready_tx, mut ready_rx) = mpsc::channel::<Result<usize>>(n);
 
         let live_workers = Arc::new(AtomicUsize::new(n));
         let loaded_workers = Arc::new(AtomicUsize::new(0));
+        let model_rss_per_worker_bytes = Arc::new(AtomicUsize::new(0));
         let live_workers_for_init = Arc::clone(&live_workers);
         let loaded_workers_for_init = Arc::clone(&loaded_workers);
+        let model_rss_for_init = Arc::clone(&model_rss_per_worker_bytes);
 
         let init_handle = tokio::task::spawn(
             async move {
                 let mut worker_handles = Vec::with_capacity(n);
 
                 let spawn_worker = |id: usize,
-                                    ready_tx_clone: mpsc::Sender<Result<()>>,
+                                    ready_tx_clone: mpsc::Sender<Result<usize>>,
                                     worker_config: WorkerConfig|
                  -> JoinHandle<Result<()>> {
                     let rx_clone = Arc::clone(&rx);
@@ -766,13 +1208,23 @@ impl EmbedPool {
                     })
                 };
 
+                // Collect per-worker RSS deltas for median aggregation.
+                // Median is robust to one outlier from transient kernel snapshot
+                // quirk (page-cache settling, ORT arena init jitter) while still
+                // using all N independent measurements.
+                let mut rss_deltas: Vec<usize> = Vec::with_capacity(n);
+
                 // --- Phase 1: spawn leader worker (may download models) ---
                 worker_handles.push(spawn_worker(0, ready_tx.clone(), config.clone()));
 
                 match ready_rx.recv().await {
-                    Some(Ok(())) => {
+                    Some(Ok(delta)) => {
                         loaded_workers_for_init.fetch_add(1, Ordering::AcqRel);
-                        info!("Leader worker ready, model cache warm (1/{n})");
+                        rss_deltas.push(delta);
+                        info!(
+                            rss_delta_mb = delta / (1024 * 1024),
+                            "Leader worker ready, model cache warm (1/{n})"
+                        );
                     }
                     Some(Err(e)) => {
                         return Err(anyhow::anyhow!("Leader worker failed to load models: {e}"));
@@ -784,31 +1236,54 @@ impl EmbedPool {
                     }
                 }
 
-                // --- Phase 2: spawn follower workers (load from warm cache) ---
+                // --- Phase 2: spawn follower workers one at a time.
+                //
+                // Workers load sequentially: spawn one, await its ready signal,
+                // then spawn the next. This ensures each worker's RSS delta
+                // (pre/post load_models) reflects only that worker's ORT session
+                // allocation — not the cumulative effect of other workers loading
+                // in parallel. Parallel loading caused the 2026-05-09 measurement
+                // contamination bug: all followers read post_load_rss after most
+                // other sessions had already mmap'd, producing an inflated
+                // rss_delta ≈ N × model_size and driving per_worker_workspace to 0.
+                //
+                // Startup cost: ~4-6s per worker × 6 followers ≈ 24-36s total,
+                // well within the configured startPeriod (300s).
                 for id in 1..n {
                     worker_handles.push(spawn_worker(id, ready_tx.clone(), config.clone()));
-                }
 
-                drop(ready_tx);
-
-                for i in 1..n {
                     match ready_rx.recv().await {
-                        Some(Ok(())) => {
+                        Some(Ok(delta)) => {
                             loaded_workers_for_init.fetch_add(1, Ordering::AcqRel);
-                            info!("Follower worker signaled ready ({}/{n})", i + 1);
+                            rss_deltas.push(delta);
+                            info!(
+                                rss_delta_mb = delta / (1024 * 1024),
+                                "Follower worker signaled ready ({}/{n})",
+                                id + 1
+                            );
                         }
                         Some(Err(e)) => {
-                            return Err(anyhow::anyhow!("Worker failed to load models: {e}"));
+                            return Err(anyhow::anyhow!("Worker {id} failed to load models: {e}"));
                         }
                         None => {
                             return Err(anyhow::anyhow!(
-                                "Worker exited before signaling readiness (got {i}/{n})"
+                                "Worker {id} exited before signaling readiness ({id}/{n})"
                             ));
                         }
                     }
                 }
 
+                drop(ready_tx);
                 drop(worker_handles);
+
+                // Compute and store the median delta as the per-worker model footprint.
+                let median = median_usize(&mut rss_deltas);
+                model_rss_for_init.store(median, Ordering::Release);
+                info!(
+                    median_rss_mb = median / (1024 * 1024),
+                    samples = rss_deltas.len(),
+                    "All workers ready — per-worker model RSS median computed"
+                );
 
                 Ok(())
             }
@@ -820,12 +1295,13 @@ impl EmbedPool {
                 tx,
                 live_workers,
                 loaded_workers,
+                model_rss_per_worker_bytes,
             },
             init_handle,
         )
     }
 
-    pub async fn dense(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>> {
+    pub async fn dense(&self, texts: Vec<String>) -> Result<(Vec<Vec<f32>>, EmbedStats)> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.tx
             .send(EmbedRequest::Dense {
@@ -839,10 +1315,29 @@ impl EmbedPool {
             .map_err(|_| anyhow::anyhow!("Worker dropped reply sender"))?
     }
 
-    pub async fn sparse(&self, texts: Vec<String>) -> Result<Vec<SparseEmbedding>> {
+    pub async fn sparse(&self, texts: Vec<String>) -> Result<(Vec<SparseEmbedding>, EmbedStats)> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.tx
             .send(EmbedRequest::Sparse {
+                texts,
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|_| anyhow::anyhow!("EmbedPool channel closed"))?;
+        reply_rx
+            .await
+            .map_err(|_| anyhow::anyhow!("Worker dropped reply sender"))?
+    }
+
+    /// Runs a single forward pass that yields both dense and sparse embeddings.
+    ///
+    /// Equivalent to calling [`Self::dense`] and [`Self::sparse`] back-to-back,
+    /// but uses one `session.run()` per chunk instead of two — at near-zero
+    /// marginal GPU cost.
+    pub async fn both(&self, texts: Vec<String>) -> Result<(Vec<DualEmbedding>, EmbedStats)> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.tx
+            .send(EmbedRequest::Both {
                 texts,
                 reply: reply_tx,
             })
@@ -878,6 +1373,41 @@ impl EmbedPool {
     pub fn loaded_worker_count(&self) -> usize {
         self.loaded_workers.load(Ordering::Acquire)
     }
+
+    /// Returns the number of requests currently queued but not yet picked up
+    /// by a worker. Uses the channel's current vs max capacity.
+    #[must_use]
+    pub fn queue_depth(&self) -> usize {
+        self.tx.max_capacity().saturating_sub(self.tx.capacity())
+    }
+
+    /// Returns the median RSS delta (bytes) measured across all workers during
+    /// sequential model load.
+    ///
+    /// This is the per-worker model-weight footprint used by
+    /// `run_readiness_probe` to compute the per-worker workspace budget.
+    /// Returns `0` on non-Linux targets where RSS measurement is unavailable,
+    /// or before the init task has completed.
+    #[must_use]
+    pub fn model_rss_per_worker_bytes(&self) -> usize {
+        self.model_rss_per_worker_bytes.load(Ordering::Acquire)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Aggregation helpers
+// ---------------------------------------------------------------------------
+
+/// Computes the median of a `Vec<usize>` in-place (sorts the slice).
+///
+/// Returns `0` for empty input. For even-length inputs returns the lower
+/// of the two middle elements (no floating-point required).
+fn median_usize(values: &mut [usize]) -> usize {
+    if values.is_empty() {
+        return 0;
+    }
+    values.sort_unstable();
+    values[values.len() / 2]
 }
 
 // ---------------------------------------------------------------------------
@@ -893,6 +1423,7 @@ impl EmbedPool {
             tx,
             live_workers: Arc::new(AtomicUsize::new(0)),
             loaded_workers: Arc::new(AtomicUsize::new(0)),
+            model_rss_per_worker_bytes: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -903,14 +1434,30 @@ impl EmbedPool {
         let (tx, mut rx) = mpsc::channel::<EmbedRequest>(8);
         let dense = Arc::new(dense_fixture);
         let sparse = Arc::new(sparse_fixture);
+        let dense_both = Arc::clone(&dense);
+        let sparse_both = Arc::clone(&sparse);
         tokio::spawn(async move {
             while let Some(req) = rx.recv().await {
                 match req {
                     EmbedRequest::Dense { reply, .. } => {
-                        let _ = reply.send(Ok((*dense).clone()));
+                        let _ = reply.send(Ok(((*dense).clone(), EmbedStats::default())));
                     }
                     EmbedRequest::Sparse { reply, .. } => {
-                        let _ = reply.send(Ok((*sparse).clone()));
+                        let _ = reply.send(Ok(((*sparse).clone(), EmbedStats::default())));
+                    }
+                    EmbedRequest::Both { reply, .. } => {
+                        // Pair dense_fixture[i] with sparse_fixture[i] elementwise.
+                        // Truncate to the shorter of the two so the test fixture is
+                        // self-consistent.
+                        let pairs: Vec<DualEmbedding> = dense_both
+                            .iter()
+                            .zip(sparse_both.iter())
+                            .map(|(d, s)| DualEmbedding {
+                                dense: d.clone(),
+                                sparse: s.clone(),
+                            })
+                            .collect();
+                        let _ = reply.send(Ok((pairs, EmbedStats::default())));
                     }
                     EmbedRequest::Probe { reply, .. } => {
                         let _ = reply.send(Ok(ProbeResult {
@@ -925,6 +1472,7 @@ impl EmbedPool {
             tx,
             live_workers: Arc::new(AtomicUsize::new(1)),
             loaded_workers: Arc::new(AtomicUsize::new(1)),
+            model_rss_per_worker_bytes: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -934,7 +1482,16 @@ impl EmbedPool {
             tx,
             live_workers: Arc::new(AtomicUsize::new(1)),
             loaded_workers: Arc::new(AtomicUsize::new(0)),
+            model_rss_per_worker_bytes: Arc::new(AtomicUsize::new(0)),
         }
+    }
+
+    /// Returns the raw `Arc<AtomicUsize>` backing `model_rss_per_worker_bytes`.
+    ///
+    /// Test-only; allows injecting a specific value to assert aggregation logic
+    /// without running actual model loads.
+    pub(crate) fn model_rss_per_worker_bytes_atomic(&self) -> Arc<AtomicUsize> {
+        Arc::clone(&self.model_rss_per_worker_bytes)
     }
 }
 
@@ -951,8 +1508,10 @@ mod tests {
         PathBuf::from("/dev/null/impossible")
     }
 
-    fn test_cost_model() -> CostModel {
-        CostModel::conservative(CostModel::DEFAULT_MAX_WORKSPACE)
+    fn test_cost_model_handle() -> Arc<ArcSwap<CostModel>> {
+        Arc::new(ArcSwap::from_pointee(CostModel::conservative(
+            CostModel::DEFAULT_MAX_WORKSPACE,
+        )))
     }
 
     #[tokio::test]
@@ -961,10 +1520,11 @@ mod tests {
             1,
             bad_cache_dir(),
             WorkerConfig {
-                cost_model: test_cost_model(),
+                cost_model: test_cost_model_handle(),
                 idle_timeout: None,
                 model_variant: crate::config::ModelVariant::Fp32,
                 max_seq_length: 512,
+                intra_threads: 1,
             },
         );
 
@@ -992,10 +1552,11 @@ mod tests {
             3,
             bad_cache_dir(),
             WorkerConfig {
-                cost_model: test_cost_model(),
+                cost_model: test_cost_model_handle(),
                 idle_timeout: None,
                 model_variant: crate::config::ModelVariant::Fp32,
                 max_seq_length: 512,
+                intra_threads: 1,
             },
         );
 
@@ -1027,6 +1588,39 @@ mod tests {
         assert!(err.to_string().contains("channel closed"));
     }
 
+    #[tokio::test]
+    async fn both_returns_error_when_channel_closed() {
+        let pool = EmbedPool::closed_for_test();
+        let result = pool.both(vec!["hello".into()]).await;
+        let err = result.expect_err("expected an error");
+        assert!(err.to_string().contains("channel closed"));
+    }
+
+    #[tokio::test]
+    async fn both_returns_paired_dense_and_sparse_from_fixture() {
+        let dense_fixture = vec![vec![0.1f32, 0.2, 0.3], vec![0.4, 0.5, 0.6]];
+        let sparse_fixture = vec![
+            SparseEmbedding {
+                indices: vec![10],
+                values: vec![0.7],
+            },
+            SparseEmbedding {
+                indices: vec![20, 30],
+                values: vec![0.8, 0.9],
+            },
+        ];
+        let pool = EmbedPool::with_fixed_responses(dense_fixture.clone(), sparse_fixture.clone());
+        let (result, _stats) = pool
+            .both(vec!["a".into(), "b".into()])
+            .await
+            .expect("both should succeed against fixture pool");
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].dense, dense_fixture[0]);
+        assert_eq!(result[1].dense, dense_fixture[1]);
+        assert_eq!(result[0].sparse.indices, sparse_fixture[0].indices);
+        assert_eq!(result[1].sparse.indices, sparse_fixture[1].indices);
+    }
+
     #[test]
     fn live_worker_count_returns_zero_for_closed_pool() {
         let pool = EmbedPool::closed_for_test();
@@ -1044,6 +1638,16 @@ mod tests {
         let pool = EmbedPool::idle_for_test();
         assert_eq!(pool.live_worker_count(), 1);
         assert_eq!(pool.loaded_worker_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn model_rss_per_worker_bytes_returns_zero_for_test_pool() {
+        // Test helpers initialize model_rss_per_worker_bytes to 0 since no real
+        // load_models() runs; the getter must reflect that.
+        let pool = EmbedPool::closed_for_test();
+        assert_eq!(pool.model_rss_per_worker_bytes(), 0);
+        let pool2 = EmbedPool::with_fixed_responses(vec![], vec![]);
+        assert_eq!(pool2.model_rss_per_worker_bytes(), 0);
     }
 
     // -----------------------------------------------------------------------
@@ -1316,5 +1920,118 @@ mod tests {
             .filter_map(|s| s.get("texts").and_then(|t| t.as_array()).map(Vec::len))
             .sum();
         assert_eq!(total, 184, "total corpus texts should be 184");
+    }
+
+    // -----------------------------------------------------------------------
+    // EmbedStats and queue_depth
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn embed_stats_default_is_all_zero() {
+        let stats = EmbedStats::default();
+        assert_eq!(stats.chunks, 0);
+        assert_eq!(stats.max_chunk_seq, 0);
+        assert_eq!(stats.total_token_positions, 0);
+        assert_eq!(stats.tokenize_ms, 0);
+        assert_eq!(stats.inference_ms, 0);
+    }
+
+    #[tokio::test]
+    async fn fixture_pool_returns_default_embed_stats() {
+        let pool = EmbedPool::with_fixed_responses(vec![vec![0.1f32]], vec![]);
+        let (_embeddings, stats) = pool
+            .dense(vec!["hello".into()])
+            .await
+            .expect("fixture pool should succeed");
+        // Fixture always returns EmbedStats::default() — all zero.
+        assert_eq!(
+            stats.chunks, 0,
+            "fixture pool stats should be default zeros"
+        );
+        assert_eq!(stats.inference_ms, 0);
+    }
+
+    #[tokio::test]
+    async fn queue_depth_is_zero_when_idle() {
+        let pool = EmbedPool::with_fixed_responses(vec![], vec![]);
+        // No requests in flight — queue should be empty.
+        assert_eq!(pool.queue_depth(), 0);
+    }
+
+    #[test]
+    fn queue_depth_is_zero_for_closed_pool() {
+        let pool = EmbedPool::closed_for_test();
+        // Closed pool has a dropped receiver; capacity reports max - 0 pending = 0.
+        assert_eq!(pool.queue_depth(), 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // median_usize
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn median_usize_empty_returns_zero() {
+        let mut v: Vec<usize> = vec![];
+        assert_eq!(median_usize(&mut v), 0);
+    }
+
+    #[test]
+    fn median_usize_single_element() {
+        let mut v = vec![42usize];
+        assert_eq!(median_usize(&mut v), 42);
+    }
+
+    #[test]
+    fn median_usize_odd_count() {
+        let mut v = vec![3usize, 1, 2];
+        assert_eq!(median_usize(&mut v), 2);
+    }
+
+    #[test]
+    fn median_usize_even_count_returns_lower_middle() {
+        // For even-length: returns the lower of the two middle elements.
+        let mut v = vec![1usize, 3, 5, 7];
+        // sorted: [1, 3, 5, 7]; len/2 = 2 → v[2] = 5
+        assert_eq!(median_usize(&mut v), 5);
+    }
+
+    #[test]
+    fn median_usize_outlier_does_not_inflate_result() {
+        // Simulates the production scenario: 5 clean readings ~1100 MB
+        // and one contaminated reading at 8459 MB (parallel-load artifact).
+        // Before the fix, fetch_max returned 8459; median returns 1100.
+        let mut v = vec![
+            1_100usize * 1024 * 1024,
+            1_080usize * 1024 * 1024,
+            1_100usize * 1024 * 1024,
+            8_459usize * 1024 * 1024, // outlier
+            1_090usize * 1024 * 1024,
+        ];
+        let median = median_usize(&mut v);
+        // sorted: [1080, 1090, 1100, 1100, 8459]; len/2 = 2 → v[2] = 1100 MiB
+        assert_eq!(median, 1_100 * 1024 * 1024);
+        assert!(
+            median < 2_000 * 1024 * 1024,
+            "median ({} MiB) should be nowhere near the outlier (8459 MiB)",
+            median / (1024 * 1024)
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // model_rss_per_worker_bytes accessor
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn model_rss_per_worker_bytes_defaults_to_zero() {
+        let pool = EmbedPool::closed_for_test();
+        assert_eq!(pool.model_rss_per_worker_bytes(), 0);
+    }
+
+    #[test]
+    fn model_rss_per_worker_bytes_reflects_stored_value() {
+        let pool = EmbedPool::closed_for_test();
+        let atomic = pool.model_rss_per_worker_bytes_atomic();
+        atomic.store(1_234_567, Ordering::Release);
+        assert_eq!(pool.model_rss_per_worker_bytes(), 1_234_567);
     }
 }

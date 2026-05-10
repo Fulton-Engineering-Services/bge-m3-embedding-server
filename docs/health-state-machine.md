@@ -96,8 +96,12 @@ derives the state — there is no cached status that can go stale.
 
 ### ok — Fully operational
 
-When ready, the response also includes `max_seq_length` and the `tuning` object
-derived at startup (null if the probe has not yet run or was skipped):
+When ready, the response includes `max_seq_length` and the `tuning` object.
+The `tuning` block is **always present** once the server is ready — it is written
+to `AppState` immediately after memory detection completes, before the background
+probe starts. The cost-model fields (`a_bytes_per_token`, `b_bytes_per_token_sq`,
+`max_workspace_bytes`) reflect live values from the `ArcSwap<CostModel>` and
+update atomically when the probe finishes.
 
 ```json
 {
@@ -107,13 +111,30 @@ derived at startup (null if the probe has not yet run or was skipped):
   "tuning": {
     "a_bytes_per_token": 18432.0,
     "b_bytes_per_token_sq": 6.2,
-    "max_workspace_bytes": 2500000000,
+    "max_workspace_bytes": 2044000000,
+    "probe_status": "complete",
     "memory_source": "cgroup_v2",
     "available_bytes": 28991029248,
-    "model_rss_bytes_per_worker": 1100000000
+    "model_rss_bytes_per_worker": 1100000000,
+    "worst_case_peak_bytes": 21533073408,
+    "utilization_pct": 74.3
   }
 }
 ```
+
+| `tuning` field | Meaning |
+|----------------|---------|
+| `a_bytes_per_token` | Fitted linear coefficient (FFN term); updates after probe completes. |
+| `b_bytes_per_token_sq` | Fitted quadratic coefficient (attention term); updates after probe completes. |
+| `max_workspace_bytes` | Per-worker bin-packing budget. |
+| `probe_status` | `running` while probe is in progress, then `complete`, `cache_hit`, `failed`, or `disabled`. |
+| `memory_source` | How available memory was detected (`cgroup_v2`, `cgroup_v1`, `proc_meminfo`, `host_ram`). |
+| `available_bytes` | Total container memory visible to the server. |
+| `model_rss_bytes_per_worker` | Peak RSS delta measured by each worker during model load; used in the budget formula. |
+| `worst_case_peak_bytes` | `N×workspace + N×model_rss + OS_HEADROOM`; must be below `available_bytes`. |
+| `utilization_pct` | `worst_case_peak / available × 100`; a startup `WARN` fires if > 90%. |
+
+While `probe_status` is `running`, `a_bytes_per_token` / `b_bytes_per_token_sq` reflect conservative defaults until the probe finishes. The bin-packer operates safely but may pack fewer texts per chunk than the fitted model would allow.
 
 ### idle — Models unloaded after timeout
 

@@ -91,6 +91,35 @@ pub struct SparseValues {
 }
 
 // ---------------------------------------------------------------------------
+// Dual embedding types (single forward pass yielding both dense and sparse)
+// ---------------------------------------------------------------------------
+
+/// Request body for the unified dense + sparse embeddings endpoint.
+#[derive(Debug, Deserialize)]
+pub struct DualRequest {
+    pub input: TextInput,
+    /// Accepted for `OpenAI` API compatibility; always uses BGE-M3.
+    pub model: Option<String>,
+}
+
+/// Top-level response for the unified dense + sparse embeddings endpoint.
+#[derive(Debug, Serialize)]
+pub struct DualResponse {
+    pub object: &'static str,
+    pub model: &'static str,
+    pub data: Vec<DualEmbeddingData>,
+    pub usage: Usage,
+}
+
+/// Per-document paired dense + sparse embedding entry.
+#[derive(Debug, Serialize)]
+pub struct DualEmbeddingData {
+    pub index: usize,
+    pub embedding: Vec<f32>,
+    pub sparse_values: SparseValues,
+}
+
+// ---------------------------------------------------------------------------
 // Models list types
 // ---------------------------------------------------------------------------
 
@@ -264,6 +293,48 @@ mod tests {
             let input: TextInput = serde_json::from_str(json).expect("empty array should deserialize");
             prop_assert_eq!(input.0.len(), 0);
         }
+    }
+
+    #[test]
+    fn dual_response_serializes_with_paired_dense_and_sparse() {
+        let response = DualResponse {
+            object: "list",
+            model: "bge-m3",
+            data: vec![DualEmbeddingData {
+                index: 0,
+                embedding: vec![0.1, 0.2, 0.3],
+                sparse_values: SparseValues {
+                    indices: vec![42, 100],
+                    values: vec![0.5, 0.8],
+                },
+            }],
+            usage: Usage {
+                prompt_tokens: 5,
+                total_tokens: 5,
+            },
+        };
+
+        let json = serde_json::to_value(&response).expect("serialize dual response");
+        assert_eq!(json["object"], "list");
+        assert_eq!(json["model"], "bge-m3");
+        assert_eq!(json["data"][0]["index"], 0);
+        assert_eq!(json["data"][0]["embedding"][0], 0.1_f32);
+        assert_eq!(json["data"][0]["sparse_values"]["indices"][0], 42);
+        assert_eq!(json["data"][0]["sparse_values"]["values"][1], 0.8_f32);
+        assert_eq!(json["usage"]["prompt_tokens"], 5);
+    }
+
+    #[test]
+    fn dual_request_model_is_optional() {
+        let with_model = r#"{"input": "hello", "model": "bge-m3"}"#;
+        let req: DualRequest = serde_json::from_str(with_model).expect("deserialize with model");
+        assert_eq!(req.model.as_deref(), Some("bge-m3"));
+        assert_eq!(req.input, TextInput(vec!["hello".to_string()]));
+
+        let without_model = r#"{"input": "hello"}"#;
+        let req: DualRequest =
+            serde_json::from_str(without_model).expect("deserialize without model");
+        assert!(req.model.is_none());
     }
 
     #[test]
