@@ -75,7 +75,16 @@ pub(crate) fn build_router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/v1/embeddings", post(handler::dense_embeddings))
         .route("/v1/sparse-embeddings", post(handler::sparse_embeddings))
+        // The colon in `/v1/embeddings:both` is a valid `pchar` per RFC 3986
+        // §3.3, but some HTTP clients (and URI builders) percent-encode it
+        // anyway when it appears in a path segment. The router is built on
+        // `matchit`, which matches the raw URI path byte-for-byte, so the
+        // encoded forms are registered as alias routes pointing at the same
+        // handler. RFC 3986 percent-encoding is case-insensitive, hence both
+        // upper- and lowercase aliases.
         .route("/v1/embeddings:both", post(handler::both_embeddings))
+        .route("/v1/embeddings%3Aboth", post(handler::both_embeddings))
+        .route("/v1/embeddings%3aboth", post(handler::both_embeddings))
         .route("/v1/models", get(handler::models))
         .route("/health", get(handler::health))
         .layer(DefaultBodyLimit::max(2_097_152))
@@ -897,6 +906,47 @@ mod tests {
         let req = Request::builder()
             .method("POST")
             .uri("/v1/embeddings:both")
+            .header("content-type", "application/json")
+            .body(Body::from(body))
+            .expect("request should build");
+        let resp: Response = app.oneshot(req).await.expect("router should respond");
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    /// `:` is a valid `pchar` per RFC 3986, but some HTTP clients (and some
+    /// URI builders) percent-encode it to `%3A` anyway when it appears in a
+    /// path segment. Axum's `matchit` router matches the raw URI path
+    /// byte-for-byte and does not percent-decode before matching, so the
+    /// percent-encoded form is registered as an explicit alias route
+    /// pointing at the same handler. This test asserts that the alias
+    /// resolves and reaches the handler — returning the handler's own 503
+    /// here because the test pool is dead.
+    #[tokio::test]
+    async fn router_both_accepts_uppercase_percent_encoded_colon() {
+        let app = build_router(make_test_state(true, 256));
+        let body = serde_json::to_vec(&serde_json::json!({"input": ["test"]}))
+            .expect("request body should serialize");
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/embeddings%3Aboth")
+            .header("content-type", "application/json")
+            .body(Body::from(body))
+            .expect("request should build");
+        let resp: Response = app.oneshot(req).await.expect("router should respond");
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    /// Sibling of `router_both_accepts_uppercase_percent_encoded_colon` —
+    /// RFC 3986 percent-encoding is case-insensitive, so the lowercase
+    /// `%3a` form must also reach the handler.
+    #[tokio::test]
+    async fn router_both_accepts_lowercase_percent_encoded_colon() {
+        let app = build_router(make_test_state(true, 256));
+        let body = serde_json::to_vec(&serde_json::json!({"input": ["test"]}))
+            .expect("request body should serialize");
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/embeddings%3aboth")
             .header("content-type", "application/json")
             .body(Body::from(body))
             .expect("request should build");
