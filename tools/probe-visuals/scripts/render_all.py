@@ -17,8 +17,10 @@ render_all.py — render all 10 probe-visual figures and report results.
 
 Run from tools/probe-visuals/ with:
     uv run python scripts/render_all.py
+    uv run python scripts/render_all.py --animated
 """
 
+import argparse
 import sys
 import time
 import traceback
@@ -51,7 +53,22 @@ FIGURES = [
 ]
 
 
+ANIMATED_FIGURES = [
+    "fig03_ols_geometry_animated",
+    "fig04_loss_landscape_animated",
+    "fig07_probe_shape_animated",
+]
+
+
 def main() -> int:
+    parser = argparse.ArgumentParser(description="Render BGE-M3 probe-visual figures.")
+    parser.add_argument(
+        "--animated",
+        action="store_true",
+        help="Also render animated GIFs (fig03, fig04, fig07).",
+    )
+    args = parser.parse_args()
+
     print("=" * 60)
     print("render_all.py — BGE-M3 probe visual companions")
     print("=" * 60)
@@ -72,11 +89,39 @@ def main() -> int:
             traceback.print_exc()
             failures.append(name)
 
+    # Animated GIFs (optional)
+    if args.animated:
+        print("\n--- Animated GIFs ---")
+        from probe_visuals.figures import (  # noqa: PLC0415
+            fig03_ols_geometry_animated,
+            fig04_loss_landscape_animated,
+            fig07_probe_shape_animated,
+        )
+
+        anim_modules = [
+            ("fig03_ols_geometry_animated", fig03_ols_geometry_animated),
+            ("fig04_loss_landscape_animated", fig04_loss_landscape_animated),
+            ("fig07_probe_shape_animated", fig07_probe_shape_animated),
+        ]
+        for name, mod in anim_modules:
+            print(f"\n▶ Running {name} …")
+            t0 = time.perf_counter()
+            try:
+                mod.main()
+                dt = time.perf_counter() - t0
+                print(f"  ✓  ({dt:.1f}s)")
+            except Exception as exc:
+                dt = time.perf_counter() - t0
+                print(f"  ✗ FAILED  ({dt:.1f}s): {exc}", file=sys.stderr)
+                traceback.print_exc()
+                failures.append(name)
+
     total_dt = time.perf_counter() - total_start
 
     print("\n" + "=" * 60)
-    n_succeeded = len(FIGURES) - len(failures)
-    print(f"Completed in {total_dt:.1f}s  —  {n_succeeded}/{len(FIGURES)} succeeded")
+    n_total = len(FIGURES) + (len(ANIMATED_FIGURES) if args.animated else 0)
+    n_succeeded = n_total - len(failures)
+    print(f"Completed in {total_dt:.1f}s  —  {n_succeeded}/{n_total} succeeded")
 
     if failures:
         print(f"FAILURES: {failures}", file=sys.stderr)
@@ -88,9 +133,24 @@ def main() -> int:
         size_kb = p.stat().st_size / 1024
         print(f"  {p.name:50s}  {size_kb:8.1f} KiB")
 
+    # Report GIF sizes (if animated)
+    if args.animated:
+        gifs = sorted(OUT_DIR.glob("*.gif"))
+        if gifs:
+            print(f"\nGIFs in {OUT_DIR}:")
+            for g in gifs:
+                size_kb = g.stat().st_size / 1024
+                print(f"  {g.name:50s}  {size_kb:8.1f} KiB")
+
     if len(pngs) == len(FIGURES) and not failures:
-        print("\nAll 10 PNGs generated successfully.")
-        return 0
+        if args.animated:
+            gifs = sorted(OUT_DIR.glob("*.gif"))
+            if len(gifs) == len(ANIMATED_FIGURES):
+                print(f"\nAll 10 PNGs and {len(ANIMATED_FIGURES)} GIFs generated successfully.")
+                return 0
+        else:
+            print("\nAll 10 PNGs generated successfully.")
+            return 0
 
     missing = len(FIGURES) - len(pngs)
     print(f"\nWARNING: expected {len(FIGURES)} PNGs, found {len(pngs)}.", file=sys.stderr)
