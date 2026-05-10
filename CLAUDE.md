@@ -192,6 +192,41 @@ The server uses a **worker pool** pattern to handle concurrent embedding request
 - **Per-request `EmbedStats`**: each worker captures tokenization time, per-chunk inference time, chunk count, and max sequence length, then forwards these via the `EmbedRequest` reply channel so the handler layer can log a fully-correlated completion record without a second RPC.
 - **Heartbeat task**: a configurable background task logs process RSS and pool state every `BGE_M3_HEARTBEAT_SECS` seconds.
 
+## Source Layout Conventions
+
+Standard Rust style for this crate. Follow the same rules when adding new code.
+
+### File-size targets
+
+- Leaf source files: aim for 100–400 lines. Hard ceiling ~500 lines of production code.
+- Inline `#[cfg(test)] mod tests { ... }` is fine up to ~150 test lines. Beyond that, move
+  the body to a sibling file: keep `#[cfg(test)] mod tests;` in the production file and put
+  the test body in `<file>/tests.rs`.
+
+### Module layout
+
+- Use the `foo.rs + foo/` layout (no `mod.rs`). New modules: never create a `mod.rs`.
+- Parent module files are facades: `mod` declarations and `pub use` re-exports only. No logic
+  in `embedder.rs`, `probe.rs`, `handler.rs`, `bootstrap.rs`, etc. — those exist purely to
+  expose their submodules' public surface and forward call sites.
+- `main.rs` is a 20–40 line entry point. All real program logic lives in `lib.rs` and
+  submodules so it stays unit- and integration-testable.
+
+### When to split a file
+
+Split a file when any of the following are true:
+- It exceeds ~500 production lines.
+- It contains two or more independent concerns (e.g. tokenization AND a worker loop, or
+  cache I/O AND a numerical fitter).
+- The same `mod tests` block has grown past ~150 lines.
+
+When splitting, write a short comment in the parent facade naming each submodule so future
+readers can navigate without opening every file.
+
+### Reference
+
+Examples to mirror: `tokio/src/runtime/`, `axum/src/routing/`, `hyper/src/proto/`.
+
 ## Long-Context Support
 
 BGE-M3's BAAI/bge-m3 FP32 export ships positional embeddings to 8192 tokens. The server's
