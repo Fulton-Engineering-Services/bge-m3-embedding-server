@@ -1,0 +1,18 @@
+# Generated PNGs — regenerate on demand with: uv run python scripts/render_all.py
+out/
+
+# uv virtual environment
+.venv/
+
+# Ruff lint cache
+.ruff_cache/
+
+# Python bytecode caches
+__pycache__/
+*.pyc
+*.pyo
+
+# Build artefacts
+dist/
+build/
+*.egg-info/

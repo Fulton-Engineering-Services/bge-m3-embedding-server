@@ -5,3 +5,16 @@
 
 # AI assistant working state — never commit
 .serena/
+
+# Scratch/temp work — never commit
+tmp/
+
+# Jupyter notebook checkpoints — never commit
+.ipynb_checkpoints/
+
+# Visuals tool — generated PNGs and virtual environment
+tools/visuals/out/
+tools/visuals/.venv/
+
+# JupyterLite build output — served via GitHub Pages Actions artifact, not git
+_output/
