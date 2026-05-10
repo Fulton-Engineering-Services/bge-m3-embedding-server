@@ -185,7 +185,7 @@ def main() -> None:
         )
 
     anim = FuncAnimation(fig, _draw_frame, frames=_N_FRAMES, interval=67)
-    path = save_animation(anim, "fig03_ols_geometry_animated", fps=15, dpi=75)
+    path = save_animation(anim, "fig03_ols_geometry_animated", fps=30, dpi=150)
     print(f"  saved → {path}")
     plt.close(fig)
 

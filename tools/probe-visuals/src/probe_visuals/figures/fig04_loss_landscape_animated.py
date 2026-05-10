@@ -324,7 +324,7 @@ def main() -> None:
         traj_raw.append(frame_lbl)
 
     anim = FuncAnimation(fig, update, frames=_N_FRAMES, interval=67, repeat=False)
-    path = save_animation(anim, "fig04_loss_landscape_animated", fps=15, dpi=100)
+    path = save_animation(anim, "fig04_loss_landscape_animated", fps=30, dpi=150)
     print(f"  saved → {path}")
     plt.close(fig)
 

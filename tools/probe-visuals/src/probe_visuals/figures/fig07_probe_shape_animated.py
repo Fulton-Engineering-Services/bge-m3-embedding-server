@@ -209,7 +209,7 @@ def main() -> None:
         fig.tight_layout()
 
     anim = FuncAnimation(fig, update, frames=_N_FRAMES, interval=67, repeat=False)
-    path = save_animation(anim, "fig07_probe_shape_animated", fps=15, dpi=100)
+    path = save_animation(anim, "fig07_probe_shape_animated", fps=30, dpi=150)
     print(f"  saved → {path}")
     plt.close(fig)
 
