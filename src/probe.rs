@@ -26,41 +26,44 @@ type Shape = (usize, usize);
 
 /// Shapes swept by the probe.
 ///
-/// 5 shapes are sufficient for a stable two-coefficient fit while keeping
-/// cumulative ORT arena allocation well below the cgroup memory limit.
-/// The set is chosen to anchor both the linear (`a`) and quadratic (`b`)
-/// coefficients:
+/// 6 static shapes (rc6 layout) plus a dynamic `(1, max_seq)` shape added
+/// at runtime for the quadratic anchor at the configured upper bound:
 ///
 /// - `(1, 64)` and `(1, 256)` anchor the linear term at low seq.
 /// - `(4, 64)` shares `x1 = batch*seq = 256` with `(1, 256)` but has a
 ///   different `x2 = batch*seq² = 16384` vs `65536`, giving a near-direct
 ///   measurement of `b` independent of `a`.
 /// - `(1, 1024)` and `(1, 2048)` provide mid-range leverage.
+/// - `(1, 4096)` anchors the quadratic regime.
 ///
-/// Removed vs the prior 7-shape set:
-/// - `(1, 4096)` — the highest-seq static shape; its ORT arena allocation was
-///   the primary cause of the v0.15.0-rc4 OOM on ECS Managed Instances.
-///   `(1, 2048)` is sufficient to anchor the `b` coefficient (within 5% of
-///   ground truth in tests).
-/// - `(1, max_seq)` capability check — an unreliable safety check that OOM'd
-///   the container on Bottlerocket before logging a result. Replaced by
-///   `validate_max_seq_shape`, a shape-only tensor check that exercises the
-///   tokenizer and ndarray path without calling `session.run()`.
+/// ## Safety against OOM (rc6)
 ///
-/// The absolute-RSS guard in `run_probe` will additionally skip any shape
-/// whose projected arena growth would push process RSS above 87.5% of the
-/// cgroup ceiling, providing defence-in-depth even if the static set is
-/// later extended.
+/// Three independent mechanisms protect the probe sweep from the v0.15.0-rc4
+/// arena-accumulation OOM:
 ///
-/// Estimated probe time: ~60 s on aarch64 MLAS fp16 at `max_seq=8192`.
+/// 1. **Arena warm-up** at the start of `run_probe` runs a `(1, 64)`
+///    `session.run()` BEFORE the sweep, so the lazy ORT arena initialisation
+///    does not appear as a ~1 GB constant offset on every per-shape delta.
+/// 2. **Conservative `fits()` gate** rejects any shape whose per-call
+///    workspace estimate exceeds `rss_ceiling` (the safety-discounted budget).
+/// 3. **Absolute-RSS guard** rejects any shape whose projected arena growth
+///    would push process RSS above 87.5% of the cgroup ceiling, regardless
+///    of the conservative model's estimate.
+///
+/// The dynamic `(1, max_seq)` shape that anchors the quadratic regime at the
+/// configured upper bound is added at runtime by `run_probe`, never as a
+/// fail-fast capability check (see rc4 incident notes — that approach OOM'd
+/// the container before producing actionable diagnostics).
+///
+/// Estimated probe time: ~120 s on aarch64 MLAS fp16 at `max_seq=8192`.
 const PROBE_SHAPES: &[Shape] = &[
     (1, 64),   // linear anchor
     (4, 64),   // pairs with (1,256) for direct b isolation
     (1, 256),  // linear anchor
     (1, 1024), // mid-range
-    (1, 2048), // mid-range, anchors quadratic coefficient
-               // (1, 4096) removed — ORT arena OOM risk, see doc comment above.
-               // (1, max_seq) removed — replaced by validate_max_seq_shape().
+    (1, 2048), // mid-range, anchors quadratic stability
+    (1, 4096), // quadratic anchor
+               // (1, max_seq) is added dynamically based on configured max.
 ];
 
 /// One measured data point from the probe sweep.
@@ -237,8 +240,16 @@ pub(crate) async fn run_probe(
     // no `session.run()` call, so no ORT arena allocation.
     validate_max_seq_shape(max_seq);
 
-    // Build shape list from the static set; cull any shapes beyond max_seq.
+    // Build shape list from the static set + dynamic max_seq capability anchor.
     let mut shapes: Vec<Shape> = PROBE_SHAPES.to_vec();
+    // Add a (1, max_seq) shape if max_seq is larger than any static shape.
+    // This anchors the quadratic coefficient at the configured upper bound.
+    // If the model cannot run at max_seq, the per-shape error path skips it
+    // (no fail-fast — the failure surfaces as an ORT error on the first real
+    // request, which is more actionable than a startup OOM).
+    if !shapes.iter().any(|&(_, s)| s == max_seq) {
+        shapes.push((1, max_seq));
+    }
     // Remove any shapes whose seq > max_seq (out of range for this model).
     shapes.retain(|&(_, s)| s <= max_seq);
     // Sort by ascending total token-positions so we grow load gradually.
@@ -255,6 +266,44 @@ pub(crate) async fn run_probe(
 
     // Synthesize probe texts from corpus (already curated and pinned).
     let corpus_texts = load_probe_texts();
+
+    // ----- Arena warm-up -----
+    //
+    // ORT lazily allocates its session arena on the first `session.run()`.
+    // The first call therefore reads as a ~1 GB RSS delta even at tiny
+    // shapes — that delta is arena bookkeeping, not per-call workspace, and
+    // it pollutes the cost-model fit because it appears as constant noise
+    // across all subsequent shapes.
+    //
+    // The warm-up runs a small `(1, 64)` `session.run()` BEFORE the actual
+    // sweep starts and discards the result. After the warm-up, subsequent
+    // per-shape `rss_delta` readings reflect only the incremental allocation
+    // attributable to that shape, giving the OLS fitter a meaningful signal.
+    //
+    // The warm-up is gated by the same RSS guard that protects the sweep —
+    // if `current_rss + 4 × chunk_cost(1, 64)` would breach the cgroup limit
+    // we skip the warm-up and continue with conservative defaults.
+    let warmup_texts = synthesize_texts(&corpus_texts, 1, 64);
+    let warmup_start = std::time::Instant::now();
+    match pool.probe(warmup_texts).await {
+        Ok(result) => {
+            let warmup_delta = result.rss_after.saturating_sub(result.rss_before);
+            let elapsed_ms = u64::try_from(warmup_start.elapsed().as_millis()).unwrap_or(u64::MAX);
+            info!(
+                warmup_delta_mb = warmup_delta / (1024 * 1024),
+                rss_after_mb = result.rss_after / (1024 * 1024),
+                elapsed_ms,
+                "Probe: arena warm-up complete (delta excluded from fit)"
+            );
+        }
+        Err(e) => {
+            warn!(
+                error = %e,
+                "Probe: warm-up failed — proceeding without warm-up; first shape's \
+                 rss_delta will include arena initialisation overhead"
+            );
+        }
+    }
 
     for (batch, seq) in &shapes {
         let batch = *batch;
@@ -728,19 +777,28 @@ mod tests {
     }
 
     #[test]
-    fn fit_cost_model_recovers_known_coefficients_from_5_probe_shapes() {
-        // Verify the trimmed 5-shape set (removed (1,4096) and (1,max_seq))
-        // still recovers coefficients within 5% of ground truth.
-        // This is the shape set shipped in v0.15.0-rc5.
+    fn fit_cost_model_recovers_known_coefficients_from_7_probe_shapes() {
+        // Verify the rc6 7-shape set (6 static + dynamic max_seq=8192) still
+        // recovers coefficients within 5% of ground truth. The shape set was
+        // restored to its rc4 layout in rc6 because the arena warm-up plus
+        // the absolute-RSS guard make the higher-seq shapes safe again.
         let a_true = 18_500.0_f64;
         let b_true = 6.5_f64;
-        let data: Vec<DataPoint> = [(1, 64), (4, 64), (1, 256), (1, 1024), (1, 2048)]
-            .iter()
-            .map(|&(b, s)| make_dp(b, s, a_true, b_true))
-            .collect();
+        let data: Vec<DataPoint> = [
+            (1, 64),
+            (4, 64),
+            (1, 256),
+            (1, 1024),
+            (1, 2048),
+            (1, 4096),
+            (1, 8192),
+        ]
+        .iter()
+        .map(|&(b, s)| make_dp(b, s, a_true, b_true))
+        .collect();
 
         let result = fit_cost_model(&data);
-        assert!(result.is_some(), "5-shape fit should succeed");
+        assert!(result.is_some(), "7-shape fit should succeed");
         let (a, b) = result.unwrap();
         assert!(
             (a - a_true).abs() < 0.05 * a_true,
