@@ -129,7 +129,7 @@ def main() -> None:
     ax.text2D(
         0.02,
         0.02,
-        f"Fitted:  a = {a_hat/1024:.1f} KiB/tok  ·  b = {b_hat:.2f} B/tok²",
+        f"Fitted:  a = {a_hat / 1024:.1f} KiB/tok  ·  b = {b_hat:.2f} B/tok²",
         transform=ax.transAxes,
         fontsize=8,
         va="bottom",

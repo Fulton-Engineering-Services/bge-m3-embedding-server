@@ -97,8 +97,7 @@ def main() -> None:
     ax.text(
         0.03,
         0.97,
-        "$B=1$ arc gives joint $(a,b)$ leverage.\n"
-        "Off-arc point $(4,64)$ isolates $b$.",
+        "$B=1$ arc gives joint $(a,b)$ leverage.\nOff-arc point $(4,64)$ isolates $b$.",
         transform=ax.transAxes,
         fontsize=9,
         va="top",

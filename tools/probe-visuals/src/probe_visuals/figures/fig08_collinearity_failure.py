@@ -63,9 +63,7 @@ def loss_grid_norm(
     return A, B, L
 
 
-def opt_alpha_beta(
-    shapes: list[tuple[int, int]], y_vals: np.ndarray
-) -> tuple[float, float]:
+def opt_alpha_beta(shapes: list[tuple[int, int]], y_vals: np.ndarray) -> tuple[float, float]:
     x1 = np.array([b * s for b, s in shapes], dtype=float)
     x2 = np.array([b * s**2 for b, s in shapes], dtype=float)
     n_max = x1.max() if x1.max() > 0 else 1
@@ -84,9 +82,7 @@ def main() -> None:
 
     # y values (bytes)
     y_chosen = np.array([MEASURED_RSS_MB[sh] * 1024**2 for sh in chosen_shapes], dtype=float)
-    y_collin = np.array(
-        [A_FIT * s + B_FIT * s**2 for (_, s) in collinear_shapes], dtype=float
-    )
+    y_collin = np.array([A_FIT * s + B_FIT * s**2 for (_, s) in collinear_shapes], dtype=float)
 
     det_chosen = gram_det_normalised(chosen_shapes)
     det_collin = gram_det_normalised(collinear_shapes)
@@ -106,8 +102,7 @@ def main() -> None:
     # ── Plot ──────────────────────────────────────────────────────────────────
     fig, axes = plt.subplots(1, 2, figsize=SIZE_2D)
     fig.suptitle(
-        "Collinearity Failure: Loss Landscape Comparison\n"
-        "Chosen probe shapes vs. all B=1 shapes",
+        "Collinearity Failure: Loss Landscape Comparison\nChosen probe shapes vs. all B=1 shapes",
         fontsize=12,
         fontweight="bold",
     )

@@ -64,9 +64,7 @@ def main() -> None:
 
     # Draw the B=1 arc as a guide (x2 = x1²  when B=1 and S = x1)
     S_arc = np.logspace(np.log10(64), np.log10(8192), 200)
-    ax1.plot(
-        S_arc, S_arc**2, color=C_GREY, lw=1.2, ls="--", label="$B=1$ arc: $x_2=x_1^2$"
-    )
+    ax1.plot(S_arc, S_arc**2, color=C_GREY, lw=1.2, ls="--", label="$B=1$ arc: $x_2=x_1^2$")
 
     ax1.set_xscale("log")
     ax1.set_yscale("log")

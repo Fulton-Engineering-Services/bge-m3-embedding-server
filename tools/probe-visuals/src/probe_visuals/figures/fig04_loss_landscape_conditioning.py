@@ -51,9 +51,7 @@ def main() -> None:
     # ── Build design matrix ────────────────────────────────────────────────────
     x1_data = np.array([b * s for b, s in PROBE_SHAPES], dtype=float)
     x2_data = np.array([b * s**2 for b, s in PROBE_SHAPES], dtype=float)
-    y_data = np.array(
-        [MEASURED_RSS_MB[shape] * 1024**2 for shape in PROBE_SHAPES], dtype=float
-    )
+    y_data = np.array([MEASURED_RSS_MB[shape] * 1024**2 for shape in PROBE_SHAPES], dtype=float)
 
     n_max = x1_data.max()  # = 1*8192 = 8192
     m_max = x2_data.max()  # = 1 * 8192² = 67,108,864
@@ -144,9 +142,7 @@ def main() -> None:
     # Left: raw
     L_raw_log = np.log10(L_raw + 1)
     ax1.contourf(A_grid, B_grid, L_raw_log, levels=log_levels, cmap="RdYlGn_r")
-    ax1.contour(
-        A_grid, B_grid, L_raw_log, levels=log_levels, colors="k", linewidths=0.3, alpha=0.4
-    )
+    ax1.contour(A_grid, B_grid, L_raw_log, levels=log_levels, colors="k", linewidths=0.3, alpha=0.4)
     ax1.plot(a_opt, b_opt, "w*", ms=12, zorder=5, label="Optimum")
     ax1.annotate(
         "",
@@ -160,7 +156,7 @@ def main() -> None:
     ax1.set_ylabel("$b$  (bytes / token-position²)")
     ax1.set_title("Raw columns\n(ellipses very elongated — ill-conditioned)")
     ax1.legend(fontsize=8, loc="upper right")
-    ax1.xaxis.set_major_formatter(ticker.FuncFormatter(lambda x, _: f"{x/1000:.0f}k"))
+    ax1.xaxis.set_major_formatter(ticker.FuncFormatter(lambda x, _: f"{x / 1000:.0f}k"))
     ax1.text(
         0.03,
         0.04,

@@ -65,10 +65,7 @@ def main() -> None:
         fitted_mib,
         color=C_BLUE,
         lw=2.5,
-        label=(
-            f"Fitted: $a_{{fit}}·S + b_{{fit}}·S^2$\n"
-            f"$a$ = {A_FIT:,} B  $b$ = {B_FIT} B/tok²"
-        ),
+        label=(f"Fitted: $a_{{fit}}·S + b_{{fit}}·S^2$\n$a$ = {A_FIT:,} B  $b$ = {B_FIT} B/tok²"),
     )
 
     ax.plot(
@@ -92,9 +89,7 @@ def main() -> None:
     # Annotate each measured point
     for b, s in b1_shapes:
         rss = MEASURED_RSS_MB[(b, s)]
-        ax.annotate(
-            f"{rss} MiB", (s, rss), textcoords="offset points", xytext=(8, 2), fontsize=8
-        )
+        ax.annotate(f"{rss} MiB", (s, rss), textcoords="offset points", xytext=(8, 2), fontsize=8)
 
     # Mark crossover
     crossover_S = A_FIT / B_FIT

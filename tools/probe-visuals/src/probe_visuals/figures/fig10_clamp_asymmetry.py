@@ -59,9 +59,7 @@ def main() -> None:
     a_out = clamp_a(a_raw)
 
     ax_a.axvspan(a_lo_plot, 0, alpha=0.08, color=C_GREY, zorder=0)
-    ax_a.axvspan(
-        0, A_LO, alpha=0.12, color=C_RED, zorder=0, label="Below floor → clamped to 4 KiB"
-    )
+    ax_a.axvspan(0, A_LO, alpha=0.12, color=C_RED, zorder=0, label="Below floor → clamped to 4 KiB")
     ax_a.axvspan(
         A_LO, A_HI, alpha=0.10, color=C_GREEN, zorder=0, label="Valid band [4 KiB, 256 KiB]"
     )
@@ -95,12 +93,10 @@ def main() -> None:
 
     ax_a.set_xlabel("$a_{raw}$  (bytes / token-position)")
     ax_a.set_ylabel("$a_{out}$  (bytes / token-position)")
-    ax_a.set_title(
-        "Coefficient $a$: symmetric floor clamp (negatives → 4 KiB, NOT rejected)"
-    )
+    ax_a.set_title("Coefficient $a$: symmetric floor clamp (negatives → 4 KiB, NOT rejected)")
     ax_a.legend(fontsize=8, loc="upper left")
-    ax_a.yaxis.set_major_formatter(plt.FuncFormatter(lambda y, _: f"{y/1024:.0f} KiB"))
-    ax_a.xaxis.set_major_formatter(plt.FuncFormatter(lambda x, _: f"{x/1024:.0f} KiB"))
+    ax_a.yaxis.set_major_formatter(plt.FuncFormatter(lambda y, _: f"{y / 1024:.0f} KiB"))
+    ax_a.xaxis.set_major_formatter(plt.FuncFormatter(lambda x, _: f"{x / 1024:.0f} KiB"))
     ax_a.set_xlim(a_lo_plot, a_hi_plot)
 
     # ── Bottom: b clamp ───────────────────────────────────────────────────────

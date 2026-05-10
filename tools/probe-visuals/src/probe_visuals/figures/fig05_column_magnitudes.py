@@ -72,12 +72,8 @@ def main() -> None:
     )
 
     # ── Panel B: normalised, linear ──────────────────────────────────────────
-    ax2.bar(
-        x - w / 2, xi1, width=w, color=C_BLUE, label=r"$\xi_1 = x_1 / n_{\max}$"
-    )
-    ax2.bar(
-        x + w / 2, xi2, width=w, color=C_RED, label=r"$\xi_2 = x_2 / m_{\max}$"
-    )
+    ax2.bar(x - w / 2, xi1, width=w, color=C_BLUE, label=r"$\xi_1 = x_1 / n_{\max}$")
+    ax2.bar(x + w / 2, xi2, width=w, color=C_RED, label=r"$\xi_2 = x_2 / m_{\max}$")
     ax2.set_xticks(x)
     ax2.set_xticklabels(labels, rotation=30, ha="right", fontsize=8)
     ax2.set_xlabel("Probe shape  (B, S)")
