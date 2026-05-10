@@ -349,12 +349,12 @@ fn extract_const_str(path: &str, const_name: &str) -> String {
 #[test]
 fn repo_revision_consistent_across_all_copies() {
     let embedder = extract_const_str("src/embedder/model_files.rs", "REPO_REVISION");
-    let bench = extract_const_str("benches/coreml.rs", "REPO_REVISION");
+    let bench = extract_const_str("benches/coreml/setup.rs", "REPO_REVISION");
     let example = extract_const_str("examples/fp16_eval.rs", "REPO_REVISION");
 
     assert_eq!(
         embedder, bench,
-        "REPO_REVISION mismatch: src/embedder/model_files.rs ({embedder}) != benches/coreml.rs ({bench})"
+        "REPO_REVISION mismatch: src/embedder/model_files.rs ({embedder}) != benches/coreml/setup.rs ({bench})"
     );
     assert_eq!(
         embedder, example,
@@ -370,12 +370,12 @@ fn repo_revision_consistent_across_all_copies() {
 #[test]
 fn xenova_repo_revision_consistent_across_all_copies() {
     let embedder = extract_const_str("src/embedder/model_files.rs", "XENOVA_REPO_REVISION");
-    let bench = extract_const_str("benches/coreml.rs", "XENOVA_REPO_REVISION");
+    let bench = extract_const_str("benches/coreml/setup.rs", "XENOVA_REPO_REVISION");
 
     assert_eq!(
         embedder, bench,
         "XENOVA_REPO_REVISION mismatch: \
-         src/embedder/model_files.rs ({embedder}) != benches/coreml.rs ({bench})"
+         src/embedder/model_files.rs ({embedder}) != benches/coreml/setup.rs ({bench})"
     );
     assert_eq!(embedder.len(), 40);
     assert!(embedder.chars().all(|c| c.is_ascii_hexdigit()));
