@@ -117,24 +117,6 @@ image links.
 
 Interactive ipywidgets notebooks for hands-on exploration. Require Jupyter and ipywidgets.
 
-### Setup
-
-```bash
-uv sync --group notebooks
-
-# Register the kernel so VS Code/Cursor finds it automatically
-uv run python -m ipykernel install --user --name bge-m3-probe-visuals --display-name "BGE-M3 Probe Visuals"
-```
-
-After running the install command, VS Code will offer **"BGE-M3 Probe Visuals"** in the kernel selector — no manual path entry needed. The notebooks embed this kernel name in their metadata.
-
-To run via terminal instead:
-```bash
-uv run jupyter notebook notebooks/
-```
-
-Notebooks use the `ipympl` backend — each widget interaction redraws the live matplotlib canvas in-cell. Pan and zoom work on all figure panels.
-
 ### Available notebooks
 
 | Notebook | Description |
@@ -143,7 +125,57 @@ Notebooks use the `ipympl` backend — each widget interaction redraws the live 
 | `02_workspace_budget_calculator.ipynb` | Deployment sizing tool — workers, model RSS, available memory, safety factor → utilization traffic light |
 | `03_conditioning_visualiser.ipynb` | Column scale ratio slider — morphs OLS loss landscape from circular to elongated, shows condition number |
 
-GitHub renders the markdown and code cells statically. For interactive use, run locally with `uv sync --group notebooks && uv run jupyter notebook`.
+GitHub renders the markdown and code cells statically. For interactive use, run locally with the terminal path below.
+
+Notebooks use the `ipympl` backend — each widget interaction redraws the live matplotlib canvas in-cell. Pan and zoom work on all figure panels.
+
+---
+
+## Running the Notebooks
+
+### Terminal + Browser (recommended — always works)
+
+This is the confirmed reliable path. Run from the `tools/probe-visuals/` directory:
+
+```bash
+# 1. Install all notebook dependencies (first time only)
+uv sync --group notebooks
+
+# 2. Register the kernel so Jupyter can find it (first time only, or after recreating the venv)
+uv run python -m ipykernel install --user --name bge-m3-probe-visuals --display-name "BGE-M3 Probe Visuals"
+
+# 3. Launch Jupyter in the browser
+uv run jupyter notebook notebooks/
+```
+
+Jupyter opens at `http://localhost:8888` with a file browser. Click any notebook to open it, then **Run → Run All Cells** (or Shift+Enter through each cell). The widgets appear inline — sliders are interactive immediately.
+
+**Why this path:** `uv run jupyter notebook` launches Jupyter with the project venv's Python automatically. No kernel selection needed.
+
+### VS Code / Cursor
+
+After running the `ipykernel install` command above, VS Code offers **"BGE-M3 Probe Visuals"** in the kernel picker (top-right of the notebook). Select it, then **Run All**.
+
+If VS Code does not show the kernel: `Ctrl+Shift+P` → **Developer: Reload Window**, then reopen the notebook.
+
+**Note:** If the kernel picker shows a pyenv Python that gets killed (SIGKILL), the project venv is backed by Homebrew Python. Recreate the venv with:
+
+```bash
+rm -rf .venv
+uv venv --python /opt/homebrew/bin/python3.13
+uv sync --group dev --group notebooks
+uv run python -m ipykernel install --user --name bge-m3-probe-visuals --display-name "BGE-M3 Probe Visuals"
+```
+
+### Troubleshooting
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `ModuleNotFoundError: No module named 'matplotlib'` | Wrong kernel selected | Select "BGE-M3 Probe Visuals" kernel or use terminal path |
+| `'widget' is not a recognised backend name` | ipympl not in active kernel | Same as above |
+| `FigureCanvasAgg is non-interactive` | Old cached output | Restart kernel and run all cells |
+| Figure clipped in browser | Browser window too narrow | Widen browser window or zoom out |
+| SIGKILL on Python binary | pyenv binary blocked by Gatekeeper | Recreate venv with Homebrew Python (see above) |
 
 ---
 
