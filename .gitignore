@@ -9,6 +9,9 @@
 # Scratch/temp work — never commit
 tmp/
 
+# Jupyter notebook checkpoints — never commit
+.ipynb_checkpoints/
+
 # Probe-visuals tool — generated PNGs and virtual environment
 tools/probe-visuals/out/
 tools/probe-visuals/.venv/
