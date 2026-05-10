@@ -241,9 +241,16 @@ fn load_tokenizer(tokenizer_path: &Path, max_seq_length: usize) -> Result<tokeni
 }
 
 /// Builds an ORT session from the ONNX model file with the given execution providers.
+///
+/// `intra_threads` controls intra-op parallelism for matmul / attention kernels
+/// inside a single `session.run()` call. The default (`1`) keeps per-worker RSS
+/// predictable for the workspace probe; raise it to `floor(num_cpus / workers)`
+/// on under-utilized hosts to recover CPU headroom. See
+/// [`crate::config::Config::intra_threads`] for the operator-facing knob.
 fn load_session(
     model_path: &Path,
     eps: Vec<ort::ep::ExecutionProviderDispatch>,
+    intra_threads: usize,
 ) -> Result<ort::session::Session> {
     let mut builder = ort::session::Session::builder().map_err(ort_err)?;
     if !eps.is_empty() {
@@ -252,7 +259,7 @@ fn load_session(
     let session = builder
         .with_optimization_level(ort::session::builder::GraphOptimizationLevel::Level3)
         .map_err(ort_err)?
-        .with_intra_threads(1)
+        .with_intra_threads(intra_threads.max(1))
         .map_err(ort_err)?
         .commit_from_file(model_path)
         .map_err(ort_err)?;
@@ -812,11 +819,12 @@ fn load_models(
     show_download_progress: bool,
     model_variant: ModelVariant,
     max_seq_length: usize,
+    intra_threads: usize,
 ) -> Result<(ort::session::Session, tokenizers::Tokenizer)> {
     let files = download_model_files(cache_dir, show_download_progress, model_variant)?;
     let tokenizer = load_tokenizer(&files.tokenizer_path, max_seq_length)?;
     let eps = execution_providers(cache_dir);
-    let session = load_session(&files.onnx_path, eps)?;
+    let session = load_session(&files.onnx_path, eps, intra_threads)?;
     Ok((session, tokenizer))
 }
 
@@ -854,6 +862,10 @@ pub(crate) struct WorkerConfig {
     pub model_variant: ModelVariant,
     /// Maximum tokenized sequence length.
     pub max_seq_length: usize,
+    /// Number of intra-op threads each ORT session may use for a single
+    /// `session.run()` call. Plumbed through to `load_session` at model load
+    /// time. See [`crate::config::Config::intra_threads`] for sizing guidance.
+    pub intra_threads: usize,
 }
 
 #[allow(clippy::needless_pass_by_value, clippy::too_many_lines)]
@@ -883,6 +895,7 @@ fn run_worker(
         id == 0,
         config.model_variant,
         config.max_seq_length,
+        config.intra_threads,
     ) {
         Ok(mut models) => {
             // Prime the ORT session arena with a tiny session.run() BEFORE
@@ -973,6 +986,7 @@ fn run_worker(
                         false,
                         config.model_variant,
                         config.max_seq_length,
+                        config.intra_threads,
                     ) {
                         Ok(mut m) => {
                             // Prime the freshly-loaded session arena so the
@@ -1510,6 +1524,7 @@ mod tests {
                 idle_timeout: None,
                 model_variant: crate::config::ModelVariant::Fp32,
                 max_seq_length: 512,
+                intra_threads: 1,
             },
         );
 
@@ -1541,6 +1556,7 @@ mod tests {
                 idle_timeout: None,
                 model_variant: crate::config::ModelVariant::Fp32,
                 max_seq_length: 512,
+                intra_threads: 1,
             },
         );
 

@@ -105,6 +105,7 @@ When `status=ok`, the `/health` response also includes:
 | `BGE_M3_CACHE_DIR` | `/cache` | Path where ONNX model files are cached |
 | `BGE_M3_BIND` | `0.0.0.0:8081` | TCP bind address |
 | `BGE_M3_WORKERS` | `2` | Number of worker threads (each loads its own model instance; min 1) |
+| `BGE_M3_INTRA_THREADS` | `1` | Intra-op threads each ORT session may use per `session.run()` call (min 1). Default `1` keeps per-worker RSS predictable for the workspace probe. Raise to `floor(num_cpus / workers)` on under-utilized hosts (e.g. `4` on an 8 vCPU task with `workers=2`) to take CPU utilization from ~25% to ~100% under load. Re-run the probe after changing. |
 | `BGE_M3_MAX_BATCH` | `256` | Maximum number of texts accepted per request (min 1) |
 | `BGE_M3_MAX_SEQ_LENGTH` | `8192` | Maximum tokenized sequence length. Range `[1, 8192]`. Lower values reduce memory use; `8192` is the BGE-M3 model's published maximum. |
 | `BGE_M3_IDLE_TIMEOUT_SECS` | `300` | Seconds of inactivity before models are unloaded; `0` disables idle unloading |

@@ -567,6 +567,7 @@ async fn main() -> anyhow::Result<()> {
             idle_timeout: cfg.idle_timeout,
             model_variant: cfg.model_variant,
             max_seq_length: cfg.max_seq_length,
+            intra_threads: cfg.intra_threads,
         },
     );
 

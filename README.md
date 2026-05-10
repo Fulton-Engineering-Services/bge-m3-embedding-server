@@ -291,6 +291,7 @@ require a restart.
 | `BGE_M3_CACHE_DIR` | `/cache` | Directory where ONNX model files are cached |
 | `BGE_M3_BIND` | `0.0.0.0:8081` | TCP bind address |
 | `BGE_M3_WORKERS` | `2` | Worker thread count (each loads its own model; min 1) |
+| `BGE_M3_INTRA_THREADS` | `1` | Intra-op threads each ORT session may use per `session.run()` call (min 1). Default `1` keeps per-worker RSS predictable for the workspace probe; raise to `floor(num_cpus / workers)` on under-utilized hosts to fan out matmul/attention kernels across cores. Re-run the probe after changing. |
 | `BGE_M3_MAX_BATCH` | `256` | Maximum texts per request (min 1) |
 | `BGE_M3_MAX_SEQ_LENGTH` | `8192` | Maximum tokenized sequence length, range `[1, 8192]`. Lower values reduce memory; `8192` is BGE-M3's published maximum. |
 | `BGE_M3_IDLE_TIMEOUT_SECS` | `300` | Seconds of inactivity before models are unloaded from memory; `0` disables idle unloading |

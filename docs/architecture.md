@@ -147,6 +147,7 @@ classDiagram
         +Option~Duration~ idle_timeout
         +ModelVariant model_variant
         +usize max_seq_length
+        +usize intra_threads
     }
 
     class CostModel {
