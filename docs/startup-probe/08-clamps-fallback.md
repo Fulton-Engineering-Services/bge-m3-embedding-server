@@ -8,7 +8,11 @@ The asymmetry — $a$ is forgiving, $b$ is strict — reflects the asymmetric pr
 
 ## The clamping functions
 
-![Figure 10 — Two-panel figure: left panel shows the clamping function for a (piecewise: input clamped to [4096, 262144], with the floor at 4096 highlighted); right panel shows the clamping function for b (input mapped to None when negative, otherwise clamped to [0.01, 50000]).](../figures/startup-probe/fig10_clamp_asymmetry.png)
+<div align="center">
+
+<img src="../figures/startup-probe/fig10_clamp_asymmetry.png" width="900" alt="Figure 10 — Two-panel figure: left panel shows the clamping function for a (piecewise: input clamped to [4096, 262144], with the floor at 4096 highlighted); right panel shows the clamping function for b (input mapped to None when negative, otherwise clamped to [0.01, 50000]).">
+
+</div>
 
 Figure 10 plots the two clamping functions side by side. The horizontal axis on each is the raw fitter output; the vertical axis is the clamped value applied to the cost model.
 

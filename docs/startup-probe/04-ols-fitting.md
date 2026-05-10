@@ -12,7 +12,11 @@ $$
 
 For two parameters and one linear equation per measurement, the solution is closed-form: solve a $2 \times 2$ system once and the result is a pair $(\hat a, \hat b)$. There is no iterative optimiser, no learning rate, no convergence test — only one matrix inversion and a few multiplications.
 
-![Figure 3 — OLS best-fit plane through 7 probe measurements with residuals shown as vertical green segments.](../figures/startup-probe/fig03_ols_geometry.png)
+<div align="center">
+
+<img src="../figures/startup-probe/fig03_ols_geometry.png" width="720" alt="Figure 3 — OLS best-fit plane through 7 probe measurements with residuals shown as vertical green segments.">
+
+</div>
 
 Figure 3 visualises the fit as a 3-D problem. The seven probe measurements appear as coloured points in $(x^1, x^2, y)$ space. The shaded plane is the OLS best fit $y = a \cdot x^1 + b \cdot x^2$; it passes through the origin because the model has no intercept (justified below). The vertical green segments are the residuals $y_i - \hat y_i$ that OLS drives to a minimum-sum-of-squares solution. A perfect fit would place every point on the plane; real data carries small residuals due to RSS measurement noise, page granularity, and the model's inherent approximation error.
 
@@ -20,7 +24,11 @@ The plane is tilted because the two coefficients have very different magnitudes:
 
 ### Animated version
 
-![Figure 3a — Animation: the seven scatter points fade in sequentially, then the best-fit plane materialises through them, and finally the camera orbits to show the plane from multiple angles.](../figures/startup-probe/animated/fig03_ols_geometry_animated.gif)
+<div align="center">
+
+<img src="../figures/startup-probe/animated/fig03_ols_geometry_animated.gif" width="840" alt="Figure 3a — Animation: the seven scatter points fade in sequentially, then the best-fit plane materialises through them, and finally the camera orbits to show the plane from multiple angles.">
+
+</div>
 
 Figure 3a constructs the fit incrementally: the seven points appear one at a time, the OLS plane materialises after the last point, and the camera then orbits to confirm that the surface is genuinely two-dimensional — flat, with no warping or curvature. The orbit reveals residuals that were hidden in the static image.
 

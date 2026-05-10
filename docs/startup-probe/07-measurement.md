@@ -8,7 +8,11 @@ The second question matters because ORT does not expose its workspace allocator 
 
 ## Fit quality as a calibration check
 
-![Figure 9 — Scatter: x-axis is sequence length S; y-axis is RSS delta in MB; seven measured probe points (dots) overlaid on the fitted quadratic curve y = a·B·S + b·B·S² (solid line) and the conservative-defaults curve (dashed); residuals visible as the gap between dots and curve.](../figures/startup-probe/fig09_fit_quality.png)
+<div align="center">
+
+<img src="../figures/startup-probe/fig09_fit_quality.png" width="720" alt="Figure 9 — Scatter: x-axis is sequence length S; y-axis is RSS delta in MB; seven measured probe points (dots) overlaid on the fitted quadratic curve y = a·B·S + b·B·S² (solid line) and the conservative-defaults curve (dashed); residuals visible as the gap between dots and curve.">
+
+</div>
 
 Figure 9 plots the seven probe measurements (filled dots) against the cost model's prediction. The solid curve is $y = a \cdot B \cdot S + b \cdot B \cdot S^2$ with the fitted $(a, b)$. The dashed curve uses the conservative defaults (`CONSERVATIVE_A`, `CONSERVATIVE_B`) for comparison. Each dot's vertical distance to the solid curve is the residual that OLS minimises.
 

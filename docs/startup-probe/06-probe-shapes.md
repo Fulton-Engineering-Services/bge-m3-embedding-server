@@ -10,7 +10,11 @@ In linear-algebra terms, "different directions" means the corresponding rows of 
 
 To break that degeneracy, at least two measurements at different $S$ are required. To anchor both $a$ (FFN-dominated low-$S$ regime) and $b$ (attention-dominated high-$S$ regime), measurements should span the full range. The chosen probe set therefore consists of a row of $(1, S)$ shapes spanning four orders of magnitude in $S$, plus one off-arc shape $(4, 64)$ that exists solely to give the fitter a clean handle on $b$ independent of $a$.
 
-![Figure 7 — Log-log scatter of seven probe shapes in (B·S, B·S²) space; the (1, S) shapes form a curved arc, the (4, 64) point sits off the arc, and an annotated bracket connects (4, 64) and (1, 256), highlighting that they share x¹ but differ in x².](../figures/startup-probe/fig07_probe_shape_information.png)
+<div align="center">
+
+<img src="../figures/startup-probe/fig07_probe_shape_information.png" width="720" alt="Figure 7 — Log-log scatter of seven probe shapes in (B·S, B·S²) space; the (1, S) shapes form a curved arc, the (4, 64) point sits off the arc, and an annotated bracket connects (4, 64) and (1, 256), highlighting that they share x¹ but differ in x².">
+
+</div>
 
 Figure 7 plots the seven shapes in design-matrix coordinates $(x^1, x^2) = (B \cdot S, B \cdot S^2)$ on log-log axes. Six points lie along the parametric curve traced by $(1, S)$ for varying $S$. The seventh, $(4, 64)$, sits off that curve. An annotated bracket connects $(4, 64)$ to $(1, 256)$: they share the same $x^1$ value ($4 \cdot 64 = 1 \cdot 256 = 256$) but have different $x^2$ values ($4 \cdot 64^2 = 16{,}384$ versus $1 \cdot 256^2 = 65{,}536$).
 
@@ -20,13 +24,21 @@ If $(4, 64)$ were removed and replaced by another $(1, S)$ point, the OLS solve 
 
 ### Animated version
 
-![Figure 7a — Animation: probe shapes appear in design space one at a time, with a running counter showing the Gram-matrix determinant after each addition; the determinant is small when only collinear (1, S) points are present and jumps when (4, 64) is added.](../figures/startup-probe/animated/fig07_probe_shape_animated.gif)
+<div align="center">
+
+<img src="../figures/startup-probe/animated/fig07_probe_shape_animated.gif" width="840" alt="Figure 7a — Animation: probe shapes appear in design space one at a time, with a running counter showing the Gram-matrix determinant after each addition; the determinant is small when only collinear (1, S) points are present and jumps when (4, 64) is added.">
+
+</div>
 
 Figure 7a adds shapes to the design matrix one at a time and displays the running determinant of the (normalised) Gram matrix $\det G$. After two collinear $(1, S)$ points $\det G$ is essentially zero — the design columns are nearly parallel and there is no information about $b$ independent of $a$. After three $(1, S)$ points the determinant grows slowly: parallel additions add no new dimension. The moment $(4, 64)$ enters the set, $\det G$ jumps by orders of magnitude, marking the transition from underdetermined to fully constrained. Subsequent $(1, S)$ additions only modestly grow $\det G$ — they contribute noise rejection, not new geometry.
 
 ## What goes wrong without an off-arc shape
 
-![Figure 8 — Side-by-side OLS loss landscapes: left shows the loss with all chosen probe shapes (compact, well-defined ellipsoidal minimum); right shows the loss with all (1, S) shapes only (degenerate valley stretching to infinity along the b axis); Gram matrix determinants annotated for both cases.](../figures/startup-probe/fig08_collinearity_failure.png)
+<div align="center">
+
+<img src="../figures/startup-probe/fig08_collinearity_failure.png" width="900" alt="Figure 8 — Side-by-side OLS loss landscapes: left shows the loss with all chosen probe shapes (compact, well-defined ellipsoidal minimum); right shows the loss with all (1, S) shapes only (degenerate valley stretching to infinity along the b axis); Gram matrix determinants annotated for both cases.">
+
+</div>
 
 Figure 8 plots the OLS loss $\mathcal{L}(a, b)$ for two candidate probe sets. The left panel uses the seven chosen shapes: the loss has a clean, isolated minimum visible as concentric tight ellipses. The right panel uses the same number of probe shapes, but all at $B = 1$. The loss is now a long valley — moving along the valley axis barely changes the loss at all, and the fit on $(a, b)$ is essentially undetermined.
 

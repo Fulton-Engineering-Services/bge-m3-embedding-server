@@ -8,7 +8,11 @@ A transformer is a stack of identical layers. Each layer maps a $[B, S, D]$ tens
 
 The two coefficients $a$ and $b$ are the per-token-position and per-token-position-squared workspace contributions on the active hardware running the active model. The probe measures both; the bin-packer respects both.
 
-![Figure 1 — Workspace cost decomposition: orange linear term, teal quadratic term, dashed total, with crossover at S ≈ 2,973 marked.](../figures/startup-probe/fig01_cost_decomposition.png)
+<div align="center">
+
+<img src="../figures/startup-probe/fig01_cost_decomposition.png" width="900" alt="Figure 1 — Workspace cost decomposition: orange linear term, teal quadratic term, dashed total, with crossover at S ≈ 2,973 marked.">
+
+</div>
 
 Figure 1 plots the two cost components against sequence length $S$ at fixed $B = 1$ (linear axes on the left, log–log on the right). The orange curve is $a \cdot S$, the teal curve is $b \cdot S^2$, and the dashed black curve is their sum $W(1, S)$. The vertical gold line marks the crossover $S^* = a/b \approx 2{,}973$ where the two terms are equal.
 
@@ -16,7 +20,11 @@ Below $S^*$ the orange curve is taller and most workspace is feed-forward. Above
 
 ## The 3-D view
 
-![Figure 2 — Surface of W(B, S) with the per-worker workspace budget shown as a horizontal plane intersecting the surface; the floor projection traces the feasible (B, S) region as a contour line.](../figures/startup-probe/fig02_workspace_surface.png)
+<div align="center">
+
+<img src="../figures/startup-probe/fig02_workspace_surface.png" width="720" alt="Figure 2 — Surface of W(B, S) with the per-worker workspace budget shown as a horizontal plane intersecting the surface; the floor projection traces the feasible (B, S) region as a contour line.">
+
+</div>
 
 Figure 2 plots the same cost function as a surface over the $(B, S)$ plane, with workspace $W$ on the vertical axis. The translucent horizontal plane is the per-worker budget `max_workspace_bytes`. Where the surface crosses the plane, the corresponding chunk does not fit; the floor projection traces the `fits()` boundary as a contour.
 
@@ -24,7 +32,11 @@ The surface is a flat ramp at small $S$ (linear regime) and curls into a parabol
 
 ### Animated version
 
-![Figure 2a — Animated 360-degree rotation of the W(B, S) surface around its vertical axis, showing the budget plane intersection from every angle.](../figures/startup-probe/animated/fig02_workspace_surface_animated.gif)
+<div align="center">
+
+<img src="../figures/startup-probe/animated/fig02_workspace_surface_animated.gif" width="840" alt="Figure 2a — Animated 360-degree rotation of the W(B, S) surface around its vertical axis, showing the budget plane intersection from every angle.">
+
+</div>
 
 Figure 2a rotates the camera azimuth around the vertical workspace axis. The intersection contour preserves its shape under rotation, but the geometry of the over-budget region — the part of the surface above the plane — is most easily seen when the camera is roughly perpendicular to the long axis of the bowl.
 

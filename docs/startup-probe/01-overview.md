@@ -8,7 +8,11 @@ The probe addresses this by measuring the actual workspace cost on the active co
 
 ## The cost decomposition at a glance
 
-![Figure 1 — Workspace cost decomposition: orange linear term, teal quadratic term, dashed total, with crossover at S ≈ 2,973 marked.](../figures/startup-probe/fig01_cost_decomposition.png)
+<div align="center">
+
+<img src="../figures/startup-probe/fig01_cost_decomposition.png" width="900" alt="Figure 1 — Workspace cost decomposition: orange linear term, teal quadratic term, dashed total, with crossover at S ≈ 2,973 marked.">
+
+</div>
 
 Figure 1 plots the two cost components against sequence length $S$ at fixed $B = 1$. The orange curve is the linear term $a \cdot S$ — feed-forward and projection workspace, which grows in proportion to $S$. The teal curve is the quadratic term $b \cdot S^2$ — attention-score workspace, which grows in proportion to $S^2$. The dashed black curve is their sum, the actual workspace $W(1, S)$. The vertical gold line marks the crossover sequence length $S^* = a / b \approx 2{,}973$ at which the two terms are equal.
 

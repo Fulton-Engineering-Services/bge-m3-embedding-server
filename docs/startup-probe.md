@@ -4,7 +4,11 @@ The startup probe measures the actual ONNX workspace cost of a BGE-M3 inference 
 
 ## Visual overview
 
-![Figure — Workspace cost decomposition: linear and quadratic components at fixed B = 1, with crossover at S ≈ 2,973.](figures/startup-probe/fig01_cost_decomposition.png)
+<div align="center">
+
+<img src="figures/startup-probe/fig01_cost_decomposition.png" width="880" alt="Figure — Workspace cost decomposition: linear and quadratic components at fixed B = 1, with crossover at S ≈ 2,973.">
+
+</div>
 
 The bge-m3 transformer's per-call workspace decomposes into a linear (FFN and projection) component and a quadratic (attention) component. At $S = 8192$ the quadratic term dominates by roughly $16\times$, so a static batch ceiling under-budgets long-context calls by exactly that factor. The probe replaces the static ceiling with a measured two-coefficient model $W = a \cdot B \cdot S + b \cdot B \cdot S^2$ fit on real RSS measurements taken inside the container.
 

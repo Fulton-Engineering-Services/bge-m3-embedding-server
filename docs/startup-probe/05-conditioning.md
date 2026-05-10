@@ -15,7 +15,11 @@ The remedy is a Jacobi (diagonal) preconditioner: rescale each column to live in
 
 ## The loss landscape, conditioned and unconditioned
 
-![Figure 4 — Side-by-side OLS loss-level ellipses in eigenvector-aligned coordinates with equal-aspect axes: left panel shows the raw design with κ ≈ 6.7×10⁸, the ellipse collapsed to a near-line below pixel resolution; right panel shows the Jacobi-normalised design with κ ≈ 49 and a clean ~7:1 ellipse. The visible aspect ratio of each ellipse equals √κ exactly.](../figures/startup-probe/fig04_loss_landscape_conditioning.png)
+<div align="center">
+
+<img src="../figures/startup-probe/fig04_loss_landscape_conditioning.png" width="900" alt="Figure 4 — Side-by-side OLS loss-level ellipses in eigenvector-aligned coordinates with equal-aspect axes: left panel shows the raw design with κ ≈ 6.7×10⁸, the ellipse collapsed to a near-line below pixel resolution; right panel shows the Jacobi-normalised design with κ ≈ 49 and a clean ~7:1 ellipse. The visible aspect ratio of each ellipse equals √κ exactly.">
+
+</div>
 
 Figure 4 plots the OLS loss-level ellipse $\{\theta : (\theta - \theta^*)^\top G\,(\theta - \theta^*) = c\}$ in two parameter coordinate systems, where $G$ is the Gram matrix and $\theta^*$ is the OLS optimum recovered from the actual probe data. Each panel uses eigenvector-aligned axes — the long axis $v_{\min}$ and the short axis $v_{\max}$ — and equal aspect (`set_aspect("equal")`) with identical axis ranges on both sides. Under those drawing conventions, the visible aspect ratio of the level set equals exactly $\sqrt{\kappa(G)}$, the square root of the Gram matrix's condition number; no coordinate-system stretch hides or exaggerates the geometry.
 
@@ -27,7 +31,11 @@ The probe does not use gradient descent — it uses the closed-form normal equat
 
 ### Animated version
 
-![Figure 4a — Animation: the OLS loss-level ellipse morphs continuously from raw coordinates (κ ≈ 6.7×10⁸, ellipse collapsed to a near-line) to Jacobi-normalised coordinates (κ ≈ 49, ~7:1 ellipse) under a smoothstep interpolation on the column-rescaling matrix; 150 frames at 15 fps.](../figures/startup-probe/animated/fig04_loss_landscape_animated.gif)
+<div align="center">
+
+<img src="../figures/startup-probe/animated/fig04_loss_landscape_animated.gif" width="840" alt="Figure 4a — Animation: the OLS loss-level ellipse morphs continuously from raw coordinates (κ ≈ 6.7×10⁸, ellipse collapsed to a near-line) to Jacobi-normalised coordinates (κ ≈ 49, ~7:1 ellipse) under a smoothstep interpolation on the column-rescaling matrix; 150 frames at 15 fps.">
+
+</div>
 
 Figure 4a morphs the same level-set ellipse continuously from raw to Jacobi-normalised parameter coordinates. A column-rescaling matrix $D(t) = \mathrm{diag}(n_{\max}^t, m_{\max}^t)$ interpolates between $D(0) = I$ and $D(1) = \mathrm{diag}(n_{\max}, m_{\max})$, so the design $X(t) = X_{\text{raw}} \cdot D(t)^{-1}$ and the Hessian $H(t) = X(t)^\top X(t)$ slide smoothly between the two endpoints. A cubic smoothstep easing applied over $t \in [0, 1]$ accelerates the morph through the middle and rests at each end. The condition number $\kappa(t)$, reported in the annotation block, decreases monotonically from $\sim 6.7 \times 10^8$ at $t = 0$ to $\sim 49$ at $t = 1$; the visible eccentricity decreases as $\sqrt{\kappa(t)}$, and the ellipse deforms continuously from the degenerate near-line into the workable $\sim 7{:}1$ ellipse. The animation runs 150 frames at 15 fps with hold periods at both endpoints.
 
@@ -45,7 +53,11 @@ The condition number of the unnormalised Gram matrix grows roughly as $(S_{\max}
 
 Empirically, before the fix, the 16-shape sweep silently fell back to conservative defaults despite valid data. The test `fit_cost_model_production_scale_16_shapes_with_max_seq_8192` in `probe.rs` reproduces this and verifies the normalised version succeeds.
 
-![Figure 5 — Bar chart: left side shows raw column magnitudes for B·S and B·S² across the seven probe shapes, with up to 8000× ratio at S = 8192; right side shows the normalised columns, all bounded in [0, 1].](../figures/startup-probe/fig05_column_magnitudes.png)
+<div align="center">
+
+<img src="../figures/startup-probe/fig05_column_magnitudes.png" width="900" alt="Figure 5 — Bar chart: left side shows raw column magnitudes for B·S and B·S² across the seven probe shapes, with up to 8000× ratio at S = 8192; right side shows the normalised columns, all bounded in [0, 1].">
+
+</div>
 
 Figure 5 makes the scale gap concrete. On the left, the raw values are plotted on a log scale: the quadratic column dwarfs the linear column at every shape, by a factor that grows with $S$. At $(1, 8192)$, the gap is roughly $8000{:}1$. On the right, each column has been divided by its column-wide maximum and both lie in $[0, 1]$. The geometry of the fit is unchanged; the solver's view of the data is now balanced.
 
@@ -110,7 +122,11 @@ This is the simplest case of preconditioning: the diagonal of the design's colum
 
 ## A coordinate change, not a different algorithm
 
-![Figure 6 — Side-by-side scatter plots: left shows the seven probe shapes in raw log-log (B·S, B·S²) coordinates; right shows the same shapes after Jacobi normalisation, now bounded in the [0, 1] × [0, 1] unit square; the (4, 64) off-arc shape is highlighted in both panels.](../figures/startup-probe/fig06_jacobi_transformation.png)
+<div align="center">
+
+<img src="../figures/startup-probe/fig06_jacobi_transformation.png" width="900" alt="Figure 6 — Side-by-side scatter plots: left shows the seven probe shapes in raw log-log (B·S, B·S²) coordinates; right shows the same shapes after Jacobi normalisation, now bounded in the [0, 1] × [0, 1] unit square; the (4, 64) off-arc shape is highlighted in both panels.">
+
+</div>
 
 Figure 6 plots the probe shapes in two coordinate systems. On the left, in raw $(x^1, x^2) = (B \cdot S, B \cdot S^2)$ log-log coordinates, the points span eight decades on the $y$-axis. On the right, after dividing each column by its maximum, the points are confined to the unit square $[0, 1]^2$. The $(4, 64)$ shape that deliberately breaks the $B = 1$ line to provide leverage on the quadratic coefficient (§6) is highlighted in both panels.
 
