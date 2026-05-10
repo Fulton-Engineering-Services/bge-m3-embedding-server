@@ -734,16 +734,10 @@ mod tests {
         // This is the shape set shipped in v0.15.0-rc5.
         let a_true = 18_500.0_f64;
         let b_true = 6.5_f64;
-        let data: Vec<DataPoint> = [
-            (1, 64),
-            (4, 64),
-            (1, 256),
-            (1, 1024),
-            (1, 2048),
-        ]
-        .iter()
-        .map(|&(b, s)| make_dp(b, s, a_true, b_true))
-        .collect();
+        let data: Vec<DataPoint> = [(1, 64), (4, 64), (1, 256), (1, 1024), (1, 2048)]
+            .iter()
+            .map(|&(b, s)| make_dp(b, s, a_true, b_true))
+            .collect();
 
         let result = fit_cost_model(&data);
         assert!(result.is_some(), "5-shape fit should succeed");

@@ -1054,7 +1054,10 @@ mod tests {
         )
         .await;
         // run_readiness_probe returns Ok — the probe task was spawned.
-        assert!(result.is_ok(), "run_readiness_probe should return Ok (probe spawned)");
+        assert!(
+            result.is_ok(),
+            "run_readiness_probe should return Ok (probe spawned)"
+        );
         // Give the probe task time to run the readiness check and fail.
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         // The pool is closed_for_test, so dense() fails; ready should stay false.
