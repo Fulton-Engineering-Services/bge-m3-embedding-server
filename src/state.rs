@@ -1,3 +1,23 @@
+// Copyright (c) 2026 J. Patrick Fulton
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! Shared application state threaded through Axum handlers via [`Arc<AppState>`].
+//!
+//! [`AppState`] holds the worker pool, readiness flag, concurrency semaphore,
+//! and the live cost-model handle. [`TuningInfo`] captures the static
+//! memory-detection snapshot written once before the background probe starts.
+
 use crate::binpack::CostModel;
 use crate::embedder::EmbedPool;
 use crate::sysinfo::{MemoryReading, MemorySource};
@@ -28,6 +48,7 @@ pub enum ProbeStatus {
 
 impl ProbeStatus {
     /// Returns the JSON-serializable string representation used in `/health`.
+    #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Disabled => "disabled",
@@ -39,6 +60,7 @@ impl ProbeStatus {
     }
 
     /// Converts a raw `u8` (from `AtomicU8::load`) back to `ProbeStatus`.
+    #[must_use]
     pub fn from_u8(v: u8) -> Self {
         match v {
             0 => Self::Disabled,
@@ -128,6 +150,8 @@ pub struct TuningInfo {
 }
 
 impl TuningInfo {
+    /// Creates a [`TuningInfo`] from a memory reading and probe measurements.
+    #[must_use]
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         mem: &MemoryReading,
@@ -146,6 +170,7 @@ impl TuningInfo {
 
     /// Convenience builder for the case where memory detection was not possible
     /// (macOS without cgroup support, or probe disabled).
+    #[must_use]
     #[allow(dead_code)]
     pub fn unknown(model_rss_per_worker: usize) -> Self {
         Self {

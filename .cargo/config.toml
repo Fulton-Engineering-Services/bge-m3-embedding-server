@@ -7,3 +7,10 @@
 # Docker (linux/amd64 + linux/arm64) which does not use this config section.
 [target.aarch64-apple-darwin]
 rustflags = ["-C", "target-cpu=native"]
+
+[build]
+rustdocflags = [
+    "-D", "warnings",
+    "--default-theme", "light",
+    "--html-in-header", "docs/rustdoc-theme-init.html",
+]

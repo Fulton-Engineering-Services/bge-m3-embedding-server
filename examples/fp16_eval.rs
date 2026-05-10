@@ -1,3 +1,17 @@
+// Copyright (c) 2026 J. Patrick Fulton
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 #![allow(
     clippy::cast_precision_loss,
     clippy::cast_possible_truncation,
@@ -87,7 +101,7 @@ struct SparseLinearWeights {
 // its own SparseLinearWeights/SparseFp16 types for FP16 evaluation output.
 
 fn load_sparse_weights() -> SparseLinearWeights {
-    let data = include_bytes!("../src/weights/sparse_linear.safetensors");
+    let data = include_bytes!("../src/sparse_linear.safetensors");
     let tensors = safetensors::SafeTensors::deserialize(data).expect("Invalid safetensors");
     let weight_view = tensors.tensor("weight").expect("Missing weight tensor");
     let bias_view = tensors.tensor("bias").expect("Missing bias tensor");

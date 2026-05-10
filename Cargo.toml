@@ -1,6 +1,6 @@
 [package]
 name = "bge-m3-embedding-server"
-version = "0.15.0"
+version = "1.0.0"
 edition = "2021"
 license = "Apache-2.0"
 description = "Axum HTTP server serving BGE-M3 dense and sparse embeddings via ONNX Runtime"
@@ -10,13 +10,21 @@ keywords = ["embeddings", "bge-m3", "axum", "nlp", "onnxruntime"]
 categories = ["web-programming::http-server"]
 rust-version = "1.88"
 
+[lib]
+name = "bge_m3_embedding_server"
+path = "src/lib.rs"
+
+[[bin]]
+name = "bge-m3-embedding-server"
+path = "src/main.rs"
+
 [dependencies]
 axum = "0.8"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "time"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 arc-swap = "1"
-ort = { version = "=2.0.0-rc.12", features = ["coreml", "ndarray", "std", "api-24", "download-binaries", "tls-rustls"], default-features = false }
+ort = { version = "=2.0.0-rc.12", features = ["coreml", "ndarray", "std", "api-24"], default-features = false }
 hf-hub = "0.5"
 tokenizers = { version = "0.22", default-features = false, features = ["onig"] }
 safetensors = "0.7"
@@ -40,7 +48,7 @@ coreml-profile = []
 ## Let ort-sys download a prebuilt ONNX Runtime binary during build.
 ## Used in CI where ORT_LIB_LOCATION is unavailable. Never enable in
 ## production builds — use ORT_LIB_LOCATION with a locally built ORT instead.
-download-ort = ["ort/download-binaries", "ort/tls-native"]
+download-ort = ["ort/download-binaries", "ort/tls-rustls"]
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

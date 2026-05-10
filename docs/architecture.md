@@ -45,17 +45,23 @@ graph TB
 
 ## Module Layout
 
-| Module | File | Responsibility |
-|--------|------|----------------|
-| `main` | `src/main.rs` | Bootstrap, router construction, memory detection, probe, readiness |
+The codebase uses a `[lib]` + `[[bin]]` split: `src/lib.rs` is the library
+crate root (exposes the public API for integration tests) and `src/main.rs`
+is the thin binary entry point. Each large module is a facade (`mod.rs`-free
+`foo.rs` + `foo/` layout) that re-exports its submodule surfaces.
+
+| Module | File(s) | Responsibility |
+|--------|---------|----------------|
+| `main` | `src/main.rs` | Thin binary entry point — reads config, spawns pool, delegates to `bootstrap` |
+| `bootstrap` | `src/bootstrap.rs` + `src/bootstrap/` | Startup orchestration: router construction, workspace budget, background probe task, readiness probes |
 | `config` | `src/config.rs` | Env-var configuration (`Config::from_env`), cost-model override resolution |
-| `state` | `src/state.rs` | Shared `AppState` struct, `TuningInfo` for `/health` |
-| `handler` | `src/handler.rs` | HTTP handlers and input validation |
-| `embedder` | `src/embedder.rs` | Worker pool, ORT session + tokenizer loading, tokenize-once + bin-pack inference |
+| `state` | `src/state.rs` | Shared `AppState` struct, `TuningInfo` for `/health`, `ProbeStatus` enum |
+| `handler` | `src/handler.rs` + `src/handler/` | HTTP handlers (`dense`, `sparse`, `both`, `health`, `models`) and shared input validation |
+| `embedder` | `src/embedder.rs` + `src/embedder/` | Worker pool, ORT session + tokenizer loading, tokenize-once + bin-pack inference; submodules include `pool`, `worker`, `dense`, `sparse`, `dual`, `session`, `tokenize`, `math`, `model_files`, `types`, `error` |
 | `binpack` | `src/binpack.rs` | `CostModel` + quadratic-aware bin-packer |
 | `sysinfo` | `src/sysinfo.rs` | Memory detection (cgroup v2/v1 → host RAM) and RSS reads |
-| `probe` | `src/probe.rs` | Startup workspace probe, least-squares coefficient fitting |
-| `weights` | `src/weights/mod.rs` | Bundled sparse-linear projection weights (`sparse_linear.safetensors`) |
+| `probe` | `src/probe.rs` + `src/probe/` | Startup workspace probe and least-squares coefficient fitting; submodules include `runner`, `fit`, `cache`, `corpus`, `validate` |
+| `weights` | `src/weights.rs` | Bundled sparse-linear projection weights (`sparse_linear.safetensors`) |
 | `models` | `src/models.rs` | Request/response serde types |
 | `error` | `src/error.rs` | `AppError` → HTTP status code mapping |
 
@@ -272,7 +278,7 @@ sequenceDiagram
     else cache miss
         Main->>Main: probe_status = Running
         Main->>Probe: tokio::spawn run_probe(pool, max_seq, rss_ceiling)
-        Note over Probe: 7 shapes, ~120 s — runs while<br/>workers serve requests with<br/>conservative defaults
+        Note over Probe: 7 shapes, ~120 s — runs while workers serve requests with conservative defaults
         Probe->>Leader: EmbedRequest::Probe (per shape)
         Leader-->>Probe: ProbeResult { rss_before, rss_after }
         Probe->>Probe: fit_cost_model (normalized OLS)

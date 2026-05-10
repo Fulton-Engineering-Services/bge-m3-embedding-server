@@ -96,3 +96,33 @@ jobs:
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
       - uses: EmbarkStudios/cargo-deny-action@3fd3802e88374d3fe9159b834c7714ec57d6c979  # v2
+
+  docs:
+    name: Rustdoc
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9  # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4  # v2
+      - name: Check docs
+        run: RUSTDOCFLAGS="-D warnings --default-theme light --html-in-header docs/rustdoc-theme-init.html" cargo doc --no-deps --document-private-items
+
+  license-headers:
+    name: License Headers
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+      - name: Install hawkeye
+        run: |
+          VERSION="6.5.1"
+          ARCH="x86_64-unknown-linux-musl"
+          BASE="https://github.com/korandoru/hawkeye/releases/download/v${VERSION}"
+          curl --proto '=https' --tlsv1.2 -sSfL "${BASE}/hawkeye-${ARCH}.tar.xz" -o /tmp/hawkeye.tar.xz
+          echo "9a6454f7f4f587764b4cbcbb865026526bbadeda477f1ef0b65924af777fb172  /tmp/hawkeye.tar.xz" | sha256sum -c
+          tar -xJf /tmp/hawkeye.tar.xz -C /tmp
+          sudo mv "/tmp/hawkeye-${ARCH}/hawkeye" /usr/local/bin/hawkeye
+          hawkeye --version
+      - name: Check license headers
+        run: hawkeye check

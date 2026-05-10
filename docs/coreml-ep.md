@@ -25,12 +25,6 @@ graph LR
     CPU --- UMA
     GPU --- UMA
     ANE --- UMA
-
-    classDef active fill:#555,stroke:#222,stroke-width:2px,color:#fff
-    classDef idle fill:#e0e0e0,stroke:#999,stroke-width:1px
-
-    class CPU,GPU active
-    class ANE idle
 ```
 
 ### CPU — NEON SIMD (active)
@@ -100,7 +94,7 @@ for the full MIL analysis.
 ```mermaid
 graph TD
     App["bge-m3-embedding-server<br/><code>Cargo.toml</code>"]
-    ORT["ort = &quot;=2.0.0-rc.11&quot;<br/>features: coreml, ndarray, std"]
+    ORT["ort = &quot;=2.0.0-rc.12&quot;<br/>features: coreml, ndarray, std"]
     SYS["ort-sys = &quot;2.0.0-rc.9&quot;<br/>build.rs downloads binary OR uses ORT_LIB_LOCATION"]
     LIB_PYKE["libonnxruntime.a<br/>ORT 1.23.2 (pyke.io prebuilt)<br/>Standard builds"]
     LIB_CUSTOM["libonnxruntime_*.a<br/>ORT 1.23.2 (FES fork)<br/>Apple Silicon CoreML builds"]
@@ -456,7 +450,7 @@ this model.
 
 ## CoreML EP Configuration
 
-### `ort::ep::CoreML` Builder API (v2.0.0-rc.11)
+### `ort::ep::CoreML` Builder API (v2.0.0-rc.12)
 
 | Method | Type | Default | Notes |
 |--------|------|---------|-------|
@@ -471,7 +465,7 @@ this model.
 
 ### Rust Implementation
 
-The `execution_providers()` function in `src/embedder.rs`:
+The `execution_providers()` function in `src/embedder/session.rs`:
 
 ```rust
 fn execution_providers(cache_dir: &Path) -> Vec<ort::ep::ExecutionProviderDispatch> {

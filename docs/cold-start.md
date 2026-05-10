@@ -106,13 +106,13 @@ sequenceDiagram
 
     Main->>Pool: spawn(workers, cache_dir, idle_timeout)
     Pool-->>Main: (EmbedPool, init_handle)
-    Note right of Pool: Workers begin loading<br/>in background
+    Note right of Pool: Workers begin loading in background
 
     Main->>Main: Build AppState { pool, ready: false, ... }
     Main->>Main: build_router(state)
 
     Main->>Listener: TcpListener::bind(bind_addr)
-    Note right of Listener: Server is listening<br/>but ready=false
+    Note right of Listener: Server is listening but ready=false
 
     Main->>Probe: tokio::spawn(run_readiness_probe)
 
@@ -158,9 +158,6 @@ graph TD
     LeaderResult -->|"Ok(())"| LeaderOk
     LeaderResult -->|"Err(e)"| LeaderFail
     LeaderFail --> ProcessExit
-
-    classDef errorNode fill:#f96,stroke:#333,stroke-width:2px
-    class LeaderFail,ProcessExit errorNode
 ```
 
 ### Follower fails to load

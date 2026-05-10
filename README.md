@@ -1,4 +1,6 @@
-[![CI](https://github.com/Fulton-Engineering-Services/bge-m3-embedding-server/actions/workflows/ci.yml/badge.svg)](https://github.com/Fulton-Engineering-Services/bge-m3-embedding-server/actions/workflows/ci.yml) [![Release](https://github.com/Fulton-Engineering-Services/bge-m3-embedding-server/actions/workflows/release.yml/badge.svg)](https://github.com/Fulton-Engineering-Services/bge-m3-embedding-server/actions/workflows/release.yml) [![codecov](https://codecov.io/gh/Fulton-Engineering-Services/bge-m3-embedding-server/graph/badge.svg)](https://codecov.io/gh/Fulton-Engineering-Services/bge-m3-embedding-server) [![DCO](https://img.shields.io/badge/DCO-enforced-brightgreen.svg)](CONTRIBUTING.md) [![MSRV](https://img.shields.io/badge/MSRV-1.88-orange.svg)](Cargo.toml) [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE) [![Docker Image](https://img.shields.io/badge/docker-ghcr.io-blue)](https://github.com/Fulton-Engineering-Services/bge-m3-embedding-server/pkgs/container/bge-m3-embedding-server)
+[![CI](https://github.com/Fulton-Engineering-Services/bge-m3-embedding-server/actions/workflows/ci.yml/badge.svg)](https://github.com/Fulton-Engineering-Services/bge-m3-embedding-server/actions/workflows/ci.yml) [![Release](https://github.com/Fulton-Engineering-Services/bge-m3-embedding-server/actions/workflows/release.yml/badge.svg)](https://github.com/Fulton-Engineering-Services/bge-m3-embedding-server/actions/workflows/release.yml) [![codecov](https://codecov.io/gh/Fulton-Engineering-Services/bge-m3-embedding-server/graph/badge.svg)](https://codecov.io/gh/Fulton-Engineering-Services/bge-m3-embedding-server) [![DCO](https://img.shields.io/badge/DCO-enforced-brightgreen.svg)](CONTRIBUTING.md) [![MSRV](https://img.shields.io/badge/MSRV-1.88-orange.svg)](Cargo.toml) [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE) [![Docker Image](https://img.shields.io/badge/docker-ghcr.io-blue)](https://github.com/Fulton-Engineering-Services/bge-m3-embedding-server/pkgs/container/bge-m3-embedding-server) [![API Docs](https://img.shields.io/badge/docs-GitHub%20Pages-blue)](https://fulton-engineering-services.github.io/bge-m3-embedding-server/bge_m3_embedding_server/)
+
+**API Documentation:** [fulton-engineering-services.github.io/bge-m3-embedding-server](https://fulton-engineering-services.github.io/bge-m3-embedding-server/bge_m3_embedding_server/)
 
 # bge-m3-embedding-server
 
@@ -279,7 +281,7 @@ SPLADE weights) for the same input string.
 
 ---
 
-
+## Configuration
 
 All configuration is via environment variables. The server reads them once at startup; changes
 require a restart.
@@ -296,7 +298,7 @@ require a restart.
 | `BGE_M3_MAX_SEQ_LENGTH` | `8192` | Maximum tokenized sequence length, range `[1, 8192]`. Lower values reduce memory; `8192` is BGE-M3's published maximum. |
 | `BGE_M3_IDLE_TIMEOUT_SECS` | `300` | Seconds of inactivity before models are unloaded from memory; `0` disables idle unloading |
 | `BGE_M3_MODEL` | `fp16` | Model variant — see [Model Variants](#model-variants) |
-| `BGE_M3_LOG_FORMAT` | (text) | Set to `json` for structured JSON log output |
+| `BGE_M3_LOG_FORMAT` | (text) | Set to `json` for structured JSON log output; omit for auto-detect (JSON in non-TTY, human-readable in TTY) |
 
 ### Auto-Budget Tuning (Linux)
 
