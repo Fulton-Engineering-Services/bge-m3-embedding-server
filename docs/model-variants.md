@@ -71,7 +71,7 @@ Both consumers use rank-based retrieval, not raw similarity scores:
 | Consumer | Retrieval method | Why rank matters more than score magnitude |
 |----------|-----------------|-------------------------------------------|
 | `mcp-local-knowledge-base` | Reciprocal Rank Fusion (k=60) of dense cosine + sparse dot-product | RRF discards raw scores entirely — only ordinal position in each leg matters. |
-| `dpos-coordinator` | Hybrid merge of lexical `ts_rank` + semantic cosine, 50/50 weighted average | Score magnitude matters but is averaged with a separate lexical signal. |
+| Hybrid search application | Hybrid merge of lexical `ts_rank` + semantic cosine, 50/50 weighted average | Score magnitude matters but is averaged with a separate lexical signal. |
 
 The critical question is whether FP16 preserves rank order, not whether raw cosine similarity shifts by 0.001.
 

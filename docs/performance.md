@@ -24,19 +24,10 @@ Curated from three production databases via a `db-backup` sidecar. Stored at `be
 |----------|--------|-------|------------|-------------|
 | `document_chunks` | `knowledgebase.chunks` | 50 | 337–1,599 | Stratified sample: 10 short, 20 medium, 20 long. Hamlet PDF + Spring AI docs. |
 | `tool_descriptions` | `coordinator.vector_store` | 75 | 33–283 | Complete set. Tool/capability descriptions for semantic memory retrieval. |
-| `code_symbols` | `codekeeper.symbols` | 50 | 22–120 | Random sample from 185K symbols. Class/method/field name_paths. |
-
-**Database inventory:**
-
-| Database | Host container | Relevant tables | Row count | Notes |
-|----------|---------------|-----------------|-----------|-------|
-| `knowledgebase` | `coordinator-db` | `chunks`, `documents` | 386 chunks / 5 docs | `halfvec(1024)` dense + `sparsevec(250002)` sparse stored alongside content |
-| `coordinator` | `coordinator-db` | `vector_store`, `captures` | 75 vectors / 0 captures | Tool descriptions with `vector(1024)` embeddings |
-| `codekeeper` | `codekeeper-db` | `symbols`, `symbol_embeddings` | 185K symbols / 0 embeddings | Embeddings not yet generated; symbols have name_path + signature |
-| `langfuse` | `langfuse-db` | `observations`, `traces` | 0 / 0 | Not yet wired for tracing |
+| `code_symbols` | `symbols` table | 50 | 22–120 | Random sample from 185K symbols. Class/method/field name_paths. |
 
 **Extraction queries (for reproducibility):** the corpus is built by sampling rows from
-three Postgres databases used by downstream consumers. The exact `psql` commands are not
+Postgres databases used by downstream consumers. The exact `psql` commands are not
 portable — adapt the queries below to your own environment by pointing them at any
 Postgres instance with similar tables.
 
@@ -219,7 +210,7 @@ The batch regression (76–319% slower at `onnx_batch_size=8`) dominates the ben
 
 | Consumer | Operation | Texts/request | Latency-sensitive? |
 |----------|-----------|---------------|-------------------|
-| `dpos-coordinator` | Semantic memory lookup | 1 | **Yes** — user/agent waiting |
+| Your application | Semantic memory lookup | 1 | **Yes** — user/agent waiting |
 | `mcp-local-knowledge-base` | Search query embedding | 1 | **Yes** — user waiting |
 | `mcp-local-knowledge-base` | Document chunk indexing | 10–50 | No — background task |
 
@@ -303,7 +294,7 @@ Estimated savings are relative to the CoreML 2-worker projection of 25–44 GB. 
 |---|--------|-------------|-----------|
 | 1 | **`BGE_M3_WORKERS=1`** | ~12–22 GB (CoreML) | Requests queue behind a single worker. P99 ~120 ms queued still beats MLAS P50 for long texts. |
 | 2 | **Shorter idle timeout** | Full model memory when idle | `BGE_M3_IDLE_TIMEOUT_SECS` already implemented. With CoreML model cache, reload ~5–10 s from compiled cache vs ~15–30 s cold. |
-| 3 | **Lower `BGE_M3_MAX_SEQ_LENGTH`** | Reduces auto-budget workspace ceiling | Setting `BGE_M3_MAX_SEQ_LENGTH=512` restores historical behavior; setting `=2048` matches codekeeper `max-tokens`. The bin-packer will pack more texts per chunk at shorter lengths. |
+| 3 | **Lower `BGE_M3_MAX_SEQ_LENGTH`** | Reduces auto-budget workspace ceiling | Setting `BGE_M3_MAX_SEQ_LENGTH=512` restores historical behavior; setting `=2048` is appropriate for longer code or document workloads. The bin-packer will pack more texts per chunk at shorter lengths. |
 
 ### Tier 2 — Moderate code changes
 
