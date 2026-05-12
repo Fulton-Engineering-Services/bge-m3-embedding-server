@@ -31,7 +31,7 @@ mod inner {
     use tracing::{debug, info, warn};
 
     enum NvmlState {
-        Ready { nvml: Nvml, gpu_count: usize },
+        Ready { nvml: Box<Nvml>, gpu_count: usize },
         Unavailable,
     }
 
@@ -55,7 +55,10 @@ mod inner {
                 Ok(nvml) => {
                     info!(gpu_count, "NVML initialised; GPU heartbeat stats enabled");
                     Self {
-                        state: NvmlState::Ready { nvml, gpu_count },
+                        state: NvmlState::Ready {
+                            nvml: Box::new(nvml),
+                            gpu_count,
+                        },
                     }
                 }
                 Err(e) => {
