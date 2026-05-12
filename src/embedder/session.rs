@@ -88,7 +88,7 @@ pub(super) fn execution_providers(
             // a cold engine cache benefits from a warm timing cache when
             // multiple shapes are compiled in the same warmup sweep.
             return vec![ort::ep::TensorRT::default()
-                .with_device_id(device_id as i32)
+                .with_device_id(device_id.cast_signed())
                 .with_engine_cache(true)
                 .with_engine_cache_path(cache_info.path.display().to_string())
                 .with_timing_cache(true)
@@ -102,7 +102,7 @@ pub(super) fn execution_providers(
         if ep == EpSelection::Cuda {
             let _ = cache_dir;
             return vec![ort::ep::CUDA::default()
-                .with_device_id(device_id as i32)
+                .with_device_id(device_id.cast_signed())
                 .build()];
         }
 

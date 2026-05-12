@@ -175,7 +175,7 @@ pub(crate) fn detect_gpu_count(override_val: Option<usize>) -> usize {
 fn count_nvidia_gpus_from_proc() -> Option<usize> {
     let count = std::fs::read_dir("/proc/driver/nvidia/gpus")
         .ok()?
-        .filter_map(|e| e.ok())
+        .filter_map(std::result::Result::ok)
         .count();
     if count > 0 {
         Some(count)
