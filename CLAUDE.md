@@ -112,6 +112,8 @@ The human-readable `text`/`pretty` formats do not include these tags.
 
 **Key log events at INFO:** per-request completion (`route`, `batch_size`, `chunks`, `tokenize_ms`, `inference_ms`, `total_ms`, `worker_id`); periodic heartbeat (`rss_mb`, `live_workers`, `queue_depth`, `probe_status`); full startup sequence. `/health` and `/v1/models` are logged at DEBUG to suppress load-balancer noise.
 
+**GPU heartbeat (GPU builds only):** on each heartbeat tick, one additional `INFO` event with `message: "gpu heartbeat"` is emitted per CUDA device, containing `gpu_device` (device index), `vram_used_mb`, `vram_total_mb`, `vram_utilization_pct`, `gpu_utilization_pct`, `gpu_temp_c` (GPU die temperature in °C), and `gpu_temp_f` (same temperature in °F, computed as `gpu_temp_c * 9 / 5 + 32`). NVML unavailability (driver absent, permission denied) is logged as a single `WARN` at startup and then silently skipped — it is never a fatal error. Per-device query failures are logged at `DEBUG` and skipped. CPU builds compile the GPU stats module as a zero-cost stub; no NVML dependency is present at all on CPU builds.
+
 **Useful CloudWatch Insights queries:**
 ```
 # p99 request latency by route

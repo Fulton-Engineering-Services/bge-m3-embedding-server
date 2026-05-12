@@ -1,6 +1,6 @@
 [package]
 name = "bge-m3-embedding-server"
-version = "1.2.0-rc5"
+version = "1.2.0-rc6"
 edition = "2021"
 license = "Apache-2.0"
 description = "Axum HTTP server serving BGE-M3 dense and sparse embeddings via ONNX Runtime"
@@ -34,6 +34,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 anyhow = "1"
 tower-http = { version = "0.6", features = ["trace", "request-id"] }
 uuid = { version = "1", features = ["v4"] }
+nvml-wrapper = { version = "0.12.1", optional = true }
 
 [features]
 ## Emit per-op CoreML hardware dispatch decisions to stderr at model load time.
@@ -50,17 +51,22 @@ coreml-profile = []
 ## production builds — use ORT_LIB_LOCATION with a locally built ORT instead.
 download-ort = ["ort/download-binaries", "ort/tls-rustls"]
 
+## Enable NVML-based per-device GPU VRAM and utilization heartbeat logging.
+## Pulled in automatically by the `cuda` and `tensorrt` features; never needs
+## to be set manually. CPU builds do not depend on nvml-wrapper at all.
+nvml = ["dep:nvml-wrapper"]
+
 ## Enable the NVIDIA CUDA execution provider.
 ## Requires a CUDA-enabled ORT build (ORT_LIB_LOCATION pointing to a CUDA EP build,
 ## or `download-ort` with a CUDA prebuilt). CPU-only builds are unaffected by this
 ## feature gate — it is a no-op on macOS (CoreML is always used there).
-cuda = ["ort/cuda"]
+cuda = ["ort/cuda", "nvml"]
 
 ## Enable the NVIDIA TensorRT execution provider.
 ## TRT requires the CUDA EP underneath; this feature pulls in both.
 ## Requires a TensorRT-enabled ORT build. Falls back to the CUDA EP if TRT
 ## registration fails at runtime. CPU-only builds are unaffected.
-tensorrt = ["ort/cuda", "ort/tensorrt"]
+tensorrt = ["ort/cuda", "ort/tensorrt", "nvml"]
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

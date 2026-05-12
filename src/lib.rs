@@ -33,6 +33,7 @@ pub mod bootstrap;
 pub mod config;
 pub mod embedder;
 pub mod error;
+pub mod gpu_stats;
 pub mod handler;
 pub mod logging;
 pub mod models;
@@ -54,6 +55,7 @@ use crate::binpack::CostModel;
 use crate::bootstrap::{build_router, run_readiness_probe};
 use crate::config::Config;
 use crate::embedder::{EmbedPool, WorkerConfig};
+use crate::gpu_stats::GpuStatsCollector;
 use crate::state::{AppState, ProbeStatus};
 
 /// Runs the embedding server end-to-end: load config, spawn the worker pool,
@@ -199,8 +201,10 @@ pub async fn run() -> anyhow::Result<()> {
 
     // Periodic heartbeat — logs RSS, worker counts, queue depth, and permits
     // at a fixed interval so dashboards can detect slow leaks or saturation.
+    // On GPU builds, also emits per-device VRAM and utilization stats.
     let heartbeat_secs = cfg.heartbeat_secs;
     if heartbeat_secs > 0 {
+        let gpu_stats = GpuStatsCollector::init(cfg.gpu_count);
         let state_hb = Arc::clone(&state);
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(Duration::from_secs(heartbeat_secs));
@@ -221,6 +225,7 @@ pub async fn run() -> anyhow::Result<()> {
                             .as_str(),
                     "heartbeat"
                 );
+                gpu_stats.emit_heartbeat();
             }
         });
     }
