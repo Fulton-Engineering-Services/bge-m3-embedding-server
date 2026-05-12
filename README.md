@@ -292,7 +292,7 @@ require a restart.
 |----------|---------|-------------|
 | `BGE_M3_CACHE_DIR` | `/cache` | Directory where ONNX model files are cached |
 | `BGE_M3_BIND` | `0.0.0.0:8081` | TCP bind address |
-| `BGE_M3_WORKERS` | `2` | Worker thread count (each loads its own model; min 1). Automatically clamped to `1` when `BGE_M3_EP` is `cuda` or `tensorrt` — see [GPU Execution Providers](#gpu-execution-providers-cuda--tensorrt). |
+| `BGE_M3_WORKERS` | `2` | Worker thread count (each loads its own model; min 1). On GPU EPs (`cuda`/`tensorrt`), workers are clamped to `BGE_M3_GPU_COUNT` and each worker is pinned to a distinct CUDA device (`device_id = worker_index % gpu_count`). A `WARN` is logged if the requested count exceeds `BGE_M3_GPU_COUNT`. For maximum throughput on multi-GPU instances, set `BGE_M3_WORKERS` equal to `BGE_M3_GPU_COUNT`. See [GPU Execution Providers](#gpu-execution-providers-cuda--tensorrt). |
 | `BGE_M3_INTRA_THREADS` | `1` | Intra-op threads each ORT session may use per `session.run()` call (min 1). Default `1` keeps per-worker RSS predictable for the workspace probe; raise to `floor(num_cpus / workers)` on under-utilized hosts to fan out matmul/attention kernels across cores. Re-run the probe after changing. |
 | `BGE_M3_MAX_BATCH` | `256` | Maximum texts per request (min 1) |
 | `BGE_M3_MAX_SEQ_LENGTH` | `8192` | Maximum tokenized sequence length, range `[1, 8192]`. Lower values reduce memory; `8192` is BGE-M3's published maximum. |
@@ -300,8 +300,9 @@ require a restart.
 | `BGE_M3_MODEL` | `fp16` | Model variant — see [Model Variants](#model-variants) |
 | `BGE_M3_EP` | `cpu` | Execution provider: `cpu` (MLAS, default), `cuda` (NVIDIA CUDA), or `tensorrt` (NVIDIA TensorRT). On macOS, CoreML is always used regardless of this setting. `cuda`/`tensorrt` require the corresponding Cargo feature and a GPU-enabled ORT build — use the `-cuda` Docker image tag. |
 | `BGE_M3_GPU_VRAM_BUDGET_BYTES` | unset | VRAM workspace ceiling (bytes) when `BGE_M3_EP` is `cuda` or `tensorrt`. Defaults to 10 GiB when unset (suitable for GPUs with ≥ 16 GiB VRAM, e.g. A10G / L4). Lower this for GPUs with less VRAM (e.g. `8589934592` for 8 GiB). The host-RAM probe is bypassed when any GPU EP is active. |
-| `BGE_M3_TRT_WARMUP_SHAPES` | 2D 16-shape grid (see TensorRT notes) | Comma-separated `BxL` shapes to pre-compile as TensorRT engine files during worker startup (`BGE_M3_EP=tensorrt` only). Default: `{1, 4, 16, 32} × {128, 512, 2048, 8192}` in batch-major order — the smallest batches finish first so common router shapes are warm quickly. Invalid tokens are skipped with a warning; empty or all-invalid values fall back to the default set. Each shape takes 30–170 s on the first deploy; subsequent starts reuse cached engines. Shrink the grid (e.g. `1x128`) for local development. |
-| `BGE_M3_WARMUP_ONLY` | `0` | When `1`, compile and fsync all TRT engine files then exit 0. No HTTP port is bound. Use as an ECS init container to pre-populate the shared engine cache before the main container starts — the main container then reaches healthy in seconds instead of 90–180 minutes on a cold cache. A `WARN` is logged if set with a non-`tensorrt` EP (exits 0 cleanly regardless). See [ECS Init Container Pattern](#ecs-init-container-pattern-tensorrt). |
+| `BGE_M3_GPU_COUNT` | auto | Number of GPU devices on this instance. Auto-detected on Linux by counting entries under `/proc/driver/nvidia/gpus/`; defaults to `1` on macOS and on Linux without an NVIDIA driver present. On GPU EPs, `BGE_M3_WORKERS` is clamped to this value and each worker is pinned to device `worker_index % gpu_count`. Set explicitly on multi-GPU ECS tasks: `BGE_M3_GPU_COUNT=8`. |
+| `BGE_M3_TRT_WARMUP_SHAPES` | 2D 16-shape grid (see TensorRT notes) | Comma-separated `BxL` shapes to pre-compile as TensorRT engine files during worker startup (`BGE_M3_EP=tensorrt` only). Default: `{1, 4, 16, 32} × {128, 512, 2048, 8192}` in batch-major order — the smallest batches finish first so common router shapes are warm quickly. Invalid tokens are skipped with a warning; empty or all-invalid values fall back to the default set. Each shape takes 30–170 s on the first deploy; subsequent starts reuse cached engines. With `BGE_M3_WORKERS > 1` (multi-GPU), the shape list is automatically sharded across workers using stride partition so each GPU compiles a disjoint subset in parallel — total cold-compile time is reduced roughly proportionally to GPU count. Shrink the grid (e.g. `1x128`) for local development. |
+| `BGE_M3_WARMUP_ONLY` | `0` | When `1`, compile and fsync all TRT engine files then exit 0. No HTTP port is bound. Use as an ECS init container to pre-populate the shared engine cache before the main container starts — the main container then reaches healthy in seconds instead of 90–180 minutes on a cold cache. On multi-GPU instances, set `BGE_M3_GPU_COUNT=N` alongside `BGE_M3_WARMUP_ONLY=1` so the init container spawns N workers and shards the warmup grid across all GPUs in parallel, reducing cold-compile time ~N×. A `WARN` is logged if set with a non-`tensorrt` EP (exits 0 cleanly regardless). See [ECS Init Container Pattern](#ecs-init-container-pattern-tensorrt). |
 | `BGE_M3_LOG_FORMAT` | (text) | Set to `json` for structured JSON log output; omit for auto-detect (JSON in non-TTY, human-readable in TTY) |
 
 ### Auto-Budget Tuning (Linux)
@@ -355,9 +356,13 @@ no-ops on macOS (CoreML is always used there) and in CPU-only builds.
 
 **Key constraints when using GPU EPs:**
 
-- `BGE_M3_WORKERS` is automatically clamped to `1`. The GPU is a serial inference resource;
-  loading multiple ORT sessions on the same GPU wastes VRAM with no throughput benefit.
-  Multi-stream GPU concurrency is a future enhancement.
+- `BGE_M3_WORKERS` is clamped to `BGE_M3_GPU_COUNT` (default: auto-detected, minimum 1). Each
+  worker is pinned to a distinct CUDA device (`device_id = worker_index % gpu_count`). On a
+  single-GPU instance this behaves identically to the old "clamped to 1" behavior. On a
+  multi-GPU instance, set `BGE_M3_WORKERS` equal to `BGE_M3_GPU_COUNT` for maximum parallel
+  inference throughput — each GPU runs its own independent ORT session.
+- `BGE_M3_GPU_COUNT` is auto-detected on Linux from `/proc/driver/nvidia/gpus/`. Override it
+  explicitly for multi-GPU ECS tasks: `BGE_M3_GPU_COUNT=8`.
 - The host-RAM startup probe is bypassed; `BGE_M3_GPU_VRAM_BUDGET_BYTES` (default 10 GiB) is
   used as the workspace ceiling instead.
 - Requires the NVIDIA Container Toolkit on the host (ECS GPU AMI or equivalent).
@@ -399,7 +404,7 @@ docker run --rm --gpus all \
 # exits 0 after compiling the single 1×128 engine
 ```
 
-**ECS task definition snippet (generic):**
+**ECS task definition snippet (single GPU):**
 
 ```json
 {
@@ -440,18 +445,73 @@ docker run --rm --gpus all \
 }
 ```
 
+**Multi-GPU init container (parallel warmup):**
+
+On instances with multiple GPUs (e.g. `p3.8xlarge` with 4 × V100 or `g6e.48xlarge` with 8 × L40S),
+set `BGE_M3_GPU_COUNT` and `BGE_M3_WORKERS` in both containers so the warmup grid is sharded across
+all GPUs in parallel — reducing cold-compile wall-clock time roughly N× (N = GPU count). Each worker
+is auto-assigned to device `worker_index % gpu_count`, and the TRT warmup shapes are partitioned via
+stride so expensive large-sequence shapes are distributed evenly.
+
+```json
+{
+  "containerDefinitions": [
+    {
+      "name": "trt-warmup",
+      "image": "ghcr.io/fulton-engineering-services/bge-m3-embedding-server:latest-cuda",
+      "essential": false,
+      "environment": [
+        { "name": "BGE_M3_EP",          "value": "tensorrt" },
+        { "name": "BGE_M3_WARMUP_ONLY", "value": "1" },
+        { "name": "BGE_M3_GPU_COUNT",   "value": "4" },
+        { "name": "BGE_M3_WORKERS",     "value": "4" }
+      ],
+      "mountPoints": [
+        { "sourceVolume": "engine-cache", "containerPath": "/cache" }
+      ],
+      "resourceRequirements": [
+        { "type": "GPU", "value": "4" }
+      ]
+    },
+    {
+      "name": "bge-m3",
+      "image": "ghcr.io/fulton-engineering-services/bge-m3-embedding-server:latest-cuda",
+      "essential": true,
+      "environment": [
+        { "name": "BGE_M3_EP",        "value": "tensorrt" },
+        { "name": "BGE_M3_GPU_COUNT", "value": "4" },
+        { "name": "BGE_M3_WORKERS",   "value": "4" }
+      ],
+      "mountPoints": [
+        { "sourceVolume": "engine-cache", "containerPath": "/cache" }
+      ],
+      "resourceRequirements": [
+        { "type": "GPU", "value": "4" }
+      ],
+      "dependsOn": [
+        { "containerName": "trt-warmup", "condition": "SUCCESS" }
+      ]
+    }
+  ]
+}
+```
+
+With 4 GPUs and the default 16-shape grid, each GPU compiles 4 shapes in parallel — total cold-start
+drops from ~90–180 min to ~22–45 min. Engine plan files are written to the shared cache volume and
+are available to all workers on startup (ORT namespaces them by SM version, so files from different
+GPU architectures coexist safely in the same directory).
+
 **Key deployment notes:**
 
-- **Both containers need GPU access** (`"type": "GPU", "value": "1"` in `resourceRequirements`).
-  The warmup container requires the GPU to compile TRT engines; the main container requires it for
-  inference.
+- **All containers need GPU access** — both the warmup and main containers must declare
+  `"type": "GPU"` in `resourceRequirements` with a count matching `BGE_M3_GPU_COUNT`.
 - **Both containers must mount the same cache volume.** The warmup container writes compiled
   engines to `{cache}/trt-engines/`; the main container reads them on startup.
 - **`healthCheckGracePeriodSeconds` must cover the full warmup window.** ECS measures the grace
-  period from task start (not from when the main container starts). For a 16-shape grid on an L4,
-  set `healthCheckGracePeriodSeconds` to at least `10800` (3 hours) to be safe. Once the engine
-  cache is warm and reused on subsequent deploys, the grace period is not consumed. Tune down for
-  smaller warmup grids.
+  period from task start (not from when the main container starts). For a 16-shape grid on a single
+  L4, set `healthCheckGracePeriodSeconds` to at least `10800` (3 hours); with 4 GPUs, ~`3600` is
+  sufficient. Once the engine cache is warm and reused on subsequent deploys, the grace period is
+  not consumed. Tune down for smaller warmup grids or more GPUs.
 - **TRT engine plans are compute-capability-specific.** Plans compiled on an L4 (`sm_89`) cannot
   be used on an A10G (`sm_86`) or T4 (`sm_75`). Use a homogeneous ASG (all instances of the same
   GPU family). An EFS-mounted cache shared across a mixed-GPU ASG will produce cache misses for
