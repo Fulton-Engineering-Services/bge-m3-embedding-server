@@ -30,6 +30,7 @@ async fn spawn_propagates_leader_load_failure() {
             max_seq_length: 512,
             intra_threads: 1,
             ep: crate::config::EpSelection::Cpu,
+            trt_warmup_shapes: vec![],
         },
     );
 
@@ -63,6 +64,7 @@ async fn spawn_multi_worker_fails_fast_on_leader_failure() {
             max_seq_length: 512,
             intra_threads: 1,
             ep: crate::config::EpSelection::Cpu,
+            trt_warmup_shapes: vec![],
         },
     );
 

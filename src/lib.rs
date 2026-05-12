@@ -125,6 +125,7 @@ pub async fn run() -> anyhow::Result<()> {
             max_seq_length: cfg.max_seq_length,
             intra_threads: cfg.intra_threads,
             ep: cfg.ep,
+            trt_warmup_shapes: cfg.trt_warmup_shapes,
         },
     );
 

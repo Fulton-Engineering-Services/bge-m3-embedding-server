@@ -14,7 +14,7 @@
 
 use std::collections::HashMap;
 
-use super::super::{Config, ModelVariant};
+use super::super::{parse_trt_warmup_shapes, Config, ModelVariant};
 use super::helpers::lookup_from;
 use crate::binpack::CostModel;
 
@@ -136,4 +136,64 @@ fn heartbeat_secs_invalid_falls_back_to_default() {
         cfg.heartbeat_secs, 60,
         "invalid value should fall back to default"
     );
+}
+
+// --- BGE_M3_TRT_WARMUP_SHAPES ---
+
+#[test]
+fn trt_warmup_shapes_none_yields_defaults() {
+    assert_eq!(
+        parse_trt_warmup_shapes(None),
+        vec![(1, 128), (1, 512), (1, 2048), (1, 8192)],
+    );
+}
+
+#[test]
+fn trt_warmup_shapes_empty_string_yields_defaults() {
+    assert_eq!(
+        parse_trt_warmup_shapes(Some(String::new())),
+        vec![(1, 128), (1, 512), (1, 2048), (1, 8192)],
+    );
+}
+
+#[test]
+fn trt_warmup_shapes_valid_tokens_parsed() {
+    assert_eq!(
+        parse_trt_warmup_shapes(Some("1x128,1x512".to_string())),
+        vec![(1, 128), (1, 512)],
+    );
+}
+
+#[test]
+fn trt_warmup_shapes_invalid_token_skipped() {
+    // "bad" is not a valid BxL token and should be silently skipped.
+    assert_eq!(
+        parse_trt_warmup_shapes(Some("1x128,bad,1x512".to_string())),
+        vec![(1, 128), (1, 512)],
+    );
+}
+
+#[test]
+fn trt_warmup_shapes_all_invalid_yields_defaults() {
+    assert_eq!(
+        parse_trt_warmup_shapes(Some("bad,also_bad,nope".to_string())),
+        vec![(1, 128), (1, 512), (1, 2048), (1, 8192)],
+    );
+}
+
+#[test]
+fn trt_warmup_shapes_config_field_defaults_without_env() {
+    let map = HashMap::new();
+    let cfg = Config::from_lookup(lookup_from(&map));
+    assert_eq!(
+        cfg.trt_warmup_shapes,
+        vec![(1, 128), (1, 512), (1, 2048), (1, 8192)],
+    );
+}
+
+#[test]
+fn trt_warmup_shapes_config_field_set_from_env() {
+    let map = HashMap::from([("BGE_M3_TRT_WARMUP_SHAPES", "4x256,1x8192")]);
+    let cfg = Config::from_lookup(lookup_from(&map));
+    assert_eq!(cfg.trt_warmup_shapes, vec![(4, 256), (1, 8192)]);
 }

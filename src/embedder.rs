@@ -24,6 +24,7 @@
 //! - `dense`: dense embedding pipeline.
 //! - `sparse`: BGE-M3 SPLADE-style sparse embedding pipeline.
 //! - `dual`: paired dense + sparse embedding pipeline (one forward pass).
+//! - `trt_warmup`: `TensorRT` engine pre-warming during worker startup.
 //! - `worker`: blocking worker thread, request dispatch, probe wiring.
 //! - `pool`: `EmbedPool` async wrapper and test helpers.
 
@@ -36,6 +37,7 @@ mod pool;
 mod session;
 mod sparse;
 mod tokenize;
+mod trt_warmup;
 mod types;
 mod worker;
 

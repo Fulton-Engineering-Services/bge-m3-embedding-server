@@ -238,6 +238,24 @@ pub struct Config {
     /// ceiling (suitable for GPUs with ≥ 16 GiB VRAM such as A10G / L4).
     /// Lower this on GPUs with less VRAM (e.g. `8589934592` for 8 GiB).
     pub gpu_vram_budget_bytes: Option<usize>,
+
+    /// List of `(batch_size, seq_len)` shapes to pre-compile as `TensorRT` engine
+    /// files during worker startup.
+    ///
+    /// Set with `BGE_M3_TRT_WARMUP_SHAPES` as a comma-separated list of `BxL`
+    /// tokens (e.g. `"1x128,1x512,1x2048,1x8192"`). Only used when
+    /// `ep == EpSelection::TensorRt`. Invalid tokens are skipped with a `WARN`.
+    /// An empty or all-invalid value falls back to the default set.
+    ///
+    /// Default: `[(1, 128), (1, 512), (1, 2048), (1, 8192)]` — covers short,
+    /// medium, long, and max-context shapes so every realistic request shape
+    /// hits a pre-compiled engine rather than triggering an on-demand compile.
+    ///
+    /// Each shape may take 30–120 s to compile on the first run; the worker
+    /// signals ready only after all shapes finish, so `/health` returns `503`
+    /// during this window. Subsequent starts reuse cached engine files and
+    /// warm up in seconds.
+    pub trt_warmup_shapes: Vec<(usize, usize)>,
 }
 
 impl Config {
@@ -354,6 +372,8 @@ impl Config {
             Some(CostModel::conservative(vram_budget))
         };
 
+        let trt_warmup_shapes = parse_trt_warmup_shapes(lookup("BGE_M3_TRT_WARMUP_SHAPES"));
+
         Self {
             cache_dir: lookup("BGE_M3_CACHE_DIR").unwrap_or_else(|| "/cache".to_string()),
             bind_addr: lookup("BGE_M3_BIND").unwrap_or_else(|| "0.0.0.0:8081".to_string()),
@@ -368,7 +388,46 @@ impl Config {
             heartbeat_secs,
             ep,
             gpu_vram_budget_bytes,
+            trt_warmup_shapes,
         }
+    }
+}
+
+/// Default TRT warmup shapes: short, medium, long, and max-context.
+const DEFAULT_TRT_WARMUP_SHAPES: &[(usize, usize)] = &[(1, 128), (1, 512), (1, 2048), (1, 8192)];
+
+/// Parses `BGE_M3_TRT_WARMUP_SHAPES` from its raw env-var value.
+///
+/// Accepts a comma-separated list of `BxL` tokens (e.g. `"1x128,1x512"`).
+/// Invalid tokens are skipped with a `WARN`. Returns the default shape set
+/// when `raw` is `None`, empty, or all tokens are invalid.
+pub(crate) fn parse_trt_warmup_shapes(raw: Option<String>) -> Vec<(usize, usize)> {
+    let Some(val) = raw else {
+        return DEFAULT_TRT_WARMUP_SHAPES.to_vec();
+    };
+    if val.trim().is_empty() {
+        return DEFAULT_TRT_WARMUP_SHAPES.to_vec();
+    }
+    let parsed: Vec<(usize, usize)> = val
+        .split(',')
+        .filter_map(|token| {
+            let token = token.trim();
+            let mut parts = token.splitn(2, 'x');
+            let batch = parts.next()?.parse::<usize>().ok()?;
+            let seq = parts.next()?.parse::<usize>().ok()?;
+            Some((batch, seq))
+        })
+        .collect();
+
+    if parsed.is_empty() {
+        warn!(
+            raw = %val,
+            "BGE_M3_TRT_WARMUP_SHAPES contained no valid BxL tokens; \
+             falling back to default warmup shapes"
+        );
+        DEFAULT_TRT_WARMUP_SHAPES.to_vec()
+    } else {
+        parsed
     }
 }
 

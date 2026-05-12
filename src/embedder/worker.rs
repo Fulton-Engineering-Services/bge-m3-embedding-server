@@ -32,6 +32,7 @@ use super::error::ort_err;
 use super::session::load_models;
 use super::sparse::embed_sparse;
 use super::tokenize::{build_chunk_arrays, tokenize_no_pad};
+use super::trt_warmup::trt_prewarm;
 use super::types::{EmbedRequest, ProbeResult};
 use crate::binpack::CostModel;
 use crate::config::{EpSelection, ModelVariant};
@@ -81,6 +82,14 @@ pub struct WorkerConfig {
     /// registers the correct EP. On macOS, `CoreML` is always used regardless
     /// of this value. See [`crate::config::EpSelection`] for details.
     pub ep: EpSelection,
+
+    /// `(batch_size, seq_len)` shapes to pre-compile as `TensorRT` engine files
+    /// during worker startup.
+    ///
+    /// Only applied when `ep == EpSelection::TensorRt`. Sourced from
+    /// `BGE_M3_TRT_WARMUP_SHAPES` via [`crate::config::Config::trt_warmup_shapes`].
+    /// An empty list skips pre-warming entirely.
+    pub trt_warmup_shapes: Vec<(usize, usize)>,
 }
 
 /// Runs a single `session.run()` for the probe, measuring RSS before and after.
@@ -155,7 +164,7 @@ pub(super) fn run_worker(
     // worker's model-weight + arena-baseline contribution, not accumulated
     // OS noise.
     let pre_load_rss = sysinfo::read_process_rss_bytes().unwrap_or(0);
-    let initial_models = match load_models(
+    let mut initial_models = match load_models(
         &cache_dir,
         id == 0,
         config.model_variant,
@@ -207,6 +216,30 @@ pub(super) fn run_worker(
             return Err(e);
         }
     };
+
+    // TensorRT engine pre-warming: compile engine files for each configured
+    // shape before signaling readiness.  This runs BEFORE ready_tx.send() so
+    // the worker is not marked ready until all TRT engines are cached —
+    // `/health` correctly returns `503 loading` during the compile window.
+    //
+    // Each shape may take 30–120 s on first deploy; subsequent starts reuse
+    // the cached `.engine` files from `{cache_dir}/trt-engines/` (seconds).
+    if config.ep == EpSelection::TensorRt && !config.trt_warmup_shapes.is_empty() {
+        tracing::info!(
+            worker_id = id,
+            shapes = config.trt_warmup_shapes.len(),
+            "TensorRT pre-warm: compiling engine cache for {} shape(s) \
+             (first run per shape takes 30–120 s; subsequent starts reuse cache)",
+            config.trt_warmup_shapes.len()
+        );
+        let warmed = trt_prewarm(&mut initial_models.0, &config.trt_warmup_shapes, id);
+        tracing::info!(
+            worker_id = id,
+            warmed,
+            total = config.trt_warmup_shapes.len(),
+            "TensorRT pre-warm complete"
+        );
+    }
 
     // Report the RSS delta so EmbedPool can derive the true per-worker
     // model footprint for workspace-budget calculations.

@@ -300,6 +300,7 @@ require a restart.
 | `BGE_M3_MODEL` | `fp16` | Model variant — see [Model Variants](#model-variants) |
 | `BGE_M3_EP` | `cpu` | Execution provider: `cpu` (MLAS, default), `cuda` (NVIDIA CUDA), or `tensorrt` (NVIDIA TensorRT). On macOS, CoreML is always used regardless of this setting. `cuda`/`tensorrt` require the corresponding Cargo feature and a GPU-enabled ORT build — use the `-cuda` Docker image tag. |
 | `BGE_M3_GPU_VRAM_BUDGET_BYTES` | unset | VRAM workspace ceiling (bytes) when `BGE_M3_EP` is `cuda` or `tensorrt`. Defaults to 10 GiB when unset (suitable for GPUs with ≥ 16 GiB VRAM, e.g. A10G / L4). Lower this for GPUs with less VRAM (e.g. `8589934592` for 8 GiB). The host-RAM probe is bypassed when any GPU EP is active. |
+| `BGE_M3_TRT_WARMUP_SHAPES` | `1x128,1x512,1x2048,1x8192` | Comma-separated `BxL` shapes to pre-compile as TensorRT engine files during worker startup (`BGE_M3_EP=tensorrt` only). Invalid tokens are skipped with a warning; empty or all-invalid values fall back to the default set. Each shape takes 30–120 s on the first deploy; subsequent starts reuse cached engines. |
 | `BGE_M3_LOG_FORMAT` | (text) | Set to `json` for structured JSON log output; omit for auto-detect (JSON in non-TTY, human-readable in TTY) |
 
 ### Auto-Budget Tuning (Linux)
