@@ -130,6 +130,25 @@ pub async fn run() -> anyhow::Result<()> {
         },
     );
 
+    // Warmup-only path: wait for all workers (and TRT engine compilation) to
+    // finish, log the engine count, then exit 0.  No HTTP listener is bound —
+    // intended for use as an ECS init container that pre-populates the shared
+    // EFS engine cache before the main container starts.
+    if cfg.warmup_only {
+        init_handle
+            .await
+            .map_err(|e| anyhow::anyhow!("Worker pool task panicked: {e}"))?
+            .map_err(|e| anyhow::anyhow!("Worker pool initialization failed: {e}"))?;
+        let trt_info =
+            crate::embedder::trt_cache::ensure_and_inspect(&PathBuf::from(&cfg.cache_dir));
+        info!(
+            engine_count = trt_info.engine_count,
+            cache_path = %trt_info.path.display(),
+            "warmup-only mode: all TRT engines compiled and cached, exiting"
+        );
+        std::process::exit(0);
+    }
+
     let state = Arc::new(AppState {
         pool,
         ready: AtomicBool::new(false),

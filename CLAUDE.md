@@ -90,6 +90,7 @@ When `status=ok`, the `/health` response also includes:
 | `BGE_M3_EP` | `cpu` | Execution provider: `cpu` (MLAS, default), `cuda` (NVIDIA CUDA EP), or `tensorrt` (NVIDIA TensorRT EP). On macOS, CoreML is always used. `cuda`/`tensorrt` require the corresponding Cargo feature and a GPU-enabled ORT build; use `Dockerfile.cuda` and the `-cuda` image tag. |
 | `BGE_M3_GPU_VRAM_BUDGET_BYTES` | unset | VRAM workspace ceiling (bytes) when `BGE_M3_EP` is `cuda` or `tensorrt`. Defaults to 10 GiB (suitable for A10G / L4 and larger). The host-RAM probe is bypassed when any GPU EP is active. |
 | `BGE_M3_TRT_WARMUP_SHAPES` | 16-shape 2D grid (see gotcha) | Comma-separated `BxL` shapes to pre-compile as TensorRT engine files during worker startup. Only used when `BGE_M3_EP=tensorrt`. Invalid tokens are skipped with a WARN; empty or all-invalid falls back to the default set. Each shape takes 30–170 s on first deploy; subsequent starts reuse the cached engines. Operators running on workstations should shrink the grid (e.g. `1x128`) to keep cold-start tractable. |
+| `BGE_M3_WARMUP_ONLY` | `0` | Exit cleanly after TRT engine compilation. When `1`, the server initialises normally (loads ONNX, configures the TRT EP, runs pre-warm shape compilation), then exits 0 after all engines are compiled and fsynced to the cache. No TCP listener is bound. Use as an ECS init container to pre-populate the engine cache before starting the main container. A WARN is logged if set with a non-`tensorrt` EP (no-op, still exits 0). |
 
 ### Logging and Observability
 

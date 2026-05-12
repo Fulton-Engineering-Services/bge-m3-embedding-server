@@ -245,6 +245,46 @@ fn trt_warmup_shapes_small_grid_override_works_for_local_dev() {
     assert_eq!(cfg.trt_warmup_shapes, vec![(1, 128)]);
 }
 
+// --- BGE_M3_WARMUP_ONLY ---
+
+#[test]
+fn warmup_only_defaults_to_false() {
+    let map = HashMap::new();
+    let cfg = Config::from_lookup(lookup_from(&map));
+    assert!(!cfg.warmup_only);
+}
+
+#[test]
+fn warmup_only_true_when_set_to_1() {
+    let map = HashMap::from([("BGE_M3_WARMUP_ONLY", "1"), ("BGE_M3_EP", "tensorrt")]);
+    let cfg = Config::from_lookup(lookup_from(&map));
+    assert!(cfg.warmup_only);
+}
+
+#[test]
+fn warmup_only_true_when_set_to_true() {
+    let map = HashMap::from([("BGE_M3_WARMUP_ONLY", "true"), ("BGE_M3_EP", "tensorrt")]);
+    let cfg = Config::from_lookup(lookup_from(&map));
+    assert!(cfg.warmup_only);
+}
+
+#[test]
+fn warmup_only_false_when_set_to_0() {
+    let map = HashMap::from([("BGE_M3_WARMUP_ONLY", "0")]);
+    let cfg = Config::from_lookup(lookup_from(&map));
+    assert!(!cfg.warmup_only);
+}
+
+#[test]
+fn warmup_only_with_non_trt_ep_still_parses_true() {
+    // The WARN path: warmup_only=true with a CPU EP is allowed (exits 0
+    // without compiling anything).  Config must still reflect the value.
+    let map = HashMap::from([("BGE_M3_WARMUP_ONLY", "1")]);
+    let cfg = Config::from_lookup(lookup_from(&map));
+    assert!(cfg.warmup_only);
+    assert_eq!(cfg.ep, EpSelection::Cpu);
+}
+
 // --- BGE_M3_EP (EpSelection) ---
 
 #[test]

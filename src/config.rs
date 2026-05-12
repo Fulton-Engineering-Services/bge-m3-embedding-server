@@ -262,6 +262,26 @@ pub struct Config {
     /// signals ready only after all shapes finish, so `/health` returns `503`
     /// during this window.
     pub trt_warmup_shapes: Vec<(usize, usize)>,
+
+    /// Exit cleanly after `TensorRT` engine compilation and cache flush.
+    ///
+    /// Set with `BGE_M3_WARMUP_ONLY`. Default `false`.
+    ///
+    /// When `true` the server initialises the model and ORT session exactly as
+    /// normal — loading ONNX weights, configuring the TRT EP, and running the
+    /// pre-warm shape compilation via the existing warmup path. After all
+    /// engines have been compiled and fsynced to the EFS cache the process
+    /// logs a single `INFO` line and calls `process::exit(0)`. No TCP listener
+    /// is bound; the HTTP server never starts.
+    ///
+    /// Primary use-case: ECS init container that pre-populates the shared EFS
+    /// engine cache before the main container starts, so the main container
+    /// always sees a warm cache and skips the 6–12 minute cold-compile window.
+    ///
+    /// A `WARN` is logged if this flag is set with `BGE_M3_EP` other than
+    /// `tensorrt` — warmup-only on CPU is a no-op (there is nothing to compile)
+    /// but the server still exits 0 cleanly rather than erroring.
+    pub warmup_only: bool,
 }
 
 impl Config {
@@ -380,6 +400,18 @@ impl Config {
 
         let trt_warmup_shapes = parse_trt_warmup_shapes(lookup("BGE_M3_TRT_WARMUP_SHAPES"));
 
+        let warmup_only = lookup("BGE_M3_WARMUP_ONLY")
+            .is_some_and(|v| matches!(v.as_str(), "1" | "true" | "yes"));
+
+        if warmup_only && ep != EpSelection::TensorRt {
+            warn!(
+                ep = %ep,
+                "BGE_M3_WARMUP_ONLY=1 is set but BGE_M3_EP is not tensorrt — \
+                 warmup-only is a no-op on non-TRT EPs (nothing to compile); \
+                 the server will exit 0 without performing any engine compilation"
+            );
+        }
+
         Self {
             cache_dir: lookup("BGE_M3_CACHE_DIR").unwrap_or_else(|| "/cache".to_string()),
             bind_addr: lookup("BGE_M3_BIND").unwrap_or_else(|| "0.0.0.0:8081".to_string()),
@@ -395,6 +427,7 @@ impl Config {
             ep,
             gpu_vram_budget_bytes,
             trt_warmup_shapes,
+            warmup_only,
         }
     }
 }

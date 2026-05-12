@@ -39,7 +39,7 @@ mod pool;
 mod session;
 mod sparse;
 mod tokenize;
-mod trt_cache;
+pub(crate) mod trt_cache;
 mod trt_warmup;
 mod types;
 mod worker;
