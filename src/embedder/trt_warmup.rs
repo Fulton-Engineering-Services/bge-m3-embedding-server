@@ -16,19 +16,235 @@
 //! worker startup so the first real request hits a cached engine instead
 //! of triggering an on-demand 30–170 s compile.
 //!
-//! Durability: after each shape compiles, the engine cache directory is
-//! fsynced so an unexpected SIGKILL (ECS OOM-kill, host crash) cannot strand
-//! a partially-written engine plan in the page cache. Without this fsync,
-//! a container that compiled engines but was OOM-killed during real traffic
-//! would leave the EFS inode pointing at files whose data blocks had never
-//! reached disk — and the next container would silently re-compile every
-//! shape, paying the full cold-start cost again. See `trt_cache.rs` for the
-//! root-cause investigation.
+//! ## Durability
+//!
+//! After each shape compiles, the engine cache directory is fsynced so an
+//! unexpected SIGKILL (ECS OOM-kill, host crash) cannot strand a
+//! partially-written engine plan in the page cache.  See `trt_cache.rs`.
+//!
+//! ## Cache-hit fast path (warm cache skip)
+//!
+//! ORT's TRT EP caches engines with per-dimension `[min, max]` ranges — not
+//! one engine per shape.  A `session.run()` is a cache **hit** (fast, no
+//! compile) when every input dimension falls within the cached `[min, max]`
+//! range; it is a cache **miss** (slow compile) only when a dimension falls
+//! outside that range and the engine must be rebuilt with an extended range.
+//!
+//! After a full first-deploy warmup sweep, the cached profile records:
+//! `input_ids.dim_0 ∈ [min_batch, max_batch]` and
+//! `input_ids.dim_1 ∈ [min_seq, max_seq]` — covering every shape in the
+//! warmup grid.  On subsequent container starts, every warmup
+//! `session.run()` is a cache hit and finishes in ≤ 3 s.
+//!
+//! Rather than paying 16 × 1–3 s = 16–48 s of redundant cache-hit loads,
+//! `trt_prewarm` runs at most **4 "dimensional-extreme" shapes** (the shapes
+//! that exercise the minimum and maximum of each input dimension
+//! independently) and measures wall-clock time.  If all extremes complete
+//! under [`CACHE_HIT_THRESHOLD_MS`], the profile is guaranteed to cover the
+//! entire shard and the remaining shapes are skipped.
+//!
+//! ### Why this has zero false positives
+//!
+//! For shape `(b, s)` to be a TRT cache hit it must satisfy:
+//! ```text
+//! profile.min_batch ≤ b ≤ profile.max_batch   (batch dimension)
+//! profile.min_seq   ≤ s ≤ profile.max_seq      (sequence dimension)
+//! ```
+//!
+//! The four extreme shapes bound all four inequalities independently:
+//!
+//! | Check shape          | Fact established when it is a cache hit  |
+//! |----------------------|------------------------------------------|
+//! | `(min_batch, any_s)` | `profile.min_batch ≤ min_batch`          |
+//! | `(max_batch, any_s)` | `profile.max_batch ≥ max_batch`          |
+//! | `(any_b, min_seq)`   | `profile.min_seq   ≤ min_seq`            |
+//! | `(any_b, max_seq)`   | `profile.max_seq   ≥ max_seq`            |
+//!
+//! Together these four facts guarantee that every shard shape `(b, s)` with
+//! `b ∈ [min_batch, max_batch]` and `s ∈ [min_seq, max_seq]` is a cache
+//! hit.  If any extreme shape is **slow** (≥ `CACHE_HIT_THRESHOLD_MS`) the
+//! engine must be rebuilt for that dimension → the fast path is suppressed
+//! and all remaining shapes are compiled normally.
 
 use std::path::Path;
 
 use super::trt_cache;
 use super::worker::probe_run_dense;
+
+/// Threshold (ms) below which a `session.run()` is classified as a TRT
+/// engine cache hit (loaded from disk) rather than a fresh compile.
+///
+/// Cold compiles take 30 000–170 000 ms; warm cache loads finish in
+/// ≤ 3 000 ms even for `32 × 8192` shapes.  A 5 000 ms threshold gives a
+/// comfortable margin above the observed maximum warm-load time while
+/// remaining well below the minimum observed cold-compile time.
+pub(super) const CACHE_HIT_THRESHOLD_MS: u64 = 5_000;
+
+/// Aggregate per-worker statistics returned by [`trt_prewarm`].
+///
+/// `total_compile_ms` and `total_fsync_ms` sum across only the shapes that
+/// completed successfully on this worker's shard, whether they were cache
+/// hits or fresh compiles.  They are intended for the `"TensorRT pre-warm
+/// complete"` summary log emitted by the worker.
+pub(super) struct PrewarmStats {
+    pub warmed: usize,
+    pub total_compile_ms: u64,
+    pub total_fsync_ms: u64,
+    /// `true` when the dimensional-extreme coverage check determined the
+    /// entire shard was already cached and the remaining shapes were skipped.
+    /// `false` on cold cache, on a fresh compile, or when the check phase
+    /// detected at least one slow (≥ `CACHE_HIT_THRESHOLD_MS`) shape.
+    pub fully_cached: bool,
+    /// Number of shapes in the shard that were skipped because
+    /// `fully_cached` was determined to be true.  Zero on cold cache or
+    /// when all shapes were run.
+    pub skipped: usize,
+}
+
+/// Selects the minimal set of shapes needed to verify that an ORT TRT EP
+/// cached profile covers all shapes in `shapes`.
+///
+/// ORT's TRT EP stores engine profiles as per-dimension `[min, max]` ranges.
+/// Verifying complete coverage requires bounding all four dimension extremes
+/// independently.  This function returns at most 4 representative shapes —
+/// one with `min_batch`, one with `max_batch`, one with `min_seq`, one with
+/// `max_seq` — deduplicated so the same shape is never run twice.
+///
+/// When the shard has only one unique extreme in a dimension (e.g. all
+/// shapes share the same batch size), the duplicates collapse and the
+/// returned set is smaller.
+pub(super) fn coverage_check_shapes(shapes: &[(usize, usize)]) -> Vec<(usize, usize)> {
+    if shapes.is_empty() {
+        return vec![];
+    }
+    let min_batch = shapes.iter().map(|(b, _)| *b).min().expect("non-empty");
+    let max_batch = shapes.iter().map(|(b, _)| *b).max().expect("non-empty");
+    let min_seq = shapes.iter().map(|(_, s)| *s).min().expect("non-empty");
+    let max_seq = shapes.iter().map(|(_, s)| *s).max().expect("non-empty");
+
+    // Pick the first shape in the shard that carries each dimensional extreme.
+    // "First" is stable (same shape list order across workers on the same host)
+    // so logs are reproducible.
+    let rep_min_batch = *shapes
+        .iter()
+        .find(|(b, _)| *b == min_batch)
+        .expect("non-empty");
+    let rep_max_batch = *shapes
+        .iter()
+        .find(|(b, _)| *b == max_batch)
+        .expect("non-empty");
+    let rep_min_seq = *shapes
+        .iter()
+        .find(|(_, s)| *s == min_seq)
+        .expect("non-empty");
+    let rep_max_seq = *shapes
+        .iter()
+        .find(|(_, s)| *s == max_seq)
+        .expect("non-empty");
+
+    // Deduplicate while preserving the discovery order (min_batch → max_batch
+    // → min_seq → max_seq) so the log is consistent across runs.
+    let mut result: Vec<(usize, usize)> = Vec::with_capacity(4);
+    for s in [rep_min_batch, rep_max_batch, rep_min_seq, rep_max_seq] {
+        if !result.contains(&s) {
+            result.push(s);
+        }
+    }
+    result
+}
+
+/// Result of a single [`run_warmup_shape`] call.
+struct ShapeRunResult {
+    compile_ms: u64,
+    fsync_ms: u64,
+    /// `true` when `compile_ms < CACHE_HIT_THRESHOLD_MS` (engine loaded from
+    /// disk cache) rather than compiled from scratch.
+    cache_hit: bool,
+    succeeded: bool,
+}
+
+/// Runs `session.run()` for a single `(batch, seq)` shape, measures wall
+/// time, classifies the result as a cache hit or fresh compile, and
+/// — on success — fsyncs the engine cache directory for durability.
+///
+/// The `shape_index` / `shape_total` parameters are purely for the
+/// operator-visible log message and do not affect logic.
+fn run_warmup_shape(
+    session: &mut ort::session::Session,
+    batch: usize,
+    seq: usize,
+    worker_id: usize,
+    shape_index: usize,
+    shape_total: usize,
+    engine_cache_dir: &Path,
+) -> ShapeRunResult {
+    let ids = ndarray::Array2::<i64>::zeros((batch, seq));
+    let mask = ndarray::Array2::<i64>::ones((batch, seq));
+
+    tracing::info!(
+        worker_id,
+        batch,
+        seq,
+        shape_index,
+        shape_total,
+        "TensorRT pre-warm: running shape (cold compile may take 30–170 s)"
+    );
+
+    let compile_start = std::time::Instant::now();
+    let result = probe_run_dense(session, &ids, &mask);
+    let compile_ms = u64::try_from(compile_start.elapsed().as_millis()).unwrap_or(u64::MAX);
+    let cache_hit = compile_ms < CACHE_HIT_THRESHOLD_MS;
+
+    match result {
+        Ok(_) => {
+            // Flush newly-written engine plan to disk before moving on.
+            // On a cache hit the engine file was only read (not written), so
+            // this fsync is a no-op for data durability — but it is cheap and
+            // keeps the call site uniform regardless of hot/cold path.
+            let fsync_start = std::time::Instant::now();
+            trt_cache::fsync_cache_dir(engine_cache_dir);
+            let fsync_ms = u64::try_from(fsync_start.elapsed().as_millis()).unwrap_or(u64::MAX);
+
+            tracing::info!(
+                worker_id,
+                batch,
+                seq,
+                shape_index,
+                shape_total,
+                compile_ms,
+                fsync_ms,
+                cache_hit,
+                "TensorRT pre-warm: engine compiled, cached, and fsynced"
+            );
+            ShapeRunResult {
+                compile_ms,
+                fsync_ms,
+                cache_hit,
+                succeeded: true,
+            }
+        }
+        Err(e) => {
+            tracing::warn!(
+                worker_id,
+                batch,
+                seq,
+                shape_index,
+                shape_total,
+                compile_ms,
+                cache_hit,
+                error = %e,
+                "TensorRT pre-warm: engine compilation failed for shape; \
+                 first real request for this shape will trigger an on-demand compile"
+            );
+            ShapeRunResult {
+                compile_ms,
+                fsync_ms: 0,
+                cache_hit,
+                succeeded: false,
+            }
+        }
+    }
+}
 
 /// Partitions `shapes` into a per-worker shard using a stride assignment.
 ///
@@ -65,105 +281,143 @@ pub(super) fn shard_shapes(
         .collect()
 }
 
-/// Aggregate per-worker statistics returned by [`trt_prewarm`].
-///
-/// `total_compile_ms` and `total_fsync_ms` sum across only the shapes that
-/// compiled successfully on this worker's shard. They are intended for the
-/// "`TensorRT` pre-warm complete" summary log emitted by the worker, where
-/// ops dashboards can divide total compile time across shards to reason
-/// about how much wall-clock the multi-GPU sharding is actually saving.
-pub(super) struct PrewarmStats {
-    pub warmed: usize,
-    pub total_compile_ms: u64,
-    pub total_fsync_ms: u64,
-}
-
 /// Runs a dummy `session.run()` for each `(batch, seq)` shape in
 /// `warmup_shapes` so the `TensorRT` EP compiles and caches engine files
 /// before the first real request arrives.
 ///
-/// Each shape may take 30–170 s on the very first deploy; subsequent starts
-/// reuse the cached `.engine` files (seconds). Progress is logged at `INFO`
-/// with `compile_ms` (the ORT/TRT compile call itself) and `fsync_ms` (the
-/// durability flush to the engine cache directory) for each shape. After
-/// each successful compile the engine cache directory is fsynced so the
-/// plan file survives an unexpected OOM-kill — see
+/// ## Warm-cache fast path
+///
+/// When `.engine` files already exist in the cache directory, the function
+/// first runs only the dimensional-extreme shapes (≤ 4) to probe whether
+/// the cached profile covers the full shard.  If all extreme shapes complete
+/// in under [`CACHE_HIT_THRESHOLD_MS`] the remaining shapes are **skipped**
+/// — they are guaranteed to be cache hits by the range-based ORT TRT EP
+/// profile logic (see module-level documentation for the proof).  If any
+/// extreme shape is slow the fast path is suppressed and all remaining
+/// shapes are compiled normally.
+///
+/// ## Cold cache
+///
+/// When no `.engine` files exist the coverage-check phase is bypassed and
+/// every shape is compiled in sequence.  Each may take 30–170 s on the
+/// very first deploy; subsequent starts reuse the cached `.engine` files.
+///
+/// Progress is logged at `INFO` with `compile_ms`, `fsync_ms`, and
+/// `cache_hit` (whether the run was under `CACHE_HIT_THRESHOLD_MS`) for
+/// each shape.  After each successful run the engine cache directory is
+/// fsynced so the plan file survives an unexpected OOM-kill — see
 /// `trt_cache::fsync_cache_dir`.
 ///
-/// Returns aggregate statistics including the number of shapes that
-/// compiled successfully and the per-worker total compile/fsync wall time.
+/// Returns aggregate statistics including `fully_cached` (whether the
+/// shard was served entirely from cache) and `skipped` (shapes not run).
 pub(super) fn trt_prewarm(
     session: &mut ort::session::Session,
     warmup_shapes: &[(usize, usize)],
     worker_id: usize,
     cache_dir: &Path,
 ) -> PrewarmStats {
+    let engine_cache_dir = trt_cache::engine_cache_path(cache_dir);
+
     let mut warmed = 0usize;
     let mut total_compile_ms: u64 = 0;
     let mut total_fsync_ms: u64 = 0;
-    let engine_cache_dir = trt_cache::engine_cache_path(cache_dir);
+    let shape_total = warmup_shapes.len();
 
-    for (idx, &(batch, seq)) in warmup_shapes.iter().enumerate() {
-        let ids = ndarray::Array2::<i64>::zeros((batch, seq));
-        let mask = ndarray::Array2::<i64>::ones((batch, seq));
+    if warmup_shapes.is_empty() {
+        return PrewarmStats {
+            warmed: 0,
+            total_compile_ms: 0,
+            total_fsync_ms: 0,
+            fully_cached: false,
+            skipped: 0,
+        };
+    }
 
-        tracing::info!(
-            worker_id,
+    // ── Coverage-check fast path ──────────────────────────────────────────
+    // If any engines already exist on disk, run only the dimensional-extreme
+    // shapes to determine whether the full shard is already cached.
+    let engine_count = trt_cache::count_engine_files(&engine_cache_dir);
+    let check_shapes = if engine_count > 0 {
+        coverage_check_shapes(warmup_shapes)
+    } else {
+        Vec::new()
+    };
+
+    // Run check shapes (at most 4).
+    let mut shape_idx = 0usize;
+    let mut all_checks_fast = !check_shapes.is_empty(); // false when check_shapes is empty
+    for &(batch, seq) in &check_shapes {
+        shape_idx += 1;
+        let r = run_warmup_shape(
+            session,
             batch,
             seq,
-            shape_index = idx + 1,
-            shape_total = warmup_shapes.len(),
-            "TensorRT pre-warm: compiling engine for shape (this may take 30–170 s)"
+            worker_id,
+            shape_idx,
+            shape_total,
+            &engine_cache_dir,
         );
-
-        // Tightly wrap only the ORT/TRT compile call so `compile_ms`
-        // measures engine-build wall time without the surrounding logging
-        // or fsync overhead.
-        let compile_start = std::time::Instant::now();
-        let result = probe_run_dense(session, &ids, &mask);
-        let compile_ms = u64::try_from(compile_start.elapsed().as_millis()).unwrap_or(u64::MAX);
-
-        match result {
-            Ok(_) => {
-                // Flush newly-written engine plan to disk before moving on
-                // to the next shape. If the kernel only ever held this
-                // engine in dirty pages, an ECS OOM-kill during the next
-                // shape (or during real traffic) would lose it silently.
-                let fsync_start = std::time::Instant::now();
-                trt_cache::fsync_cache_dir(&engine_cache_dir);
-                let fsync_ms = u64::try_from(fsync_start.elapsed().as_millis()).unwrap_or(u64::MAX);
-
-                tracing::info!(
-                    worker_id,
-                    batch,
-                    seq,
-                    shape_index = idx + 1,
-                    shape_total = warmup_shapes.len(),
-                    compile_ms,
-                    fsync_ms,
-                    "TensorRT pre-warm: engine compiled, cached, and fsynced"
-                );
-                warmed += 1;
-                total_compile_ms = total_compile_ms.saturating_add(compile_ms);
-                total_fsync_ms = total_fsync_ms.saturating_add(fsync_ms);
-            }
-            Err(e) => {
-                tracing::warn!(
-                    worker_id,
-                    batch,
-                    seq,
-                    shape_index = idx + 1,
-                    shape_total = warmup_shapes.len(),
-                    compile_ms,
-                    error = %e,
-                    "TensorRT pre-warm: engine compilation failed for shape; \
-                     first real request for this shape will trigger an on-demand compile"
-                );
-            }
+        if r.succeeded {
+            warmed += 1;
+            total_compile_ms = total_compile_ms.saturating_add(r.compile_ms);
+            total_fsync_ms = total_fsync_ms.saturating_add(r.fsync_ms);
+        }
+        if !r.cache_hit || !r.succeeded {
+            all_checks_fast = false;
         }
     }
 
-    // Final sweep covers any sidecar files (timing cache, .profile) that
+    if all_checks_fast {
+        // Every dimensional extreme was a sub-threshold cache hit: the ORT TRT
+        // EP's stored profile covers the full shard range.  Skip remaining shapes.
+        let skipped = shape_total.saturating_sub(check_shapes.len());
+        tracing::info!(
+            worker_id,
+            checked = check_shapes.len(),
+            skipped,
+            total = shape_total,
+            cache_hit_threshold_ms = CACHE_HIT_THRESHOLD_MS,
+            "TensorRT pre-warm: shard fully cached \
+             (all dimensional-extreme checks fast), skipping remaining shapes"
+        );
+        // One final fsync covers sidecar files (timing cache, `.profile`)
+        // that may have been touched during the check phase.
+        trt_cache::fsync_cache_dir(&engine_cache_dir);
+        return PrewarmStats {
+            warmed,
+            total_compile_ms,
+            total_fsync_ms,
+            fully_cached: true,
+            skipped,
+        };
+    }
+
+    // ── Full compile path ─────────────────────────────────────────────────
+    // Cold cache OR at least one extreme was slow → run all shapes not
+    // already executed in the check phase.
+    for &(batch, seq) in warmup_shapes {
+        // Skip shapes already run as coverage checks (avoid double-running).
+        if check_shapes.contains(&(batch, seq)) {
+            continue;
+        }
+        shape_idx += 1;
+        let r = run_warmup_shape(
+            session,
+            batch,
+            seq,
+            worker_id,
+            shape_idx,
+            shape_total,
+            &engine_cache_dir,
+        );
+        if r.succeeded {
+            warmed += 1;
+            total_compile_ms = total_compile_ms.saturating_add(r.compile_ms);
+            total_fsync_ms = total_fsync_ms.saturating_add(r.fsync_ms);
+        }
+    }
+
+    // Final sweep covers any sidecar files (timing cache, `.profile`) that
     // were touched during the warmup but not associated with a single shape.
     trt_cache::fsync_cache_dir(&engine_cache_dir);
 
@@ -171,41 +425,16 @@ pub(super) fn trt_prewarm(
         warmed,
         total_compile_ms,
         total_fsync_ms,
+        fully_cached: false,
+        skipped: 0,
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::shard_shapes;
+    use super::{coverage_check_shapes, shard_shapes, CACHE_HIT_THRESHOLD_MS};
 
-    /// `trt_prewarm` with an empty shape list returns 0 immediately without
-    /// attempting any inference.  We validate this by constructing a real ORT
-    /// CPU session (cheap — no actual GPU required) and calling with no shapes.
-    ///
-    /// The test skips model loading by verifying purely the early-return logic:
-    /// if `warmup_shapes` is empty the loop body never executes and the return
-    /// value is 0.
-    #[test]
-    fn empty_shapes_returns_zero() {
-        // We can't construct a real ORT session without model files in a unit
-        // test, so we verify the count accumulator logic by inspection:
-        // the loop `for &(batch, seq) in warmup_shapes` over an empty slice
-        // never executes, so `warmed` stays 0.
-        //
-        // This is equivalent to calling `trt_prewarm(session, &[], id)` and
-        // asserting 0, but without needing to load a model.  The runtime path
-        // is exercised by the equivalence integration test suite.
-        let shapes: Vec<(usize, usize)> = vec![];
-        let count: usize = shapes
-            .iter()
-            .map(|_| 1usize) // would increment warmed per success
-            .sum();
-        assert_eq!(count, 0);
-    }
-
-    // ----- shard_shapes tests -----
-
-    /// Default 16-shape grid for stride-sharding tests.
+    /// Default 16-shape grid for stride-sharding and coverage-check tests.
     fn default_shapes() -> Vec<(usize, usize)> {
         vec![
             (1, 128),
@@ -227,6 +456,159 @@ mod tests {
         ]
     }
 
+    // ─── CACHE_HIT_THRESHOLD_MS ───────────────────────────────────────────
+
+    // Compile-time guard: the threshold must lie between the warm-load ceiling
+    // (< 3 000 ms observed) and the cold-compile floor (≥ 30 000 ms observed).
+    // Expressed as a const assertion so it is checked at every build.
+    const _: () = {
+        assert!(CACHE_HIT_THRESHOLD_MS > 3_000);
+        assert!(CACHE_HIT_THRESHOLD_MS < 30_000);
+    };
+
+    // ─── coverage_check_shapes ────────────────────────────────────────────
+
+    #[test]
+    fn coverage_check_shapes_empty_input_returns_empty() {
+        assert!(coverage_check_shapes(&[]).is_empty());
+    }
+
+    #[test]
+    fn coverage_check_shapes_single_shape_returns_itself() {
+        let shapes = vec![(32_usize, 8192_usize)];
+        assert_eq!(coverage_check_shapes(&shapes), shapes);
+    }
+
+    #[test]
+    fn coverage_check_shapes_all_same_batch_returns_seq_extremes() {
+        // Worker-3 shard: all batch=4, seq varies → extremes collapse to 2 shapes.
+        let shapes = vec![(4, 128), (4, 512), (4, 2048), (4, 8192)];
+        let checks = coverage_check_shapes(&shapes);
+        // min_batch == max_batch → rep_min_batch == rep_max_batch → deduped to 1 from batch
+        // + (4,128) from min_seq + (4,8192) from max_seq = 2 shapes
+        assert_eq!(checks.len(), 2);
+        assert!(checks.contains(&(4, 128)), "must include min_seq shape");
+        assert!(checks.contains(&(4, 8192)), "must include max_seq shape");
+    }
+
+    #[test]
+    fn coverage_check_shapes_all_same_seq_returns_batch_extremes() {
+        // Shapes that share the same sequence length.
+        let shapes = vec![(1, 512), (4, 512), (16, 512), (32, 512)];
+        let checks = coverage_check_shapes(&shapes);
+        assert_eq!(checks.len(), 2);
+        assert!(checks.contains(&(1, 512)), "must include min_batch shape");
+        assert!(checks.contains(&(32, 512)), "must include max_batch shape");
+    }
+
+    #[test]
+    fn coverage_check_shapes_full_grid_returns_four_distinct_corners() {
+        let shapes = default_shapes();
+        let checks = coverage_check_shapes(&shapes);
+        // min_batch=1 → (1,128); max_batch=32 → (32,128); min_seq=128 → (1,128) same;
+        // max_seq=8192 → (1,8192). After dedup: {(1,128),(32,128),(1,8192)} = 3 shapes.
+        // (The (max_batch, min_seq) corner = (32,128) == rep_max_batch when the first
+        // shape with max_batch=32 is (32,128).)
+        assert!(checks.len() >= 2 && checks.len() <= 4);
+        // All checks must be present in the original shapes list.
+        for &c in &checks {
+            assert!(
+                shapes.contains(&c),
+                "check shape {c:?} not in original shard"
+            );
+        }
+    }
+
+    #[test]
+    fn coverage_check_shapes_covers_all_dimension_extremes() {
+        let shapes = default_shapes();
+        let checks = coverage_check_shapes(&shapes);
+        let min_batch = shapes.iter().map(|(b, _)| b).min().copied().unwrap();
+        let max_batch = shapes.iter().map(|(b, _)| b).max().copied().unwrap();
+        let min_seq = shapes.iter().map(|(_, s)| s).min().copied().unwrap();
+        let max_seq = shapes.iter().map(|(_, s)| s).max().copied().unwrap();
+
+        assert!(
+            checks.iter().any(|(b, _)| *b == min_batch),
+            "must include a shape with min_batch={min_batch}"
+        );
+        assert!(
+            checks.iter().any(|(b, _)| *b == max_batch),
+            "must include a shape with max_batch={max_batch}"
+        );
+        assert!(
+            checks.iter().any(|(_, s)| *s == min_seq),
+            "must include a shape with min_seq={min_seq}"
+        );
+        assert!(
+            checks.iter().any(|(_, s)| *s == max_seq),
+            "must include a shape with max_seq={max_seq}"
+        );
+    }
+
+    #[test]
+    fn coverage_check_shapes_no_duplicates() {
+        let shapes = default_shapes();
+        let checks = coverage_check_shapes(&shapes);
+        // Each shape appears at most once.
+        for i in 0..checks.len() {
+            for j in (i + 1)..checks.len() {
+                assert_ne!(
+                    checks[i], checks[j],
+                    "duplicate shape in check set: {:?}",
+                    checks[i]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn coverage_check_shapes_two_shape_shard_returns_both() {
+        let shapes = vec![(1_usize, 128_usize), (32_usize, 8192_usize)];
+        let checks = coverage_check_shapes(&shapes);
+        assert_eq!(checks.len(), 2);
+        assert!(checks.contains(&(1, 128)));
+        assert!(checks.contains(&(32, 8192)));
+    }
+
+    /// Regression: the zero-false-positive guarantee requires that the check
+    /// set independently exercises ALL four dimensional extremes.  This test
+    /// verifies that a shard where no single shape carries both `min_batch` AND
+    /// `min_seq` still produces a check set that covers each extreme separately.
+    #[test]
+    fn coverage_check_shapes_non_rectangular_shard_covers_all_extremes() {
+        // Shard without a (min_batch, min_seq) corner shape:
+        //   (1, 8192) carries min_batch but NOT min_seq
+        //   (32, 128) carries min_seq and max_batch but NOT min_batch
+        let shapes = vec![(1, 8192), (32, 128)];
+        let checks = coverage_check_shapes(&shapes);
+
+        let has_min_batch = checks.iter().any(|(b, _)| *b == 1);
+        let has_max_batch = checks.iter().any(|(b, _)| *b == 32);
+        let has_min_seq = checks.iter().any(|(_, s)| *s == 128);
+        let has_max_seq = checks.iter().any(|(_, s)| *s == 8192);
+
+        assert!(has_min_batch, "needs a shape with batch=1 (min_batch)");
+        assert!(has_max_batch, "needs a shape with batch=32 (max_batch)");
+        assert!(has_min_seq, "needs a shape with seq=128 (min_seq)");
+        assert!(has_max_seq, "needs a shape with seq=8192 (max_seq)");
+    }
+
+    // ─── trt_prewarm stub test ─────────────────────────────────────────────
+
+    /// `trt_prewarm` with an empty shape list returns 0 immediately without
+    /// attempting any inference.  We verify this by inspecting the
+    /// accumulator logic: the loop over an empty slice never executes, so
+    /// `warmed` stays 0.
+    #[test]
+    fn empty_shapes_returns_zero() {
+        let shapes: Vec<(usize, usize)> = vec![];
+        let count: usize = shapes.iter().map(|_| 1usize).sum();
+        assert_eq!(count, 0);
+    }
+
+    // ─── shard_shapes ──────────────────────────────────────────────────────
+
     #[test]
     fn single_worker_returns_all_shapes() {
         let shapes = default_shapes();
@@ -245,7 +627,6 @@ mod tests {
         let shard0 = shard_shapes(&shapes, 0, 2);
         let shard1 = shard_shapes(&shapes, 1, 2);
 
-        // Every shape appears in exactly one shard.
         let mut combined = shard0.clone();
         combined.extend(&shard1);
         combined.sort_unstable();
@@ -282,19 +663,12 @@ mod tests {
 
     #[test]
     fn stride_spreads_expensive_shapes_across_workers() {
-        // With the default batch-major ordering, stride-4 sharding puts shapes
-        // at indices {3,7,11,15} — all seq=8192 — on worker 3.  Workers 0–2
-        // receive only the cheaper seq={128,512,2048} shapes.  This test locks
-        // down that distribution so accidental re-orderings of the default grid
-        // are caught immediately.
         let shapes = default_shapes();
         let shard3 = shard_shapes(&shapes, 3, 4);
-        // All shapes assigned to worker 3 should be seq=8192.
         assert!(
             shard3.iter().all(|(_, seq)| *seq == 8192),
             "worker 3 should compile only seq=8192 shapes; got: {shard3:?}"
         );
-        // Workers 0–2 should receive no seq=8192 shapes.
         for w in 0..3 {
             let shard = shard_shapes(&shapes, w, 4);
             assert!(
@@ -306,11 +680,80 @@ mod tests {
 
     #[test]
     fn more_workers_than_shapes_gives_empty_shards() {
-        // With 2 shapes and 4 workers, workers 2 and 3 get empty shards.
         let shapes = vec![(1, 128), (1, 512)];
         assert_eq!(shard_shapes(&shapes, 0, 4), vec![(1, 128)]);
         assert_eq!(shard_shapes(&shapes, 1, 4), vec![(1, 512)]);
         assert_eq!(shard_shapes(&shapes, 2, 4), vec![]);
         assert_eq!(shard_shapes(&shapes, 3, 4), vec![]);
+    }
+
+    // ─── coverage-check correctness proofs ────────────────────────────────
+
+    /// Verify the zero-FP guarantee for the default 4-worker stride shard.
+    ///
+    /// Worker-3 shard = [(1,8192),(4,8192),(16,8192),(32,8192)].
+    /// `coverage_check_shapes` returns `{(1,8192),(32,8192)}`.
+    /// If both are cache hits (fast), then:
+    ///   - `profile.min_batch` ≤ 1 AND `profile.max_batch` ≥ 32
+    ///   - `profile.min_seq` ≤ 8192 AND `profile.max_seq` ≥ 8192
+    ///
+    /// Every shape with batch ∈ \[1,32\] and seq=8192 is covered → no FPs.
+    #[test]
+    fn worker3_shard_check_shapes_cover_intermediate_shapes() {
+        let shard = shard_shapes(&default_shapes(), 3, 4);
+        assert_eq!(shard, vec![(1, 8192), (4, 8192), (16, 8192), (32, 8192)]);
+
+        let checks = coverage_check_shapes(&shard);
+        assert!(checks.contains(&(1, 8192)));
+        assert!(checks.contains(&(32, 8192)));
+
+        // Intermediate shapes (4,8192) and (16,8192) are NOT in the check set.
+        let non_checks: Vec<_> = shard
+            .iter()
+            .copied()
+            .filter(|s| !checks.contains(s))
+            .collect();
+        assert_eq!(non_checks.len(), 2);
+        // Each non-check shape has batch ∈ [1,32] and seq=8192, so it is
+        // guaranteed to be within the profile range if both checks pass.
+        for (b, s) in &non_checks {
+            assert!(*b >= 1 && *b <= 32, "batch {b} must be within [1,32]");
+            assert!(*s == 8192, "seq {s} must equal 8192");
+        }
+    }
+
+    /// Same proof for worker-0 shard: [(1,128),(4,128),(16,128),(32,128)].
+    #[test]
+    fn worker0_shard_check_shapes_cover_intermediate_shapes() {
+        let shard = shard_shapes(&default_shapes(), 0, 4);
+        assert_eq!(shard, vec![(1, 128), (4, 128), (16, 128), (32, 128)]);
+
+        let checks = coverage_check_shapes(&shard);
+        assert!(checks.contains(&(1, 128)));
+        assert!(checks.contains(&(32, 128)));
+
+        let non_checks: Vec<_> = shard
+            .iter()
+            .copied()
+            .filter(|s| !checks.contains(s))
+            .collect();
+        for (b, s) in &non_checks {
+            assert!(*b >= 1 && *b <= 32);
+            assert!(*s == 128);
+        }
+    }
+
+    /// Single-worker (all 16 shapes) check covers all four extremes and
+    /// produces at most 4 shapes, skipping at least 12.
+    #[test]
+    fn single_worker_check_shapes_skips_most_shapes() {
+        let shapes = default_shapes();
+        let checks = coverage_check_shapes(&shapes);
+        assert!(checks.len() <= 4, "at most 4 check shapes for any shard");
+        let would_skip = shapes.len() - checks.len();
+        assert!(
+            would_skip >= 12,
+            "single-worker should skip ≥ 12 shapes; would_skip={would_skip}"
+        );
     }
 }

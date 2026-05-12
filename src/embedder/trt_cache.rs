@@ -178,6 +178,87 @@ pub(crate) fn log_cache_state(info: &TrtCacheInfo) {
     }
 }
 
+/// Counts `.engine` files in `dir` without allocating a sorted list.
+///
+/// Returns `0` when the directory does not exist or cannot be read (covers both
+/// cold-cache and permission-error cases). Used by `trt_warmup` to decide
+/// whether to run the coverage-check fast path before attempting a full
+/// prewarm sweep.
+pub(super) fn count_engine_files(dir: &Path) -> usize {
+    std::fs::read_dir(dir).map_or(0, |rd| {
+        rd.flatten()
+            .filter(|e| {
+                e.file_type().is_ok_and(|t| t.is_file())
+                    && e.file_name().to_string_lossy().ends_with(".engine")
+            })
+            .count()
+    })
+}
+
+/// Returns sorted basenames of regular files ending in `.engine` under `engine_dir`.
+///
+/// Used for operator-visible logs before TRT prewarm; filenames are **not** a
+/// reliable `(batch, seq)` key for dynamic models (see `CLAUDE.md`).
+pub(crate) fn engine_basenames_in_dir_sorted(engine_dir: &Path) -> std::io::Result<Vec<String>> {
+    let read_dir = std::fs::read_dir(engine_dir)?;
+    let mut basenames: Vec<String> = read_dir
+        .flatten()
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().into_owned();
+            name.ends_with(".engine").then_some(name)
+        })
+        .collect();
+    basenames.sort();
+    Ok(basenames)
+}
+
+/// Lists basenames of existing `.engine` files immediately before TRT prewarm.
+///
+/// ONNX Runtime's `TensorRT` EP names engine caches from the fused subgraph id
+/// and precision (`TensorrtExecutionProvider_TRTKernel_…_fp16_smXX.engine`), not
+/// from literal `(batch, seq)` dimensions — dynamic shapes are carried in the
+/// companion `.profile`. Operators can grep `CloudWatch` for `trt prewarm: cache
+/// engine basenames` to correlate disk state with compile times; this is not
+/// used for skip logic (see `CLAUDE.md`).
+pub(crate) fn log_engine_basenames_before_prewarm(engine_dir: &Path) {
+    const MAX_LIST: usize = 64;
+    let basenames = match engine_basenames_in_dir_sorted(engine_dir) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::info!(
+                cache_path = %engine_dir.display(),
+                error = %e,
+                "trt prewarm: could not read engine cache directory for basename listing"
+            );
+            return;
+        }
+    };
+
+    let total = basenames.len();
+    let mut listed = basenames;
+    let truncated = total > MAX_LIST;
+    if truncated {
+        listed.truncate(MAX_LIST);
+    }
+
+    if total == 0 {
+        tracing::info!(
+            cache_path = %engine_dir.display(),
+            engine_basename_count = 0,
+            "trt prewarm: cache engine basenames (none on disk yet)"
+        );
+    } else {
+        tracing::info!(
+            cache_path = %engine_dir.display(),
+            engine_basename_count = total,
+            truncated,
+            engine_basenames = ?listed,
+            "trt prewarm: cache engine basenames (for operator correlation; not shape-specific)"
+        );
+    }
+}
+
 /// Flushes every regular file in `dir` plus the directory's own metadata to
 /// disk, so an unexpected SIGKILL (ECS OOM, host failure) cannot strand a
 /// partially-written engine plan in the page cache.
@@ -372,5 +453,69 @@ mod tests {
         let missing = tmp.path().join("never-created");
 
         fsync_cache_dir(&missing);
+    }
+
+    #[test]
+    fn count_engine_files_returns_zero_for_missing_directory() {
+        let tmp = TempDir::new().expect("tempdir");
+        let missing = tmp.path().join("does-not-exist");
+        assert_eq!(count_engine_files(&missing), 0);
+    }
+
+    #[test]
+    fn count_engine_files_counts_only_engine_extension() {
+        let tmp = TempDir::new().expect("tempdir");
+        let dir = tmp.path().join("trt-engines");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("a.engine"), b"plan-a").unwrap();
+        fs::write(dir.join("b.engine"), b"plan-b").unwrap();
+        fs::write(dir.join("c.profile"), b"profile-c").unwrap();
+        fs::write(dir.join("d.txt"), b"ignored").unwrap();
+
+        assert_eq!(count_engine_files(&dir), 2);
+    }
+
+    #[test]
+    fn engine_basenames_in_dir_sorted_empty_directory() {
+        let tmp = TempDir::new().expect("tempdir");
+        let dir = tmp.path().join("trt-engines");
+        fs::create_dir_all(&dir).unwrap();
+        assert!(super::engine_basenames_in_dir_sorted(&dir)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn engine_basenames_in_dir_sorted_collects_and_sorts() {
+        let tmp = TempDir::new().expect("tempdir");
+        let dir = tmp.path().join("trt-engines");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("TensorrtExecutionProvider_TRTKernel_graph_z_999_fp16_sm89.engine"),
+            b"a",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("TensorrtExecutionProvider_TRTKernel_graph_a_111_fp16_sm89.engine"),
+            b"b",
+        )
+        .unwrap();
+        fs::write(dir.join("notes.txt"), b"x").unwrap();
+
+        let names = super::engine_basenames_in_dir_sorted(&dir).unwrap();
+        assert_eq!(
+            names,
+            vec![
+                "TensorrtExecutionProvider_TRTKernel_graph_a_111_fp16_sm89.engine",
+                "TensorrtExecutionProvider_TRTKernel_graph_z_999_fp16_sm89.engine",
+            ]
+        );
+    }
+
+    #[test]
+    fn engine_basenames_in_dir_sorted_missing_directory_errors() {
+        let tmp = TempDir::new().expect("tempdir");
+        let missing = tmp.path().join("nope");
+        assert!(super::engine_basenames_in_dir_sorted(&missing).is_err());
     }
 }

@@ -32,6 +32,7 @@ use super::error::ort_err;
 use super::session::load_models;
 use super::sparse::embed_sparse;
 use super::tokenize::{build_chunk_arrays, tokenize_no_pad};
+use super::trt_cache;
 use super::trt_warmup::trt_prewarm;
 use super::types::{EmbedRequest, ProbeResult};
 use crate::binpack::CostModel;
@@ -296,6 +297,7 @@ pub(super) fn run_worker(
             "TensorRT pre-warm: worker compiling shard \
              (first run per shape takes 30–170 s; subsequent starts reuse cache)"
         );
+        trt_cache::log_engine_basenames_before_prewarm(&trt_cache::engine_cache_path(&cache_dir));
         let stats = trt_prewarm(
             &mut initial_models.0,
             &config.trt_warmup_shapes,
@@ -305,6 +307,8 @@ pub(super) fn run_worker(
         tracing::info!(
             worker_id = id,
             warmed = stats.warmed,
+            skipped = stats.skipped,
+            fully_cached = stats.fully_cached,
             total = config.trt_warmup_shapes.len(),
             total_compile_ms = stats.total_compile_ms,
             total_fsync_ms = stats.total_fsync_ms,
