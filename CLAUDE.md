@@ -81,12 +81,14 @@ When `status=ok`, the `/health` response also includes:
 |----------|---------|-------------|
 | `BGE_M3_CACHE_DIR` | `/cache` | Path where ONNX model files are cached |
 | `BGE_M3_BIND` | `0.0.0.0:8081` | TCP bind address |
-| `BGE_M3_WORKERS` | `2` | Number of worker threads (each loads its own model instance; min 1) |
+| `BGE_M3_WORKERS` | `2` | Number of worker threads (each loads its own model instance; min 1). Clamped to `1` when `BGE_M3_EP` is `cuda` or `tensorrt`. |
 | `BGE_M3_INTRA_THREADS` | `1` | Intra-op threads each ORT session may use per `session.run()` call (min 1). Default `1` keeps per-worker RSS predictable for the workspace probe. Raise to `floor(num_cpus / workers)` on under-utilized hosts (e.g. `4` on an 8 vCPU task with `workers=2`) to take CPU utilization from ~25% to ~100% under load. Re-run the probe after changing. |
 | `BGE_M3_MAX_BATCH` | `256` | Maximum number of texts accepted per request (min 1) |
 | `BGE_M3_MAX_SEQ_LENGTH` | `8192` | Maximum tokenized sequence length. Range `[1, 8192]`. Lower values reduce memory use; `8192` is the BGE-M3 model's published maximum. |
 | `BGE_M3_IDLE_TIMEOUT_SECS` | `300` | Seconds of inactivity before models are unloaded; `0` disables idle unloading |
 | `BGE_M3_MODEL` | `fp16` | Model variant: `fp32` = `BAAI/bge-m3` (~2.16 GB/session); `fp16` = `Xenova/bge-m3` (~1.08 GB/session); `int8` = `Xenova/bge-m3` quantized (~568 MB/session). See model variant notes below. |
+| `BGE_M3_EP` | `cpu` | Execution provider: `cpu` (MLAS, default), `cuda` (NVIDIA CUDA EP), or `tensorrt` (NVIDIA TensorRT EP). On macOS, CoreML is always used. `cuda`/`tensorrt` require the corresponding Cargo feature and a GPU-enabled ORT build; use `Dockerfile.cuda` and the `-cuda` image tag. |
+| `BGE_M3_GPU_VRAM_BUDGET_BYTES` | unset | VRAM workspace ceiling (bytes) when `BGE_M3_EP` is `cuda` or `tensorrt`. Defaults to 10 GiB (suitable for A10G / L4 and larger). The host-RAM probe is bypassed when any GPU EP is active. |
 
 ### Logging and Observability
 
@@ -191,17 +193,29 @@ Key diagnostic values when healthy: `tuning.a_bytes_per_token` ≈ 18000–20000
 ## Docker
 
 ```bash
-# Build
+# Build (CPU — linux/amd64 + linux/arm64)
 docker build -t bge-m3-embedding-server .
 
-# Run (mount a host directory to persist the model cache across restarts)
+# Build (CUDA + TensorRT — linux/amd64 only)
+docker build -f Dockerfile.cuda -t bge-m3-embedding-server:cuda .
+
+# Run (CPU)
 docker run --rm \
   -p 8081:8081 \
   -v /path/to/model-cache:/cache \
   bge-m3-embedding-server
+
+# Run (GPU — requires NVIDIA Container Toolkit)
+docker run --rm --gpus all \
+  -p 8081:8081 \
+  -v /path/to/model-cache:/cache \
+  -e BGE_M3_EP=cuda \
+  bge-m3-embedding-server:cuda
 ```
 
 Port `8081`. Built-in `HEALTHCHECK` polls `/health` every 10 s with a 120 s start period (allows time for model download, ONNX init, and the startup probe).
+
+The Release workflow publishes both `<version>` / `latest` (CPU, multi-arch) and `<version>-cuda` / `latest-cuda` (CUDA+TRT, amd64 only) tags to GHCR.
 
 ## Releasing
 
@@ -228,3 +242,6 @@ To release: bump version in `Cargo.toml`, commit, push to `main`. The workflow h
 - **Local Docker / macOS:** probe uses `/proc` + cgroups (Linux-only); native macOS LaunchAgent uses conservative defaults (no RSS measurement). In Docker on Apple Silicon, MLAS-only inference makes the probe sweep take several minutes — use `BGE_M3_DISABLE_AUTO_BUDGET=1` for dev; use the native LaunchAgent for production-realistic tuning.
 - **Dockerfile builder is `ubuntu:24.04`** — the prebuilt ORT binary requires glibc ≥ 2.38. Debian Bookworm (glibc 2.36) fails with `undefined symbol: __isoc23_strtoul`. Rust installed via `rustup-init` with SHA-256 verification — never `curl | sh`.
 - **ECS capacity at `max_seq=8192`** — per-worker high-water ~10.3 GB (fp16). Formula: `cfg_workers × 10.3 GB + OS_HEADROOM ≤ task_memoryMiB`. Workers=2 safe cap on 28 GiB; workers=4 fits at 56 GiB.
+- **GPU EPs (cuda/tensorrt): BGE_M3_WORKERS is clamped to 1** — the GPU is the serial inference resource. Raising workers beyond 1 on a GPU build logs a WARN and is ignored. Multi-stream concurrency is a future enhancement.
+- **ort 2.0.0-rc.12 TensorRT builder methods** — use `with_engine_cache(bool)` and `with_fp16(bool)`, not `with_engine_cache_enable` / `with_fp16_enable` (those names do not exist in this version). CUDA uses `with_device_id(i32)`.
+- **Dockerfile.cuda uses `download-ort`** — the pyke.io CDN does not provide a verified CUDA+TRT prebuilt for ort 2.0.0-rc.12. The CUDA Dockerfile uses `--features cuda,tensorrt,download-ort` so ort-sys fetches a compatible binary at build time. For a reproducible production build, point `ORT_LIB_LOCATION` at a locally verified CUDA+TRT ORT static lib and remove `download-ort`.

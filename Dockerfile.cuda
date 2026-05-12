@@ -1,0 +1,76 @@
+# CUDA + TensorRT execution provider build.
+# This image is linux/amd64 only — no ARM GPU instance types exist.
+# Requires NVIDIA Container Toolkit on the host / ECS GPU AMI.
+
+# ── Builder stage ─────────────────────────────────────────────────────────────
+# Use the CUDA devel image so nvcc and CUDA headers are present at build time.
+FROM nvidia/cuda:12.6.0-cudnn-devel-ubuntu24.04 AS builder
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+       curl ca-certificates build-essential pkg-config libssl-dev python3 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Download rustup-init, verify the official SHA-256 sidecar, then install.
+ARG RUSTUP_VERSION=1.29.0
+RUN BASE="https://static.rust-lang.org/rustup/archive/${RUSTUP_VERSION}/x86_64-unknown-linux-gnu" \
+    && curl --proto '=https' --tlsv1.2 -sSf "${BASE}/rustup-init"        -o /tmp/rustup-init \
+    && curl --proto '=https' --tlsv1.2 -sSf "${BASE}/rustup-init.sha256"  -o /tmp/rustup-init.sha256 \
+    && cd /tmp && sha256sum -c rustup-init.sha256 \
+    && chmod +x /tmp/rustup-init \
+    && /tmp/rustup-init -y --no-modify-path --default-toolchain stable \
+    && rm /tmp/rustup-init /tmp/rustup-init.sha256
+ENV PATH="/root/.cargo/bin:${PATH}"
+
+# ORT prebuilt for CUDA + TensorRT.
+#
+# The pyke.io CDN (https://cdn.pyke.io/0/pyke:ort-rs/ms@<version>/<triple>.tar.lzma2)
+# only lists CPU-only prebuilts for ort 2.0.0-rc.12 in the ort-sys dist.txt.
+# A CUDA+TRT-enabled ORT static library requires a custom ORT build (see
+# https://onnxruntime.ai/docs/build/eps.html#tensorrt) — no verified prebuilt
+# is available on the CDN for this combination at this time.
+#
+# Therefore we use `download-ort` to let ort-sys fetch a compatible prebuilt at
+# build time. This requires internet access during `docker build` and pins to
+# whatever pyke.io provides for the `cuda` + `tensorrt` feature set.
+# For a fully-reproducible production build, replace this with:
+#   ENV ORT_LIB_LOCATION=/opt/ort (pointing to a locally verified ORT static lib)
+# and remove the `download-ort` feature from the cargo build command below.
+
+WORKDIR /app
+
+# Cache dependency compilation by building a dummy binary first.
+# benches/ stubs are required for all [[bench]] targets because Cargo validates
+# source paths at manifest parse time, even though cargo build --release skips
+# bench compilation.
+COPY Cargo.toml Cargo.lock build.rs ./
+RUN mkdir src && echo "fn main(){}" > src/main.rs && touch src/lib.rs \
+    && mkdir -p benches/coreml && touch benches/embeddings.rs benches/coreml/main.rs \
+    && cargo build --release --features cuda,tensorrt,download-ort \
+    && rm -rf src benches
+
+COPY src ./src
+COPY benches ./benches
+RUN touch src/main.rs && cargo build --release --features cuda,tensorrt,download-ort
+
+# ── Runtime stage ──────────────────────────────────────────────────────────────
+# Only the CUDA runtime libs are needed at inference time — not the full devel
+# image (no nvcc, no headers, no static libraries).
+FROM nvidia/cuda:12.6.0-cudnn-runtime-ubuntu24.04
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates curl libssl3t64 \
+    && rm -rf /var/lib/apt/lists/*
+
+# UID/GID must match EFS model-cache access point in Codekeeper CDK (10002).
+RUN groupadd --gid 10002 bge \
+    && useradd --uid 10002 --gid bge --no-create-home --shell /sbin/nologin bge
+
+COPY --from=builder /app/target/release/bge-m3-embedding-server /usr/local/bin/
+USER bge
+
+HEALTHCHECK --interval=10s --timeout=3s --start-period=120s --retries=3 \
+    CMD curl --fail --silent http://localhost:8081/health || exit 1
+
+EXPOSE 8081
+CMD ["bge-m3-embedding-server"]

@@ -292,12 +292,14 @@ require a restart.
 |----------|---------|-------------|
 | `BGE_M3_CACHE_DIR` | `/cache` | Directory where ONNX model files are cached |
 | `BGE_M3_BIND` | `0.0.0.0:8081` | TCP bind address |
-| `BGE_M3_WORKERS` | `2` | Worker thread count (each loads its own model; min 1) |
+| `BGE_M3_WORKERS` | `2` | Worker thread count (each loads its own model; min 1). Automatically clamped to `1` when `BGE_M3_EP` is `cuda` or `tensorrt` — see [GPU Execution Providers](#gpu-execution-providers-cuda--tensorrt). |
 | `BGE_M3_INTRA_THREADS` | `1` | Intra-op threads each ORT session may use per `session.run()` call (min 1). Default `1` keeps per-worker RSS predictable for the workspace probe; raise to `floor(num_cpus / workers)` on under-utilized hosts to fan out matmul/attention kernels across cores. Re-run the probe after changing. |
 | `BGE_M3_MAX_BATCH` | `256` | Maximum texts per request (min 1) |
 | `BGE_M3_MAX_SEQ_LENGTH` | `8192` | Maximum tokenized sequence length, range `[1, 8192]`. Lower values reduce memory; `8192` is BGE-M3's published maximum. |
 | `BGE_M3_IDLE_TIMEOUT_SECS` | `300` | Seconds of inactivity before models are unloaded from memory; `0` disables idle unloading |
 | `BGE_M3_MODEL` | `fp16` | Model variant — see [Model Variants](#model-variants) |
+| `BGE_M3_EP` | `cpu` | Execution provider: `cpu` (MLAS, default), `cuda` (NVIDIA CUDA), or `tensorrt` (NVIDIA TensorRT). On macOS, CoreML is always used regardless of this setting. `cuda`/`tensorrt` require the corresponding Cargo feature and a GPU-enabled ORT build — use the `-cuda` Docker image tag. |
+| `BGE_M3_GPU_VRAM_BUDGET_BYTES` | unset | VRAM workspace ceiling (bytes) when `BGE_M3_EP` is `cuda` or `tensorrt`. Defaults to 10 GiB when unset (suitable for GPUs with ≥ 16 GiB VRAM, e.g. A10G / L4). Lower this for GPUs with less VRAM (e.g. `8589934592` for 8 GiB). The host-RAM probe is bypassed when any GPU EP is active. |
 | `BGE_M3_LOG_FORMAT` | (text) | Set to `json` for structured JSON log output; omit for auto-detect (JSON in non-TTY, human-readable in TTY) |
 
 ### Auto-Budget Tuning (Linux)
@@ -337,12 +339,49 @@ Set `BGE_M3_MODEL` to select a variant.
 See [docs/model-variants.md](docs/model-variants.md) for the full precision evaluation and
 per-scenario metrics.
 
+## GPU Execution Providers (CUDA / TensorRT)
+
+Two opt-in Cargo features enable NVIDIA GPU inference:
+
+| Feature | Cargo flag | EP activated by |
+|---------|-----------|----------------|
+| `cuda` | `--features cuda` | `BGE_M3_EP=cuda` |
+| `tensorrt` | `--features tensorrt` | `BGE_M3_EP=tensorrt` |
+
+The `tensorrt` feature implies `cuda` (TRT requires the CUDA EP underneath it). Both features are
+no-ops on macOS (CoreML is always used there) and in CPU-only builds.
+
+**Key constraints when using GPU EPs:**
+
+- `BGE_M3_WORKERS` is automatically clamped to `1`. The GPU is a serial inference resource;
+  loading multiple ORT sessions on the same GPU wastes VRAM with no throughput benefit.
+  Multi-stream GPU concurrency is a future enhancement.
+- The host-RAM startup probe is bypassed; `BGE_M3_GPU_VRAM_BUDGET_BYTES` (default 10 GiB) is
+  used as the workspace ceiling instead.
+- Requires the NVIDIA Container Toolkit on the host (ECS GPU AMI or equivalent).
+- Use the `-cuda` Docker image tag — the CPU image does not include CUDA/TRT libraries.
+
+**TensorRT engine caching:** when `BGE_M3_EP=tensorrt`, compiled TRT engines are cached to
+`{BGE_M3_CACHE_DIR}/trt-engines/`. First inference may be slow (engine compilation); subsequent
+runs load from cache. Mount the same `cache_dir` volume across restarts to preserve compiled
+engines.
+
 ## Docker
 
 ### Build
 
 ```bash
+# CPU image (default — linux/amd64 + linux/arm64)
 docker build -t bge-m3-embedding-server .
+
+# CUDA + TensorRT image (linux/amd64 only)
+docker build -f Dockerfile.cuda -t bge-m3-embedding-server:cuda .
+```
+
+The pre-built CUDA image is available from GHCR under the `-cuda` tag:
+
+```bash
+docker pull ghcr.io/fulton-engineering-services/bge-m3-embedding-server:latest-cuda
 ```
 
 ### Run
@@ -354,6 +393,26 @@ docker run --rm \
   -p 8081:8081 \
   -v /path/to/model-cache:/cache \
   bge-m3-embedding-server
+```
+
+**GPU (CUDA) run** — requires NVIDIA Container Toolkit:
+
+```bash
+docker run --rm --gpus all \
+  -p 8081:8081 \
+  -v /path/to/model-cache:/cache \
+  -e BGE_M3_EP=cuda \
+  ghcr.io/fulton-engineering-services/bge-m3-embedding-server:latest-cuda
+```
+
+**GPU (TensorRT) run:**
+
+```bash
+docker run --rm --gpus all \
+  -p 8081:8081 \
+  -v /path/to/model-cache:/cache \
+  -e BGE_M3_EP=tensorrt \
+  ghcr.io/fulton-engineering-services/bge-m3-embedding-server:latest-cuda
 ```
 
 Override workers or limit sequence length:

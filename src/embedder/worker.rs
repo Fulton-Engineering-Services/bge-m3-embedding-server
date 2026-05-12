@@ -34,7 +34,7 @@ use super::sparse::embed_sparse;
 use super::tokenize::{build_chunk_arrays, tokenize_no_pad};
 use super::types::{EmbedRequest, ProbeResult};
 use crate::binpack::CostModel;
-use crate::config::ModelVariant;
+use crate::config::{EpSelection, ModelVariant};
 use crate::sysinfo;
 
 pub(super) struct WorkerGuard(pub Arc<AtomicUsize>);
@@ -75,6 +75,12 @@ pub struct WorkerConfig {
     /// `session.run()` call. Plumbed through to `load_session` at model load
     /// time. See [`crate::config::Config::intra_threads`] for sizing guidance.
     pub intra_threads: usize,
+    /// ONNX Runtime execution provider selection.
+    ///
+    /// Forwarded to [`load_models`] at model load time so each ORT session
+    /// registers the correct EP. On macOS, `CoreML` is always used regardless
+    /// of this value. See [`crate::config::EpSelection`] for details.
+    pub ep: EpSelection,
 }
 
 /// Runs a single `session.run()` for the probe, measuring RSS before and after.
@@ -155,6 +161,7 @@ pub(super) fn run_worker(
         config.model_variant,
         config.max_seq_length,
         config.intra_threads,
+        config.ep,
     ) {
         Ok(mut models) => {
             // Prime the ORT session arena with a tiny session.run() BEFORE
@@ -246,6 +253,7 @@ pub(super) fn run_worker(
                         config.model_variant,
                         config.max_seq_length,
                         config.intra_threads,
+                        config.ep,
                     ) {
                         Ok(mut m) => {
                             // Prime the freshly-loaded session arena so the

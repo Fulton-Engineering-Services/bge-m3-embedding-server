@@ -26,6 +26,7 @@ use tracing::{info, info_span, Instrument};
 use super::math::median_usize;
 use super::types::{DualEmbedding, EmbedRequest, EmbedStats, ProbeResult, SparseEmbedding};
 use super::worker::{run_worker, WorkerConfig};
+use crate::config::EpSelection;
 
 /// Async handle to the embedding worker thread pool.
 ///
@@ -59,11 +60,30 @@ pub struct EmbedPool {
 impl EmbedPool {
     /// Spawns `n` embedding worker threads and returns the pool plus an init
     /// handle that resolves once all workers have finished loading their models.
+    ///
+    /// When a GPU execution provider (`cuda` or `tensorrt`) is selected, `n` is
+    /// clamped to 1: the GPU is a serial inference resource and loading multiple
+    /// ORT sessions against it wastes VRAM with no throughput benefit. Multi-stream
+    /// GPU concurrency is a future enhancement.
+    #[allow(clippy::too_many_lines)]
     pub fn spawn(
         n: usize,
         cache_dir: PathBuf,
         config: WorkerConfig,
     ) -> (Self, JoinHandle<Result<()>>) {
+        let n = if config.ep != EpSelection::Cpu && n > 1 {
+            tracing::warn!(
+                requested = n,
+                clamped = 1,
+                ep = %config.ep,
+                "GPU execution provider selected — clamping BGE_M3_WORKERS to 1 \
+                 (the GPU is the serial inference resource; multi-stream concurrency \
+                 is a future enhancement)"
+            );
+            1
+        } else {
+            n
+        };
         let capacity = n * 4;
         let (tx, rx) = mpsc::channel::<EmbedRequest>(capacity);
         let rx = Arc::new(Mutex::new(rx));

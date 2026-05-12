@@ -50,6 +50,18 @@ coreml-profile = []
 ## production builds — use ORT_LIB_LOCATION with a locally built ORT instead.
 download-ort = ["ort/download-binaries", "ort/tls-rustls"]
 
+## Enable the NVIDIA CUDA execution provider.
+## Requires a CUDA-enabled ORT build (ORT_LIB_LOCATION pointing to a CUDA EP build,
+## or `download-ort` with a CUDA prebuilt). CPU-only builds are unaffected by this
+## feature gate — it is a no-op on macOS (CoreML is always used there).
+cuda = ["ort/cuda"]
+
+## Enable the NVIDIA TensorRT execution provider.
+## TRT requires the CUDA EP underneath; this feature pulls in both.
+## Requires a TensorRT-enabled ORT build. Falls back to the CUDA EP if TRT
+## registration fails at runtime. CPU-only builds are unaffected.
+tensorrt = ["ort/cuda", "ort/tensorrt"]
+
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"

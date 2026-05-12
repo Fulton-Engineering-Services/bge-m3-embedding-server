@@ -21,16 +21,31 @@ use anyhow::Result;
 use super::error::ort_err;
 use super::model_files::download_model_files;
 use super::tokenize::load_tokenizer;
-use crate::config::ModelVariant;
+use crate::config::{EpSelection, ModelVariant};
 
-/// Returns the execution providers to use for this platform.
+/// Returns the execution providers to use for this platform and EP selection.
 ///
-/// On macOS: uses the `CoreML` EP with `MLProgram` format and `FastPrediction`
-/// specialisation strategy (overridable via `BGE_M3_COREML_STRATEGY=default`).
-/// On all other platforms: returns an empty list, so ORT falls back to MLAS (CPU).
-pub(super) fn execution_providers(cache_dir: &Path) -> Vec<ort::ep::ExecutionProviderDispatch> {
+/// On macOS: always uses the `CoreML` EP with `MLProgram` format and
+/// `FastPrediction` specialisation strategy (overridable via
+/// `BGE_M3_COREML_STRATEGY=default`), regardless of `ep`.
+///
+/// On Linux with the `tensorrt` feature: selects `TensorRT` when
+/// `ep == EpSelection::TensorRt`, with engine caching and FP16 enabled.
+///
+/// On Linux with the `cuda` feature: selects CUDA when
+/// `ep == EpSelection::Cuda` or `ep == EpSelection::TensorRt` (TRT requires
+/// the CUDA EP registered underneath it).
+///
+/// CPU fallback: returns an empty list so ORT falls back to MLAS.
+pub(super) fn execution_providers(
+    cache_dir: &Path,
+    ep: EpSelection,
+) -> Vec<ort::ep::ExecutionProviderDispatch> {
+    // macOS: always CoreML regardless of BGE_M3_EP.
+    // The cfg blocks are mutually exclusive so only one branch is compiled per target.
     #[cfg(target_os = "macos")]
     {
+        let _ = ep;
         let coreml_cache = cache_dir.join("coreml");
         let strategy = match std::env::var("BGE_M3_COREML_STRATEGY").ok().as_deref() {
             Some("default") => ort::ep::coreml::SpecializationStrategy::Default,
@@ -44,9 +59,32 @@ pub(super) fn execution_providers(cache_dir: &Path) -> Vec<ort::ep::ExecutionPro
         let builder = builder.with_profile_compute_plan(true);
         vec![builder.build()]
     }
+
     #[cfg(not(target_os = "macos"))]
     {
-        let _ = cache_dir;
+        // Linux TensorRT (feature-gated).
+        // ort 2.0.0-rc.12 uses `with_engine_cache` / `with_fp16` — not
+        // `with_engine_cache_enable` / `with_fp16_enable` which don't exist.
+        #[cfg(feature = "tensorrt")]
+        if ep == EpSelection::TensorRt {
+            let trt_cache = cache_dir.join("trt-engines");
+            std::fs::create_dir_all(&trt_cache).ok();
+            return vec![ort::ep::TensorRT::default()
+                .with_engine_cache(true)
+                .with_engine_cache_path(trt_cache.display().to_string())
+                .with_fp16(true)
+                .build()];
+        }
+
+        // Linux CUDA (feature-gated).
+        #[cfg(feature = "cuda")]
+        if ep == EpSelection::Cuda || ep == EpSelection::TensorRt {
+            let _ = cache_dir;
+            return vec![ort::ep::CUDA::default().with_device_id(0).build()];
+        }
+
+        // CPU fallback (always available).
+        let _ = (cache_dir, ep);
         vec![]
     }
 }
@@ -85,10 +123,11 @@ pub(super) fn load_models(
     model_variant: ModelVariant,
     max_seq_length: usize,
     intra_threads: usize,
+    ep: EpSelection,
 ) -> Result<(ort::session::Session, tokenizers::Tokenizer)> {
     let files = download_model_files(cache_dir, show_download_progress, model_variant)?;
     let tokenizer = load_tokenizer(&files.tokenizer_path, max_seq_length)?;
-    let eps = execution_providers(cache_dir);
+    let eps = execution_providers(cache_dir, ep);
     let session = load_session(&files.onnx_path, eps, intra_threads)?;
     Ok((session, tokenizer))
 }

@@ -124,6 +124,7 @@ pub async fn run() -> anyhow::Result<()> {
             model_variant: cfg.model_variant,
             max_seq_length: cfg.max_seq_length,
             intra_threads: cfg.intra_threads,
+            ep: cfg.ep,
         },
     );
 

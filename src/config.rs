@@ -21,7 +21,7 @@
 use crate::binpack::CostModel;
 use std::env;
 use std::time::Duration;
-use tracing::warn;
+use tracing::{info, warn};
 
 /// ONNX model variant to load.
 ///
@@ -78,6 +78,44 @@ impl std::fmt::Display for ModelVariant {
             Self::Fp32 => f.write_str("fp32"),
             Self::Fp16 => f.write_str("fp16"),
             Self::Int8 => f.write_str("int8"),
+        }
+    }
+}
+
+/// VRAM workspace budget used for GPU EPs when `BGE_M3_GPU_VRAM_BUDGET_BYTES` is unset.
+///
+/// 10 GiB is a conservative ceiling for NVIDIA GPUs with ≥ 16 GiB VRAM (A10G, L4, H100 80GB).
+/// Override with `BGE_M3_GPU_VRAM_BUDGET_BYTES` for GPUs with less VRAM.
+const DEFAULT_GPU_VRAM_BUDGET_BYTES: usize = 10 * 1024 * 1024 * 1024;
+
+/// ONNX Runtime execution provider selection.
+///
+/// Controlled by `BGE_M3_EP`. Defaults to [`EpSelection::Cpu`].
+///
+/// On macOS the `CoreML` EP is always used regardless of this setting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EpSelection {
+    /// CPU inference via MLAS (default). Works everywhere, no GPU required.
+    Cpu,
+    /// NVIDIA CUDA execution provider (requires `cuda` feature and a CUDA ORT build).
+    ///
+    /// Set `BGE_M3_EP=cuda` to enable. Automatically clamps `BGE_M3_WORKERS` to 1 —
+    /// the GPU is the serial inference resource; multi-stream concurrency is a future
+    /// enhancement.
+    Cuda,
+    /// NVIDIA `TensorRT` execution provider (requires `tensorrt` feature and a TRT ORT build).
+    ///
+    /// Set `BGE_M3_EP=tensorrt` to enable. Falls back to the CUDA EP for ops that TRT
+    /// cannot handle. Automatically clamps `BGE_M3_WORKERS` to 1.
+    TensorRt,
+}
+
+impl std::fmt::Display for EpSelection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Cpu => f.write_str("cpu"),
+            Self::Cuda => f.write_str("cuda"),
+            Self::TensorRt => f.write_str("tensorrt"),
         }
     }
 }
@@ -181,6 +219,25 @@ pub struct Config {
     /// available request permits, and current probe status — useful for
     /// detecting slow memory leaks or queue saturation between requests.
     pub heartbeat_secs: u64,
+
+    /// ONNX Runtime execution provider to use.
+    ///
+    /// Set with `BGE_M3_EP`. Accepts `"cpu"`, `"cuda"`, or `"tensorrt"`.
+    /// Defaults to `"cpu"`. On macOS, `CoreML` is always used regardless of
+    /// this setting. Requires the corresponding Cargo feature (`cuda` or
+    /// `tensorrt`) to be enabled at build time for GPU EPs.
+    ///
+    /// When set to `"cuda"` or `"tensorrt"`, `BGE_M3_WORKERS` is clamped
+    /// to 1 and the host-RAM probe is bypassed in favour of the VRAM budget.
+    pub ep: EpSelection,
+
+    /// VRAM workspace ceiling (bytes) when a GPU execution provider is active.
+    ///
+    /// Set with `BGE_M3_GPU_VRAM_BUDGET_BYTES`. Ignored when `ep == Cpu`.
+    /// Defaults to `None`, which causes the server to use 10 GiB as the
+    /// ceiling (suitable for GPUs with ≥ 16 GiB VRAM such as A10G / L4).
+    /// Lower this on GPUs with less VRAM (e.g. `8589934592` for 8 GiB).
+    pub gpu_vram_budget_bytes: Option<usize>,
 }
 
 impl Config {
@@ -272,6 +329,31 @@ impl Config {
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(60);
 
+        let ep = match lookup("BGE_M3_EP").as_deref() {
+            Some("cuda") => EpSelection::Cuda,
+            Some("tensorrt") => EpSelection::TensorRt,
+            _ => EpSelection::Cpu,
+        };
+
+        let gpu_vram_budget_bytes =
+            lookup("BGE_M3_GPU_VRAM_BUDGET_BYTES").and_then(|v| v.parse::<usize>().ok());
+
+        // When a GPU EP is active, the host-RAM probe is meaningless — VRAM is
+        // the constraint. Override the cost model unconditionally so the probe
+        // is skipped and the VRAM budget drives bin-packing instead.
+        let cost_model_override = if ep == EpSelection::Cpu {
+            cost_model_override
+        } else {
+            let vram_budget = gpu_vram_budget_bytes.unwrap_or(DEFAULT_GPU_VRAM_BUDGET_BYTES);
+            info!(
+                ep = %ep,
+                vram_budget_bytes = vram_budget,
+                "GPU execution provider selected — bypassing host-RAM probe; \
+                 using VRAM budget as the workspace ceiling"
+            );
+            Some(CostModel::conservative(vram_budget))
+        };
+
         Self {
             cache_dir: lookup("BGE_M3_CACHE_DIR").unwrap_or_else(|| "/cache".to_string()),
             bind_addr: lookup("BGE_M3_BIND").unwrap_or_else(|| "0.0.0.0:8081".to_string()),
@@ -284,6 +366,8 @@ impl Config {
             memory_safety_factor,
             cost_model_override,
             heartbeat_secs,
+            ep,
+            gpu_vram_budget_bytes,
         }
     }
 }
