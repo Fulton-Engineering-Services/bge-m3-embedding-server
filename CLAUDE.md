@@ -99,7 +99,14 @@ When `status=ok`, the `/health` response also includes:
 | `BGE_M3_HEARTBEAT_SECS` | `60` | Interval between periodic heartbeat log events. Each event logs RSS, live/loaded workers, queue depth, available permits, and probe status. Set `0` to disable. |
 | `RUST_LOG` | `info` | Standard tracing filter. Examples: `info`, `debug`, `bge_m3_embedding_server=debug`, `bge_m3_embedding_server::binpack=trace`. |
 
-**Build-variant tag:** every JSON log line begins with a `"build"` attribute resolved at compile time from Cargo features. Value is `"cuda"` when either the `cuda` or `tensorrt` feature is enabled (both are turned on by `Dockerfile.cuda`); `"cpu"` otherwise (default `Dockerfile`, MLAS EP). Use it in CloudWatch Insights to filter a mixed CPU/CUDA fleet, e.g. `filter build = "cuda"`. The human-readable `text`/`pretty` formats do not include this tag.
+**Compile-time tags:** every JSON log line starts with two attributes in this order:
+
+1. `"bge_module":"server"` — always the literal string `"server"`. Distinguishes this binary from the BGE router and other BGE-family services in shared log groups.
+2. `"build"` — `"cuda"` when either the `cuda` or `tensorrt` feature is enabled (both are turned on by `Dockerfile.cuda`); `"cpu"` otherwise (default `Dockerfile`, MLAS EP). Use it in CloudWatch Insights to filter a mixed CPU/CUDA fleet, e.g. `filter build = "cuda"`.
+
+Example: `{"bge_module":"server","build":"cpu","timestamp":"…","level":"INFO",…}`
+
+The human-readable `text`/`pretty` formats do not include these tags.
 
 **Key log events at INFO:** per-request completion (`route`, `batch_size`, `chunks`, `tokenize_ms`, `inference_ms`, `total_ms`, `worker_id`); periodic heartbeat (`rss_mb`, `live_workers`, `queue_depth`, `probe_status`); full startup sequence. `/health` and `/v1/models` are logged at DEBUG to suppress load-balancer noise.
 
