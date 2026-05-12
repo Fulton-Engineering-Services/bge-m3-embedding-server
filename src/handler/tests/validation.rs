@@ -12,7 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::super::common::{check_ready, validate_input, MAX_STRING_CHARS};
+use axum::http::{header, HeaderValue};
+
+use super::super::common::{check_ready, collect_x_headers, validate_input, MAX_STRING_CHARS};
 use super::helpers::make_state;
 use crate::error::AppError;
 
@@ -83,4 +85,59 @@ fn check_ready_returns_err_when_pool_dead() {
     assert!(
         matches!(result, Err(AppError::ServiceUnavailable(msg)) if msg == "no workers available")
     );
+}
+
+// ── collect_x_headers ─────────────────────────────────────────────────────
+
+#[test]
+fn collect_x_headers_collects_x_prefix_and_skips_standard() {
+    let mut headers = axum::http::HeaderMap::new();
+    headers.insert(
+        axum::http::HeaderName::from_static("x-foo"),
+        HeaderValue::from_static("bar"),
+    );
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+
+    let result = collect_x_headers(&headers);
+    assert!(!result.is_empty());
+    assert_eq!(result.0.get("x-foo").map(String::as_str), Some("bar"));
+    assert_eq!(result.0.len(), 1, "content-type must be excluded");
+}
+
+#[test]
+fn collect_x_headers_empty_map_produces_empty() {
+    let result = collect_x_headers(&axum::http::HeaderMap::new());
+    assert!(result.is_empty());
+}
+
+#[test]
+fn collect_x_headers_no_x_prefix_produces_empty() {
+    let mut headers = axum::http::HeaderMap::new();
+    headers.insert(
+        header::AUTHORIZATION,
+        HeaderValue::from_static("Bearer tok"),
+    );
+    headers.insert(header::CONTENT_LENGTH, HeaderValue::from_static("42"));
+    let result = collect_x_headers(&headers);
+    assert!(result.is_empty());
+}
+
+#[test]
+fn collect_x_headers_multiple_x_headers_sorted() {
+    let mut headers = axum::http::HeaderMap::new();
+    headers.insert(
+        axum::http::HeaderName::from_static("x-request-id"),
+        HeaderValue::from_static("abc"),
+    );
+    headers.insert(
+        axum::http::HeaderName::from_static("x-project"),
+        HeaderValue::from_static("my-proj"),
+    );
+    let result = collect_x_headers(&headers);
+    let keys: Vec<&str> = result.0.keys().map(String::as_str).collect();
+    // BTreeMap guarantees alphabetical order
+    assert_eq!(keys, vec!["x-project", "x-request-id"]);
 }

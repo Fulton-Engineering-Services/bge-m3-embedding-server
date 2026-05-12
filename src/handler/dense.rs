@@ -17,9 +17,9 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use axum::{extract::State, Json};
+use axum::{extract::State, http::HeaderMap, Json};
 
-use super::common::{check_ready, validate_input};
+use super::common::{check_ready, collect_x_headers, validate_input};
 use crate::error::AppError;
 use crate::models::{DenseEmbeddingData, DenseRequest, DenseResponse, Usage};
 use crate::state::AppState;
@@ -37,7 +37,7 @@ use crate::state::AppState;
 ///
 /// Panics if the request semaphore has been closed — should not occur in normal operation.
 #[tracing::instrument(
-    skip(state, req),
+    skip(state, req, headers),
     fields(
         batch_size,
         prompt_tokens,
@@ -45,14 +45,23 @@ use crate::state::AppState;
         max_chunk_seq,
         tokenize_ms,
         inference_ms,
-        total_ms
+        total_ms,
+        x_headers = tracing::field::Empty
     )
 )]
 pub async fn dense_embeddings(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Json(req): Json<DenseRequest>,
 ) -> Result<Json<DenseResponse>, AppError> {
     check_ready(&state)?;
+    let x_headers = collect_x_headers(&headers);
+    if !x_headers.is_empty() {
+        tracing::Span::current().record(
+            "x_headers",
+            tracing::field::display(serde_json::to_string(&x_headers).unwrap_or_default()),
+        );
+    }
     let texts = req.input.0;
     drop(req.model);
     validate_input(&texts, state.max_batch)?;
