@@ -123,6 +123,46 @@ pub(crate) fn probe_run_dense(
     })
 }
 
+/// Emits a `WARN` if the oneshot reply receiver has been dropped while the
+/// worker was busy with `embed_*` — meaning the client (often the router's
+/// hedged race) disconnected after dispatch and the inference work is now
+/// discarded. We can't interrupt ORT `session.run()` mid-call, so this is
+/// observability only: operators can correlate `inference_ms` and `chunks`
+/// across requests to size the router's cancellation budget.
+///
+/// The reply is sent unconditionally by the caller after this returns; the
+/// channel layer will silently drop the value if the receiver is gone.
+fn log_if_abandoned_mid_flight<T>(
+    reply: &tokio::sync::oneshot::Sender<Result<(T, super::types::EmbedStats)>>,
+    route: &'static str,
+    worker_id: usize,
+    result: &Result<(T, super::types::EmbedStats)>,
+    inference_ms: u128,
+) {
+    if !reply.is_closed() {
+        return;
+    }
+    let (chunks, max_chunk_seq, total_token_positions) = match result {
+        Ok((_, stats)) => (
+            Some(stats.chunks),
+            Some(stats.max_chunk_seq),
+            Some(stats.total_token_positions),
+        ),
+        Err(_) => (None, None, None),
+    };
+    let inference_ms_u64 = u64::try_from(inference_ms).unwrap_or(u64::MAX);
+    tracing::warn!(
+        worker_id,
+        route,
+        inference_ms_so_far = inference_ms_u64,
+        chunks,
+        max_chunk_seq,
+        total_token_positions,
+        "request abandoned by client during inference (work discarded; \
+         ORT session.run() cannot be interrupted mid-call)"
+    );
+}
+
 /// Runs one probe batch: tokenize texts, build padded arrays, call `session.run()`,
 /// and return RSS deltas. Uses `embed_dense`'s no-pad tokenizer path.
 fn run_probe_batch(
@@ -229,10 +269,15 @@ pub(super) fn run_worker(
             worker_id = id,
             shapes = config.trt_warmup_shapes.len(),
             "TensorRT pre-warm: compiling engine cache for {} shape(s) \
-             (first run per shape takes 30–120 s; subsequent starts reuse cache)",
+             (first run per shape takes 30–170 s; subsequent starts reuse cache)",
             config.trt_warmup_shapes.len()
         );
-        let warmed = trt_prewarm(&mut initial_models.0, &config.trt_warmup_shapes, id);
+        let warmed = trt_prewarm(
+            &mut initial_models.0,
+            &config.trt_warmup_shapes,
+            id,
+            &cache_dir,
+        );
         tracing::info!(
             worker_id = id,
             warmed,
@@ -336,9 +381,24 @@ pub(super) fn run_worker(
 
                 match request {
                     EmbedRequest::Dense { texts, reply } => {
-                        // Load the current cost model snapshot for this request.
-                        // ArcSwap::load() is lock-free; the guard keeps the Arc
-                        // alive for the duration of embed_dense.
+                        // Pre-dispatch abandonment check: the router's hedged
+                        // race or the original HTTP client may have already
+                        // disconnected while this request sat in the worker
+                        // queue. ORT `session.run()` is a blocking C call that
+                        // cannot be interrupted mid-MatMul (see CLAUDE.md
+                        // "client disconnect" gotcha), so the only opportunity
+                        // we have to save work is BEFORE inference starts. The
+                        // post-inference check below is observability only.
+                        if reply.is_closed() {
+                            tracing::warn!(
+                                worker_id = id,
+                                route = "dense",
+                                batch_size = texts.len(),
+                                "request abandoned by client before dispatch — skipping inference"
+                            );
+                            continue;
+                        }
+                        let t_inference = std::time::Instant::now();
                         let cm_guard = config.cost_model.load();
                         let result = embed_dense(
                             session,
@@ -348,6 +408,7 @@ pub(super) fn run_worker(
                             config.model_variant,
                         )
                         .map_err(|e| anyhow::anyhow!("Dense embed error: {e}"));
+                        let inference_ms = t_inference.elapsed().as_millis();
                         if let Ok((_, ref stats)) = result {
                             tracing::info!(
                                 worker_id = id,
@@ -359,9 +420,20 @@ pub(super) fn run_worker(
                                 "worker: dense embed complete"
                             );
                         }
+                        log_if_abandoned_mid_flight(&reply, "dense", id, &result, inference_ms);
                         let _ = reply.send(result);
                     }
                     EmbedRequest::Sparse { texts, reply } => {
+                        if reply.is_closed() {
+                            tracing::warn!(
+                                worker_id = id,
+                                route = "sparse",
+                                batch_size = texts.len(),
+                                "request abandoned by client before dispatch — skipping inference"
+                            );
+                            continue;
+                        }
+                        let t_inference = std::time::Instant::now();
                         let cm_guard = config.cost_model.load();
                         let result = embed_sparse(
                             session,
@@ -371,6 +443,7 @@ pub(super) fn run_worker(
                             config.model_variant,
                         )
                         .map_err(|e| anyhow::anyhow!("Sparse embed error: {e}"));
+                        let inference_ms = t_inference.elapsed().as_millis();
                         if let Ok((_, ref stats)) = result {
                             tracing::info!(
                                 worker_id = id,
@@ -382,13 +455,25 @@ pub(super) fn run_worker(
                                 "worker: sparse embed complete"
                             );
                         }
+                        log_if_abandoned_mid_flight(&reply, "sparse", id, &result, inference_ms);
                         let _ = reply.send(result);
                     }
                     EmbedRequest::Both { texts, reply } => {
+                        if reply.is_closed() {
+                            tracing::warn!(
+                                worker_id = id,
+                                route = "both",
+                                batch_size = texts.len(),
+                                "request abandoned by client before dispatch — skipping inference"
+                            );
+                            continue;
+                        }
+                        let t_inference = std::time::Instant::now();
                         let cm_guard = config.cost_model.load();
                         let result =
                             embed_both(session, tokenizer, &texts, &cm_guard, config.model_variant)
                                 .map_err(|e| anyhow::anyhow!("Dual embed error: {e}"));
+                        let inference_ms = t_inference.elapsed().as_millis();
                         if let Ok((_, ref stats)) = result {
                             tracing::info!(
                                 worker_id = id,
@@ -400,11 +485,13 @@ pub(super) fn run_worker(
                                 "worker: both embed complete"
                             );
                         }
+                        log_if_abandoned_mid_flight(&reply, "both", id, &result, inference_ms);
                         let _ = reply.send(result);
                     }
                     EmbedRequest::Probe { texts, reply } => {
                         // Probe: tokenize once without padding, run dense inference
                         // on a single flat batch at the chunk's natural max_seq.
+                        // Probes are internal — no client-disconnect path applies.
                         let result = run_probe_batch(session, tokenizer, &texts);
                         let _ = reply.send(result);
                     }

@@ -89,7 +89,7 @@ When `status=ok`, the `/health` response also includes:
 | `BGE_M3_MODEL` | `fp16` | Model variant: `fp32` = `BAAI/bge-m3` (~2.16 GB/session); `fp16` = `Xenova/bge-m3` (~1.08 GB/session); `int8` = `Xenova/bge-m3` quantized (~568 MB/session). See model variant notes below. |
 | `BGE_M3_EP` | `cpu` | Execution provider: `cpu` (MLAS, default), `cuda` (NVIDIA CUDA EP), or `tensorrt` (NVIDIA TensorRT EP). On macOS, CoreML is always used. `cuda`/`tensorrt` require the corresponding Cargo feature and a GPU-enabled ORT build; use `Dockerfile.cuda` and the `-cuda` image tag. |
 | `BGE_M3_GPU_VRAM_BUDGET_BYTES` | unset | VRAM workspace ceiling (bytes) when `BGE_M3_EP` is `cuda` or `tensorrt`. Defaults to 10 GiB (suitable for A10G / L4 and larger). The host-RAM probe is bypassed when any GPU EP is active. |
-| `BGE_M3_TRT_WARMUP_SHAPES` | `1x128,1x512,1x2048,1x8192` | Comma-separated `BxL` shapes to pre-compile as TensorRT engine files during worker startup. Only used when `BGE_M3_EP=tensorrt`. Invalid tokens are skipped with a WARN; empty or all-invalid falls back to the default set. Each shape takes 30–120 s on first deploy; subsequent starts reuse the cached engines. |
+| `BGE_M3_TRT_WARMUP_SHAPES` | 16-shape 2D grid (see gotcha) | Comma-separated `BxL` shapes to pre-compile as TensorRT engine files during worker startup. Only used when `BGE_M3_EP=tensorrt`. Invalid tokens are skipped with a WARN; empty or all-invalid falls back to the default set. Each shape takes 30–170 s on first deploy; subsequent starts reuse the cached engines. Operators running on workstations should shrink the grid (e.g. `1x128`) to keep cold-start tractable. |
 
 ### Logging and Observability
 
@@ -110,6 +110,16 @@ fields route, total_ms
 | filter ispresent(route) and @message like "embedding request complete"
 | stats pct(total_ms, 99) as p99_ms by route
 | sort p99_ms desc
+
+# TRT cache state at every container start (warm vs cold)
+fields @timestamp, cache_path, engine_count, profile_count, @message
+| filter @message like "trt cache:"
+| sort @timestamp desc
+
+# Requests the client abandoned (router hedge race, HTTP disconnect)
+fields @timestamp, worker_id, route, inference_ms_so_far, chunks
+| filter @message like "request abandoned by client"
+| sort @timestamp desc
 
 # Slow requests (> 5 s total)
 fields @timestamp, route, batch_size, chunks, inference_ms, total_ms
@@ -246,6 +256,10 @@ To release: bump version in `Cargo.toml`, commit, push to `main`. The workflow h
 - **Dockerfile builder is `ubuntu:24.04`** — the prebuilt ORT binary requires glibc ≥ 2.38. Debian Bookworm (glibc 2.36) fails with `undefined symbol: __isoc23_strtoul`. Rust installed via `rustup-init` with SHA-256 verification — never `curl | sh`.
 - **ECS capacity at `max_seq=8192`** — per-worker high-water ~10.3 GB (fp16). Formula: `cfg_workers × 10.3 GB + OS_HEADROOM ≤ task_memoryMiB`. Workers=2 safe cap on 28 GiB; workers=4 fits at 56 GiB.
 - **GPU EPs (cuda/tensorrt): BGE_M3_WORKERS is clamped to 1** — the GPU is the serial inference resource. Raising workers beyond 1 on a GPU build logs a WARN and is ignored. Multi-stream concurrency is a future enhancement.
-- **TensorRT cold-start compile (first deploy only):** The first `docker run` with `BGE_M3_EP=tensorrt` compiles engine files into `{BGE_M3_CACHE_DIR}/trt-engines/` for each warmup shape (30–120 s each, ~2–8 min total for the default 4-shape set). The `/health` endpoint returns `503` during this window. Subsequent starts reuse the cached engines and warm up in seconds. The `BGE_M3_TRT_WARMUP_SHAPES` env var controls which shapes are pre-compiled.
-- **ort 2.0.0-rc.12 TensorRT builder methods** — use `with_engine_cache(bool)` and `with_fp16(bool)`, not `with_engine_cache_enable` / `with_fp16_enable` (those names do not exist in this version). CUDA uses `with_device_id(i32)`.
+- **TensorRT cold-start compile (first deploy only):** The first `docker run` with `BGE_M3_EP=tensorrt` compiles engine files into `{BGE_M3_CACHE_DIR}/trt-engines/` for each warmup shape (30–170 s each). The default grid is a 2D `{1, 4, 16, 32} × {128, 512, 2048, 8192} = 16 shapes` composed in batch-major order; cold-cache total compile budget is roughly 6–12 min on first deploy, and the worker signals ready only after all shapes finish so `/health` returns `503` for the full window. Subsequent starts on the same EC2 instance reuse the cached engines and warm up in seconds. Operators on workstations should shrink `BGE_M3_TRT_WARMUP_SHAPES` (e.g. `1x128`) to keep iteration fast.
+- **TensorRT engine cache is per-EC2-host, not cross-host.** TRT plan files embed `(GPU compute capability, CUDA version, TRT version, ONNX model SHA, builder config)`. Within a homogeneous ASG (same instance family + same AMI) these are stable and the cache survives container restarts on the same host. ASGs that mix instance families (T4 → A10G compute capability `sm_75` vs `sm_86`) will see expected cache misses when a task lands on a different GPU. EFS-mounted caches help across hosts only when the ASG is homogeneous.
+- **TensorRT engine cache durability requires fsync.** ORT/TRT writes engine plan files via normal `write(2)`s, which sit in the kernel page cache until the writeback timer (default 30 s) fires. ECS `OutOfMemoryError` SIGKILL (`exitCode 137`) is immediate — no signal handlers, no flush — so a freshly-compiled engine can be lost even after the inode is listed on EFS. The server now fsyncs every regular file in `{BGE_M3_CACHE_DIR}/trt-engines/` plus the directory itself after each successful warmup compile. If you see "two consecutive cold starts produced identical 172 s recompile times" without the new `trt cache: found N cached engines` log line, suspect (a) the operator is on a pre-fix build, (b) the EFS mount disappeared between restarts, or (c) the ECS task definition is not actually mounting `/cache` with `persistent=true` semantics.
+- **TensorRT timing cache** — separate from the engine cache; stored at `{BGE_M3_CACHE_DIR}/trt-timing`. Persists per-tactic kernel timings so the TRT builder can skip tactic-selection on subsequent engine builds. Enabled unconditionally alongside the engine cache.
+- **Client disconnect / hedged-race cancellation.** ORT `session.run()` is a synchronous blocking C call wrapped in `spawn_blocking`; it cannot be interrupted mid-MatMul. The worker therefore performs two best-effort checks via `oneshot::Sender::is_closed()`: (1) pre-dispatch — if the request was abandoned while sitting in the worker queue, skip inference entirely and log `WARN request abandoned by client before dispatch`; (2) post-completion — if the client disconnected during inference, log `WARN request abandoned by client during inference` with `inference_ms_so_far` and `chunks` so operators can size the router's hedge budget against the actual GPU wall time. Mid-inference cancellation is a future enhancement that would require plumbing a cancellation token into `embed_dense`/`embed_sparse`/`embed_both` between bin-packed chunks.
+- **ort 2.0.0-rc.12 TensorRT builder methods** — use `with_engine_cache(bool)`, `with_engine_cache_path(impl ToString)`, `with_timing_cache(bool)`, `with_timing_cache_path(impl ToString)`, `with_fp16(bool)`. The `*_enable` suffixed variants (`with_engine_cache_enable`, `with_fp16_enable`) do not exist in this version. CUDA uses `with_device_id(i32)`.
 - **Dockerfile.cuda uses `download-ort`** — the pyke.io CDN does not provide a verified CUDA+TRT prebuilt for ort 2.0.0-rc.12. The CUDA Dockerfile uses `--features cuda,tensorrt,download-ort` so ort-sys fetches a compatible binary at build time. For a reproducible production build, point `ORT_LIB_LOCATION` at a locally verified CUDA+TRT ORT static lib and remove `download-ort`.

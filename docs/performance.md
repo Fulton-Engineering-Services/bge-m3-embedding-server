@@ -546,7 +546,7 @@ or `BGE_M3_EP=tensorrt`. The production Docker image for GPU deployments uses th
 | Startup probe | Yes (Linux) | No (macOS) | **Bypassed** | **Bypassed** |
 | Workspace budget | Probe-derived (`max_workspace_bytes`) | macOS conservative defaults | `BGE_M3_GPU_VRAM_BUDGET_BYTES` (default 10 GiB) | Same |
 | Engine caching | Probe cache JSON | CoreML `.mlmodelc` | N/A | TRT engine files (`{cache_dir}/trt-engines/`) |
-| First-inference cold start | Normal | CoreML compilation (~15 s) | Normal | **~2–8 min first deploy (TRT compile); seconds thereafter (engine cache hit)** |
+| First-inference cold start | Normal | CoreML compilation (~15 s) | Normal | **~6–12 min first deploy (TRT 16-shape grid compile); seconds thereafter (engine cache hit, fsynced per shape)** |
 
 **Why workers = 1 for GPU EPs:** The GPU is a serial inference resource. Multiple ORT sessions
 on the same GPU would each hold VRAM but share the same compute units without throughput gain.

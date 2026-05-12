@@ -300,7 +300,7 @@ require a restart.
 | `BGE_M3_MODEL` | `fp16` | Model variant — see [Model Variants](#model-variants) |
 | `BGE_M3_EP` | `cpu` | Execution provider: `cpu` (MLAS, default), `cuda` (NVIDIA CUDA), or `tensorrt` (NVIDIA TensorRT). On macOS, CoreML is always used regardless of this setting. `cuda`/`tensorrt` require the corresponding Cargo feature and a GPU-enabled ORT build — use the `-cuda` Docker image tag. |
 | `BGE_M3_GPU_VRAM_BUDGET_BYTES` | unset | VRAM workspace ceiling (bytes) when `BGE_M3_EP` is `cuda` or `tensorrt`. Defaults to 10 GiB when unset (suitable for GPUs with ≥ 16 GiB VRAM, e.g. A10G / L4). Lower this for GPUs with less VRAM (e.g. `8589934592` for 8 GiB). The host-RAM probe is bypassed when any GPU EP is active. |
-| `BGE_M3_TRT_WARMUP_SHAPES` | `1x128,1x512,1x2048,1x8192` | Comma-separated `BxL` shapes to pre-compile as TensorRT engine files during worker startup (`BGE_M3_EP=tensorrt` only). Invalid tokens are skipped with a warning; empty or all-invalid values fall back to the default set. Each shape takes 30–120 s on the first deploy; subsequent starts reuse cached engines. |
+| `BGE_M3_TRT_WARMUP_SHAPES` | 2D 16-shape grid (see TensorRT notes) | Comma-separated `BxL` shapes to pre-compile as TensorRT engine files during worker startup (`BGE_M3_EP=tensorrt` only). Default: `{1, 4, 16, 32} × {128, 512, 2048, 8192}` in batch-major order — the smallest batches finish first so common router shapes are warm quickly. Invalid tokens are skipped with a warning; empty or all-invalid values fall back to the default set. Each shape takes 30–170 s on the first deploy; subsequent starts reuse cached engines. Shrink the grid (e.g. `1x128`) for local development. |
 | `BGE_M3_LOG_FORMAT` | (text) | Set to `json` for structured JSON log output; omit for auto-detect (JSON in non-TTY, human-readable in TTY) |
 
 ### Auto-Budget Tuning (Linux)
@@ -363,9 +363,15 @@ no-ops on macOS (CoreML is always used there) and in CPU-only builds.
 - Use the `-cuda` Docker image tag — the CPU image does not include CUDA/TRT libraries.
 
 **TensorRT engine caching:** when `BGE_M3_EP=tensorrt`, compiled TRT engines are cached to
-`{BGE_M3_CACHE_DIR}/trt-engines/`. First inference may be slow (engine compilation); subsequent
-runs load from cache. Mount the same `cache_dir` volume across restarts to preserve compiled
-engines.
+`{BGE_M3_CACHE_DIR}/trt-engines/` and the TRT timing cache (per-tactic kernel timings) is cached
+to `{BGE_M3_CACHE_DIR}/trt-timing`. Each warmup shape that compiles successfully is fsynced to
+disk before the next compile begins, so an ECS OOM-kill (`exitCode 137`) cannot strand a
+half-written engine plan in the kernel page cache. At startup the server logs `trt cache: found N
+cached engines at {path}` (warm) or `trt cache: empty (will compile)` (cold) so operators can
+verify in CloudWatch whether the persistent volume is actually being reused. Mount the same
+`cache_dir` volume across restarts to preserve compiled engines. TRT plan files embed the GPU
+compute capability and CUDA / TRT versions, so cache reuse is per-EC2-host: ASGs that mix
+instance families (T4 → A10G) will see expected cache misses on family transitions.
 
 ## Docker
 

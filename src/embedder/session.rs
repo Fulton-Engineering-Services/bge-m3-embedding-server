@@ -21,6 +21,8 @@ use anyhow::Result;
 use super::error::ort_err;
 use super::model_files::download_model_files;
 use super::tokenize::load_tokenizer;
+#[cfg(all(not(target_os = "macos"), feature = "tensorrt"))]
+use super::trt_cache;
 use crate::config::{EpSelection, ModelVariant};
 
 /// Returns the execution providers to use for this platform and EP selection.
@@ -67,11 +69,25 @@ pub(super) fn execution_providers(
         // `with_engine_cache_enable` / `with_fp16_enable` which don't exist.
         #[cfg(feature = "tensorrt")]
         if ep == EpSelection::TensorRt {
-            let trt_cache = cache_dir.join("trt-engines");
-            std::fs::create_dir_all(&trt_cache).ok();
+            // Inspect the cache directory BEFORE handing the path to ORT so
+            // operators see in CloudWatch whether engine reuse is working.
+            // Two consecutive cold starts producing the same compile time is
+            // the symptom of an EFS mount that isn't actually persisting —
+            // surfacing the count here is the fastest way to diagnose it.
+            let cache_info = trt_cache::ensure_and_inspect(cache_dir);
+            trt_cache::log_cache_state(&cache_info);
+
+            let timing_cache = trt_cache::timing_cache_path(cache_dir);
+            // The timing cache stores per-tactic kernel timings so the TRT
+            // builder can skip the tactic-selection step on each subsequent
+            // engine build. It is complementary to the engine cache — even
+            // a cold engine cache benefits from a warm timing cache when
+            // multiple shapes are compiled in the same warmup sweep.
             return vec![ort::ep::TensorRT::default()
                 .with_engine_cache(true)
-                .with_engine_cache_path(trt_cache.display().to_string())
+                .with_engine_cache_path(cache_info.path.display().to_string())
+                .with_timing_cache(true)
+                .with_timing_cache_path(timing_cache.display().to_string())
                 .with_fp16(true)
                 .build()];
         }

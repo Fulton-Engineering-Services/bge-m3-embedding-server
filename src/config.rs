@@ -243,18 +243,24 @@ pub struct Config {
     /// files during worker startup.
     ///
     /// Set with `BGE_M3_TRT_WARMUP_SHAPES` as a comma-separated list of `BxL`
-    /// tokens (e.g. `"1x128,1x512,1x2048,1x8192"`). Only used when
+    /// tokens (e.g. `"1x128,4x512,16x2048,32x8192"`). Only used when
     /// `ep == EpSelection::TensorRt`. Invalid tokens are skipped with a `WARN`.
-    /// An empty or all-invalid value falls back to the default set.
+    /// An empty or all-invalid value falls back to the default set. Operators
+    /// can shrink the grid for local development (e.g. `"1x128"`) — the env
+    /// var override path is the canonical way to keep cold-start tractable on
+    /// workstations.
     ///
-    /// Default: `[(1, 128), (1, 512), (1, 2048), (1, 8192)]` — covers short,
-    /// medium, long, and max-context shapes so every realistic request shape
-    /// hits a pre-compiled engine rather than triggering an on-demand compile.
+    /// Default: a 2D `{1, 4, 16, 32} × {128, 512, 2048, 8192}` grid composed
+    /// in batch-major order so the smallest batches finish first and the
+    /// most common router shapes (`chunks = 1–2 × max_chunk_seq up to ~6000`)
+    /// hit a pre-compiled engine on the very first real request. The expensive
+    /// `_ × 8192` shapes compile last (~30–170 s each) — total cold-cache
+    /// compile budget is roughly 6–12 minutes on first deploy. Subsequent
+    /// starts on the same EC2 instance reuse cached engine files (seconds).
     ///
-    /// Each shape may take 30–120 s to compile on the first run; the worker
+    /// Each shape may take 30–170 s to compile on the first run; the worker
     /// signals ready only after all shapes finish, so `/health` returns `503`
-    /// during this window. Subsequent starts reuse cached engine files and
-    /// warm up in seconds.
+    /// during this window.
     pub trt_warmup_shapes: Vec<(usize, usize)>,
 }
 
@@ -393,8 +399,40 @@ impl Config {
     }
 }
 
-/// Default TRT warmup shapes: short, medium, long, and max-context.
-const DEFAULT_TRT_WARMUP_SHAPES: &[(usize, usize)] = &[(1, 128), (1, 512), (1, 2048), (1, 8192)];
+/// Default TRT warmup shapes: a 2D `{1, 4, 16, 32} × {128, 512, 2048, 8192}`
+/// grid composed in batch-major order.
+///
+/// Batch is the outer dimension so the smallest batches (which dominate
+/// real router traffic — `chunks = 1–2 × max_chunk_seq`) are fully compiled
+/// first; larger batches that are mostly observed during bulk re-indexing
+/// fill in afterwards. Within each batch the sequence dimension grows
+/// monotonically so the cheap `_ × 128` shape comes before the expensive
+/// `_ × 8192` shape — operators watching `/health` see progress quickly.
+///
+/// Production observation (2026-05 codekeeper investigation): real router
+/// traffic shows `chunks = 1–2 × max_chunk_seq` up to ~6 000 token positions.
+/// Previously-unseen shapes triggered in-band engine compilation in the middle
+/// of a real request, producing 56–356 s `inference_ms` values. This 16-shape
+/// grid covers the full realistic shape space so every router request hits
+/// a pre-compiled engine.
+const DEFAULT_TRT_WARMUP_SHAPES: &[(usize, usize)] = &[
+    (1, 128),
+    (1, 512),
+    (1, 2048),
+    (1, 8192),
+    (4, 128),
+    (4, 512),
+    (4, 2048),
+    (4, 8192),
+    (16, 128),
+    (16, 512),
+    (16, 2048),
+    (16, 8192),
+    (32, 128),
+    (32, 512),
+    (32, 2048),
+    (32, 8192),
+];
 
 /// Parses `BGE_M3_TRT_WARMUP_SHAPES` from its raw env-var value.
 ///

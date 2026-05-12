@@ -140,19 +140,40 @@ fn heartbeat_secs_invalid_falls_back_to_default() {
 
 // --- BGE_M3_TRT_WARMUP_SHAPES ---
 
+/// The default warmup grid is `{1, 4, 16, 32} × {128, 512, 2048, 8192}` in
+/// batch-major order so the smallest batches (which dominate real router
+/// traffic) compile first.
+fn default_warmup_grid() -> Vec<(usize, usize)> {
+    vec![
+        (1, 128),
+        (1, 512),
+        (1, 2048),
+        (1, 8192),
+        (4, 128),
+        (4, 512),
+        (4, 2048),
+        (4, 8192),
+        (16, 128),
+        (16, 512),
+        (16, 2048),
+        (16, 8192),
+        (32, 128),
+        (32, 512),
+        (32, 2048),
+        (32, 8192),
+    ]
+}
+
 #[test]
 fn trt_warmup_shapes_none_yields_defaults() {
-    assert_eq!(
-        parse_trt_warmup_shapes(None),
-        vec![(1, 128), (1, 512), (1, 2048), (1, 8192)],
-    );
+    assert_eq!(parse_trt_warmup_shapes(None), default_warmup_grid());
 }
 
 #[test]
 fn trt_warmup_shapes_empty_string_yields_defaults() {
     assert_eq!(
         parse_trt_warmup_shapes(Some(String::new())),
-        vec![(1, 128), (1, 512), (1, 2048), (1, 8192)],
+        default_warmup_grid(),
     );
 }
 
@@ -177,7 +198,7 @@ fn trt_warmup_shapes_invalid_token_skipped() {
 fn trt_warmup_shapes_all_invalid_yields_defaults() {
     assert_eq!(
         parse_trt_warmup_shapes(Some("bad,also_bad,nope".to_string())),
-        vec![(1, 128), (1, 512), (1, 2048), (1, 8192)],
+        default_warmup_grid(),
     );
 }
 
@@ -185,10 +206,7 @@ fn trt_warmup_shapes_all_invalid_yields_defaults() {
 fn trt_warmup_shapes_config_field_defaults_without_env() {
     let map = HashMap::new();
     let cfg = Config::from_lookup(lookup_from(&map));
-    assert_eq!(
-        cfg.trt_warmup_shapes,
-        vec![(1, 128), (1, 512), (1, 2048), (1, 8192)],
-    );
+    assert_eq!(cfg.trt_warmup_shapes, default_warmup_grid());
 }
 
 #[test]
@@ -196,6 +214,35 @@ fn trt_warmup_shapes_config_field_set_from_env() {
     let map = HashMap::from([("BGE_M3_TRT_WARMUP_SHAPES", "4x256,1x8192")]);
     let cfg = Config::from_lookup(lookup_from(&map));
     assert_eq!(cfg.trt_warmup_shapes, vec![(4, 256), (1, 8192)]);
+}
+
+#[test]
+fn trt_warmup_shapes_default_grid_is_batch_major() {
+    // Default grid: outer loop is batch, inner loop is sequence length.
+    // The first four entries should all have batch=1; the last four should
+    // all have batch=32. This protects the "smallest batches compile first"
+    // ordering against accidental reshuffles.
+    let defaults = default_warmup_grid();
+    assert!(
+        defaults[..4].iter().all(|(b, _)| *b == 1),
+        "first four entries should be batch=1"
+    );
+    assert!(
+        defaults[12..].iter().all(|(b, _)| *b == 32),
+        "last four entries should be batch=32"
+    );
+    // Within batch=1 the sequence dimension grows monotonically.
+    assert_eq!(defaults[..4], [(1, 128), (1, 512), (1, 2048), (1, 8192)]);
+}
+
+#[test]
+fn trt_warmup_shapes_small_grid_override_works_for_local_dev() {
+    // Operators running locally can collapse the grid to a single cheap shape
+    // (e.g. `BGE_M3_TRT_WARMUP_SHAPES=1x128`) — that override path must keep
+    // working so cold-start stays tractable on workstations.
+    let map = HashMap::from([("BGE_M3_TRT_WARMUP_SHAPES", "1x128")]);
+    let cfg = Config::from_lookup(lookup_from(&map));
+    assert_eq!(cfg.trt_warmup_shapes, vec![(1, 128)]);
 }
 
 // --- BGE_M3_EP (EpSelection) ---
