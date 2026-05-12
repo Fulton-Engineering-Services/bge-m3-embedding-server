@@ -22,20 +22,19 @@ RUN BASE="https://static.rust-lang.org/rustup/archive/${RUSTUP_VERSION}/x86_64-u
     && rm /tmp/rustup-init /tmp/rustup-init.sha256
 ENV PATH="/root/.cargo/bin:${PATH}"
 
-# ORT prebuilt for CUDA + TensorRT.
-#
-# The pyke.io CDN (https://cdn.pyke.io/0/pyke:ort-rs/ms@<version>/<triple>.tar.lzma2)
-# only lists CPU-only prebuilts for ort 2.0.0-rc.12 in the ort-sys dist.txt.
-# A CUDA+TRT-enabled ORT static library requires a custom ORT build (see
-# https://onnxruntime.ai/docs/build/eps.html#tensorrt) — no verified prebuilt
-# is available on the CDN for this combination at this time.
-#
-# Therefore we use `download-ort` to let ort-sys fetch a compatible prebuilt at
-# build time. This requires internet access during `docker build` and pins to
-# whatever pyke.io provides for the `cuda` + `tensorrt` feature set.
-# For a fully-reproducible production build, replace this with:
-#   ENV ORT_LIB_LOCATION=/opt/ort (pointing to a locally verified ORT static lib)
-# and remove the `download-ort` feature from the cargo build command below.
+# Download the pinned ORT prebuilt for CUDA + TensorRT, verify SHA-256, then extract.
+# The pyke.io CDN publishes an "nvrtx" (NVIDIA TensorRT) prebuilt for
+# x86_64-unknown-linux-gnu that includes both the CUDA EP and the TensorRT EP.
+# Checksum taken from ort-sys-2.0.0-rc.12/build/download/dist.txt (feature set "nvrtx").
+# Same lzma2 FORMAT_RAW extraction as the CPU Dockerfile (no XZ container).
+ARG ORT_VERSION=1.24.2
+ARG ORT_NVRTX_URL=https://cdn.pyke.io/0/pyke:ort-rs/ms@1.24.2/x86_64-unknown-linux-gnu+nvrtx.tar.lzma2
+ARG ORT_NVRTX_SHA256=41a35588fd9f7cb6c570e82d3cb6cc6de2dd6fa09bac751dd8890c07d8f1e5d1
+RUN curl --proto '=https' --tlsv1.2 -sSfL "$ORT_NVRTX_URL" -o /tmp/ort.tar.lzma2 \
+    && echo "${ORT_NVRTX_SHA256}  /tmp/ort.tar.lzma2" | sha256sum -c - \
+    && python3 -c "import lzma, tarfile, io, os; data = open('/tmp/ort.tar.lzma2', 'rb').read(); dec = lzma.decompress(data, format=lzma.FORMAT_RAW, filters=[{'id': lzma.FILTER_LZMA2, 'dict_size': 1<<26}]); os.makedirs('/opt/ort', exist_ok=True); tf = tarfile.open(fileobj=io.BytesIO(dec)); tf.extractall('/opt/ort', filter='data'); tf.close()" \
+    && rm /tmp/ort.tar.lzma2
+ENV ORT_LIB_LOCATION=/opt/ort
 
 WORKDIR /app
 
@@ -46,12 +45,12 @@ WORKDIR /app
 COPY Cargo.toml Cargo.lock build.rs ./
 RUN mkdir src && echo "fn main(){}" > src/main.rs && touch src/lib.rs \
     && mkdir -p benches/coreml && touch benches/embeddings.rs benches/coreml/main.rs \
-    && cargo build --release --features cuda,tensorrt,download-ort \
+    && cargo build --release --features cuda,tensorrt \
     && rm -rf src benches
 
 COPY src ./src
 COPY benches ./benches
-RUN touch src/main.rs && cargo build --release --features cuda,tensorrt,download-ort
+RUN touch src/main.rs && cargo build --release --features cuda,tensorrt
 
 # ── Runtime stage ──────────────────────────────────────────────────────────────
 # Only the CUDA runtime libs are needed at inference time — not the full devel
