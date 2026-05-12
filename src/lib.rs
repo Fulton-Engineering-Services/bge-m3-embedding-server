@@ -141,10 +141,34 @@ pub async fn run() -> anyhow::Result<()> {
     // intended for use as an ECS init container that pre-populates the shared
     // EFS engine cache before the main container starts.
     if cfg.warmup_only {
+        // Emit GPU heartbeats while engines are compiling so operators have
+        // VRAM and temperature visibility in CloudWatch during the warmup
+        // window.  Uses the same GpuStatsCollector and interval as the
+        // normal-mode heartbeat; no-op on CPU builds.
+        let warmup_hb_handle = if cfg.heartbeat_secs > 0 {
+            let gpu_stats = GpuStatsCollector::init(cfg.gpu_count);
+            let heartbeat_secs = cfg.heartbeat_secs;
+            Some(tokio::spawn(async move {
+                let mut tick = tokio::time::interval(Duration::from_secs(heartbeat_secs));
+                tick.tick().await; // skip the immediate t=0 tick
+                loop {
+                    tick.tick().await;
+                    gpu_stats.emit_heartbeat();
+                }
+            }))
+        } else {
+            None
+        };
+
         init_handle
             .await
             .map_err(|e| anyhow::anyhow!("Worker pool task panicked: {e}"))?
             .map_err(|e| anyhow::anyhow!("Worker pool initialization failed: {e}"))?;
+
+        if let Some(h) = warmup_hb_handle {
+            h.abort();
+        }
+
         let trt_info =
             crate::embedder::trt_cache::ensure_and_inspect(&PathBuf::from(&cfg.cache_dir));
         info!(
