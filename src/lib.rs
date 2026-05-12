@@ -34,6 +34,7 @@ pub mod config;
 pub mod embedder;
 pub mod error;
 pub mod handler;
+pub mod logging;
 pub mod models;
 pub mod probe;
 pub mod state;
