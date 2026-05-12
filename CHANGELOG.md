@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **CUDA and TensorRT execution providers** — opt-in via `BGE_M3_EP=cuda` or `BGE_M3_EP=tensorrt`
+  using new `cuda` / `tensorrt` Cargo features (`ort/cuda`, `ort/tensorrt`). Activates NVIDIA
+  GPU inference on Linux. On macOS, CoreML is always used and `BGE_M3_EP` is ignored.
+- `BGE_M3_GPU_VRAM_BUDGET_BYTES` environment variable — VRAM workspace ceiling (default 10 GiB)
+  when a GPU EP is active. The host-RAM startup probe is bypassed when `BGE_M3_EP` is `cuda` or
+  `tensorrt`.
+- `Dockerfile.cuda` — multi-stage CUDA image based on `nvidia/cuda:12.6.0-cudnn-*-ubuntu24.04`
+  (linux/amd64 only). Uses the `download-ort` feature to fetch a CUDA+TRT-enabled ORT binary at
+  build time.
+- Release workflow extended: publishes `<version>-cuda` / `latest-cuda` GHCR tags alongside the
+  CPU (`latest`) multi-arch image.
+
+### Changed
+- `BGE_M3_WORKERS` is automatically clamped to `1` with a `WARN` log line when `BGE_M3_EP` is
+  `cuda` or `tensorrt`. The GPU is a serial inference resource; multiple sessions on the same GPU
+  waste VRAM without throughput benefit.
+
 ## [0.15.0] - 2026-05-10
 
 ### Added

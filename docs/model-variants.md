@@ -125,10 +125,13 @@ Dense cosine similarity ≥ 0.963 at minimum means INT8 is suitable for ANN sear
 |----|------|------|------|
 | MLAS (CPU, Linux/Intel) | baseline | ~6–9× slower | near-FP32 (-9% to +22% vs FP32) |
 | CoreML (Apple Silicon GPU) | 20–61% faster than MLAS | 6–10× slower than FP32+CoreML | 42–79% slower than INT8+MLAS |
+| CUDA EP (NVIDIA GPU, Linux) | 5–15× faster than MLAS (estimated, long sequences) | **recommended** — same as Linux fleet default | TBD — DequantizeLinear nodes may fragment CUDA execution plan |
 
 **Summary:**
-- **Linux production:** FP16 for memory efficiency; INT8 for memory-constrained hosts. Both use MLAS.
+- **Linux CPU production:** FP16 for memory efficiency; INT8 for memory-constrained hosts. Both use MLAS.
+- **Linux GPU production:** FP16 is the recommended model variant for CUDA and TensorRT EPs — matches the fleet default and avoids potential execution-plan fragmentation. INT8 compatibility with CUDA EP is not yet validated.
 - **Apple Silicon:** FP32 for best latency via CoreML GPU dispatch. FP16 and INT8 fragment the CoreML execution graph due to Cast/DequantizeLinear nodes.
+- `BGE_M3_EP=cuda` and `BGE_M3_EP=tensorrt` are Linux-only. On macOS, CoreML is always used regardless of `BGE_M3_EP`.
 
 See [coreml-ep.md](coreml-ep.md) for the full CoreML dispatch analysis.
 
@@ -141,6 +144,10 @@ See [coreml-ep.md](coreml-ep.md) for the full CoreML dispatch analysis.
 | INT8 + Linux (MLAS) | 7 | ~568 MB | ~5–6 GB |
 | FP32 + CoreML | 2 | ~2.16 GB | ~25–44 GB |
 | FP16 + CoreML | 1 | ~1.08 GB | ~10–18 GB |
+| FP16 + CUDA EP | 1 (clamped) | ~1.08 GB weights + VRAM | VRAM budget 10 GiB (default); set `BGE_M3_GPU_VRAM_BUDGET_BYTES` to adjust |
+| FP16 + TensorRT EP | 1 (clamped) | ~1.08 GB weights + VRAM | Same as CUDA EP; TRT engines cached to `{cache_dir}/trt-engines/` |
+
+GPU EP workers are always clamped to 1 — see [GPU Execution Providers](../README.md#gpu-execution-providers-cuda--tensorrt) in the README.
 
 At `BGE_M3_MAX_SEQ_LENGTH=8192`, each individual `session.run()` call at a single text
 uses ~671 MB of intermediate workspace (conservative estimate). The bin-packer ensures

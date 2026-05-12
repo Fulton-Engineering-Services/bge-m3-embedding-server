@@ -306,6 +306,8 @@ All configuration is read once at startup from environment variables via
 | `BGE_M3_MAX_SEQ_LENGTH` | `8192` | Max tokenized sequence length `[1, 8192]` |
 | `BGE_M3_IDLE_TIMEOUT_SECS` | `300` | Idle unload timeout; `0` disables |
 | `BGE_M3_MODEL` | `fp16` | Model variant: `fp32` = BAAI/bge-m3; `fp16` = Xenova/bge-m3; `int8` = Xenova/bge-m3 quantized |
+| `BGE_M3_EP` | `cpu` | Execution provider: `cpu` (MLAS, default), `cuda` (NVIDIA CUDA EP), `tensorrt` (NVIDIA TensorRT EP). macOS always uses CoreML regardless of this setting. Requires the corresponding Cargo feature and the `-cuda` Docker image. |
+| `BGE_M3_GPU_VRAM_BUDGET_BYTES` | unset | VRAM workspace ceiling (bytes) when `BGE_M3_EP` is `cuda` or `tensorrt`. Defaults to 10 GiB. The host-RAM probe is bypassed when any GPU EP is active. |
 
 ### Auto-budget variables (Linux)
 

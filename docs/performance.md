@@ -516,8 +516,85 @@ Dense embeddings shown. Sparse values are within 5% of dense for all configurati
 
 | Constraint | Recommended config | Rationale |
 |------------|-------------------|-----------|
-| Best latency | FP32 + CoreML EP | 20–61% faster than MLAS; full GPU dispatch |
+| Best latency (macOS) | FP32 + CoreML EP | 20–61% faster than MLAS; full GPU dispatch |
+| Best latency (Linux GPU) | FP16 + CUDA EP or TensorRT EP | 5–15× faster than MLAS (projected); no production data yet |
 | Memory-constrained (≤ 2 GB/session) | INT8 + MLAS EP | 74% memory savings; near-FP32 latency |
 | Memory-critical (≤ 1 GB/session) | INT8 + MLAS EP with `BGE_M3_WORKERS=1` | One session (~0.54 GB) |
-| Avoid | FP16 (any EP) | 6–10× slower than FP32; no CoreML benefit |
+| Avoid | FP16 (any EP) on macOS | 6–10× slower than FP32; no CoreML benefit |
 | Avoid | INT8 + CoreML EP | 42–79% slower than INT8 + MLAS |
+
+---
+
+## GPU Execution Providers (CUDA / TensorRT)
+
+> **Note:** No production latency measurements are available yet for GPU EPs. The figures below
+> are projections based on ONNX Runtime CUDA EP benchmarks reported for comparable transformer
+> models. These numbers should be validated once a GPU deployment is instrumented.
+
+### Overview
+
+The server can be compiled with NVIDIA CUDA or TensorRT execution providers via opt-in Cargo
+features (`--features cuda` or `--features tensorrt`). Activated at runtime by `BGE_M3_EP=cuda`
+or `BGE_M3_EP=tensorrt`. The production Docker image for GPU deployments uses the `-cuda` tag
+(built from `Dockerfile.cuda`, based on `nvidia/cuda:12.6.0-cudnn-*-ubuntu24.04`, amd64 only).
+
+### Key Behavioral Differences from CPU/CoreML
+
+| Aspect | CPU (MLAS) | CoreML | CUDA EP | TensorRT EP |
+|--------|-----------|--------|---------|-------------|
+| Workers | 2–7 (configurable) | 1–2 | **1 (clamped)** | **1 (clamped)** |
+| Startup probe | Yes (Linux) | No (macOS) | **Bypassed** | **Bypassed** |
+| Workspace budget | Probe-derived (`max_workspace_bytes`) | macOS conservative defaults | `BGE_M3_GPU_VRAM_BUDGET_BYTES` (default 10 GiB) | Same |
+| Engine caching | Probe cache JSON | CoreML `.mlmodelc` | N/A | TRT engine files (`{cache_dir}/trt-engines/`) |
+| First-inference cold start | Normal | CoreML compilation (~15 s) | Normal | **TRT engine compile** (may be slow on first run) |
+
+**Why workers = 1 for GPU EPs:** The GPU is a serial inference resource. Multiple ORT sessions
+on the same GPU would each hold VRAM but share the same compute units without throughput gain.
+Multi-stream GPU concurrency is a future enhancement.
+
+### Projected Throughput vs CPU
+
+For long-sequence workloads (the `O(seq²)` attention regime), CUDA EP is expected to deliver
+**5–15× throughput improvement** over MLAS on comparable hardware (e.g. A10G / L4 vs Fargate
+vCPU). Improvement is larger for long sequences because attention dominates, and smaller for
+short-text workloads where CUDA kernel launch overhead is non-trivial relative to compute.
+
+| Workload | MLAS (estimated) | CUDA EP (projected) | Notes |
+|----------|-----------------|---------------------|-------|
+| Short texts (code symbols, ~30 tokens) | ~35 ms/text (single-thread) | ~5–15 ms/text | Kernel launch overhead limits gain |
+| Long docs (document chunks, ~400 tokens) | ~150 ms/text | ~15–40 ms/text | `O(seq²)` attention benefits most |
+| Mixed batch (tool descriptions, ~100 tokens) | ~30 ms/text | ~5–10 ms/text | — |
+
+These are rough order-of-magnitude estimates. Actual numbers depend on GPU model, driver
+version, ORT build, and batch composition. **Instrument a GPU deployment and update this
+table with measured values before using these for capacity planning.**
+
+### VRAM Budget
+
+The startup probe (cgroup RSS measurement) does not apply to GPU deployments. Instead:
+
+- `BGE_M3_GPU_VRAM_BUDGET_BYTES` sets the workspace ceiling (default: **10 GiB** = `10_737_418_240`)
+- Suitable for GPUs with ≥ 16 GiB VRAM (A10G, L4, A100, H100)
+- For GPUs with less VRAM, lower the budget: e.g. `8589934592` (8 GiB) for an A10
+- The model weights occupy ~1.08 GB per session (FP16, recommended for GPU EP); the
+  remaining VRAM ceiling is workspace for intermediate tensors during inference
+
+| GPU | VRAM | Suggested `BGE_M3_GPU_VRAM_BUDGET_BYTES` |
+|-----|------|------------------------------------------|
+| A10G / L4 | 24 GiB | `10737418240` (10 GiB, default) |
+| A10 | 24 GiB | `10737418240` (10 GiB, default) |
+| T4 | 16 GiB | `8589934592` (8 GiB) |
+| A100 40 GB | 40 GiB | `21474836480` (20 GiB) — room for larger batches |
+| H100 80 GB | 80 GiB | `42949672960` (40 GiB) |
+
+### Model Variant Recommendation
+
+**FP16 is the recommended model variant for GPU EPs.** This matches the Linux fleet default
+and aligns with how the CUDA EP handles the model's weight precision:
+- FP16 reduces VRAM consumption by ~50% vs FP32 (~1.08 GB vs ~2.16 GB per session)
+- Unlike CoreML (which recompiles FP16 ONNX to an FP32 internal graph), CUDA EP can execute
+  FP16 ops natively on Tensor Core hardware
+
+INT8 is not yet validated with CUDA EP. The `DequantizeLinear` nodes in the Xenova INT8
+export may fragment the CUDA execution plan similarly to the CoreML fragmentation documented
+above — this is TBD and will be confirmed when GPU benchmarks are run.

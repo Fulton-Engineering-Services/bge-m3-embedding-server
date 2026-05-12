@@ -23,7 +23,7 @@ which describes BGE-M3's three retrieval heads.
 | ColBERT multi-vector | Not exposed (model supports it) | **No** | Requires `last_hidden_state`; TEI does not surface it |
 | 8192-token context | Yes (FP32 export) | Yes | None |
 | Multilingual (100+ languages) | Yes | Yes | None |
-| Flash Attention on NVIDIA | No (ORT MLAS / CoreML only) | Yes | TEI advantage on GPU latency |
+| Flash Attention on NVIDIA | Partial — CUDA EP available; Flash Attention kernel not yet (see note) | Yes | TEI kernel-level advantage remains; CUDA EP closes the basic GPU inference gap |
 | Apple Silicon CoreML execution | Yes | No | This server's advantage on macOS dev |
 
 ---
@@ -105,8 +105,13 @@ closed:
   attention to dedicated CUDA kernels rather than ORT's generic graph
   execution. For long-sequence workloads (the `O(seq²)` regime that
   motivates the workspace probe in this server), Flash Attention is a
-  meaningful per-token throughput advantage. This server would need a
-  TensorRT EP integration — or a hand-written attention path — to match.
+  meaningful per-token throughput advantage. This server now includes a
+  CUDA EP build (`BGE_M3_EP=cuda`, `-cuda` Docker image tag) that runs
+  standard ORT CUDA attention ops — which closes the basic GPU inference gap
+  but does not match TEI's Flash Attention kernel-level efficiency. A
+  TensorRT EP build is also available (`BGE_M3_EP=tensorrt`), which can
+  compile engine plans using TRT's fused attention op, but this has not
+  been benchmarked at Flash Attention parity.
 - **Engineering surface area.** TEI is maintained by Hugging Face's
   inference team with significant test coverage and a stable v1 API.
 - **gRPC + OpenAI-compatible REST out of the box.** This server is
