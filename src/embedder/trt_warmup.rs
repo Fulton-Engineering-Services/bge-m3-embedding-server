@@ -65,31 +65,48 @@ pub(super) fn shard_shapes(
         .collect()
 }
 
+/// Aggregate per-worker statistics returned by [`trt_prewarm`].
+///
+/// `total_compile_ms` and `total_fsync_ms` sum across only the shapes that
+/// compiled successfully on this worker's shard. They are intended for the
+/// "`TensorRT` pre-warm complete" summary log emitted by the worker, where
+/// ops dashboards can divide total compile time across shards to reason
+/// about how much wall-clock the multi-GPU sharding is actually saving.
+pub(super) struct PrewarmStats {
+    pub warmed: usize,
+    pub total_compile_ms: u64,
+    pub total_fsync_ms: u64,
+}
+
 /// Runs a dummy `session.run()` for each `(batch, seq)` shape in
 /// `warmup_shapes` so the `TensorRT` EP compiles and caches engine files
 /// before the first real request arrives.
 ///
 /// Each shape may take 30–170 s on the very first deploy; subsequent starts
 /// reuse the cached `.engine` files (seconds). Progress is logged at `INFO`
-/// with elapsed time for each shape. After each successful compile the
-/// engine cache directory is fsynced so the plan file survives an
-/// unexpected OOM-kill — see `trt_cache::fsync_cache_dir`.
+/// with `compile_ms` (the ORT/TRT compile call itself) and `fsync_ms` (the
+/// durability flush to the engine cache directory) for each shape. After
+/// each successful compile the engine cache directory is fsynced so the
+/// plan file survives an unexpected OOM-kill — see
+/// `trt_cache::fsync_cache_dir`.
 ///
-/// Returns the number of shapes that compiled successfully.
+/// Returns aggregate statistics including the number of shapes that
+/// compiled successfully and the per-worker total compile/fsync wall time.
 pub(super) fn trt_prewarm(
     session: &mut ort::session::Session,
     warmup_shapes: &[(usize, usize)],
     worker_id: usize,
     cache_dir: &Path,
-) -> usize {
+) -> PrewarmStats {
     let mut warmed = 0usize;
+    let mut total_compile_ms: u64 = 0;
+    let mut total_fsync_ms: u64 = 0;
     let engine_cache_dir = trt_cache::engine_cache_path(cache_dir);
 
     for (idx, &(batch, seq)) in warmup_shapes.iter().enumerate() {
         let ids = ndarray::Array2::<i64>::zeros((batch, seq));
         let mask = ndarray::Array2::<i64>::ones((batch, seq));
 
-        let shape_start = std::time::Instant::now();
         tracing::info!(
             worker_id,
             batch,
@@ -99,17 +116,22 @@ pub(super) fn trt_prewarm(
             "TensorRT pre-warm: compiling engine for shape (this may take 30–170 s)"
         );
 
-        match probe_run_dense(session, &ids, &mask) {
-            Ok(_) => {
-                let compile_elapsed_ms = shape_start.elapsed().as_millis();
+        // Tightly wrap only the ORT/TRT compile call so `compile_ms`
+        // measures engine-build wall time without the surrounding logging
+        // or fsync overhead.
+        let compile_start = std::time::Instant::now();
+        let result = probe_run_dense(session, &ids, &mask);
+        let compile_ms = u64::try_from(compile_start.elapsed().as_millis()).unwrap_or(u64::MAX);
 
+        match result {
+            Ok(_) => {
                 // Flush newly-written engine plan to disk before moving on
                 // to the next shape. If the kernel only ever held this
                 // engine in dirty pages, an ECS OOM-kill during the next
                 // shape (or during real traffic) would lose it silently.
                 let fsync_start = std::time::Instant::now();
                 trt_cache::fsync_cache_dir(&engine_cache_dir);
-                let fsync_elapsed_ms = fsync_start.elapsed().as_millis();
+                let fsync_ms = u64::try_from(fsync_start.elapsed().as_millis()).unwrap_or(u64::MAX);
 
                 tracing::info!(
                     worker_id,
@@ -117,11 +139,13 @@ pub(super) fn trt_prewarm(
                     seq,
                     shape_index = idx + 1,
                     shape_total = warmup_shapes.len(),
-                    elapsed_ms = compile_elapsed_ms,
-                    fsync_ms = fsync_elapsed_ms,
+                    compile_ms,
+                    fsync_ms,
                     "TensorRT pre-warm: engine compiled, cached, and fsynced"
                 );
                 warmed += 1;
+                total_compile_ms = total_compile_ms.saturating_add(compile_ms);
+                total_fsync_ms = total_fsync_ms.saturating_add(fsync_ms);
             }
             Err(e) => {
                 tracing::warn!(
@@ -130,7 +154,7 @@ pub(super) fn trt_prewarm(
                     seq,
                     shape_index = idx + 1,
                     shape_total = warmup_shapes.len(),
-                    elapsed_ms = shape_start.elapsed().as_millis(),
+                    compile_ms,
                     error = %e,
                     "TensorRT pre-warm: engine compilation failed for shape; \
                      first real request for this shape will trigger an on-demand compile"
@@ -143,7 +167,11 @@ pub(super) fn trt_prewarm(
     // were touched during the warmup but not associated with a single shape.
     trt_cache::fsync_cache_dir(&engine_cache_dir);
 
-    warmed
+    PrewarmStats {
+        warmed,
+        total_compile_ms,
+        total_fsync_ms,
+    }
 }
 
 #[cfg(test)]

@@ -296,7 +296,7 @@ pub(super) fn run_worker(
             "TensorRT pre-warm: worker compiling shard \
              (first run per shape takes 30–170 s; subsequent starts reuse cache)"
         );
-        let warmed = trt_prewarm(
+        let stats = trt_prewarm(
             &mut initial_models.0,
             &config.trt_warmup_shapes,
             id,
@@ -304,8 +304,10 @@ pub(super) fn run_worker(
         );
         tracing::info!(
             worker_id = id,
-            warmed,
+            warmed = stats.warmed,
             total = config.trt_warmup_shapes.len(),
+            total_compile_ms = stats.total_compile_ms,
+            total_fsync_ms = stats.total_fsync_ms,
             "TensorRT pre-warm complete"
         );
     }

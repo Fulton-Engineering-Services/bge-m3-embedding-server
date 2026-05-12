@@ -127,6 +127,11 @@ fields @timestamp, cache_path, engine_count, profile_count, @message
 | filter @message like "trt cache:"
 | sort @timestamp desc
 
+# p99 per-shape TRT engine compile time (warmup)
+fields compile_ms
+| filter @message like "engine compiled, cached, and fsynced"
+| stats pct(compile_ms, 99) as p99_compile_ms by @message
+
 # Requests the client abandoned (router hedge race, HTTP disconnect)
 fields @timestamp, worker_id, route, inference_ms_so_far, chunks
 | filter @message like "request abandoned by client"
