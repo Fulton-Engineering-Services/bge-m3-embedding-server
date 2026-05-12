@@ -301,6 +301,7 @@ require a restart.
 | `BGE_M3_EP` | `cpu` | Execution provider: `cpu` (MLAS, default), `cuda` (NVIDIA CUDA), or `tensorrt` (NVIDIA TensorRT). On macOS, CoreML is always used regardless of this setting. `cuda`/`tensorrt` require the corresponding Cargo feature and a GPU-enabled ORT build — use the `-cuda` Docker image tag. |
 | `BGE_M3_GPU_VRAM_BUDGET_BYTES` | unset | VRAM workspace ceiling (bytes) when `BGE_M3_EP` is `cuda` or `tensorrt`. Defaults to 10 GiB when unset (suitable for GPUs with ≥ 16 GiB VRAM, e.g. A10G / L4). Lower this for GPUs with less VRAM (e.g. `8589934592` for 8 GiB). The host-RAM probe is bypassed when any GPU EP is active. |
 | `BGE_M3_TRT_WARMUP_SHAPES` | 2D 16-shape grid (see TensorRT notes) | Comma-separated `BxL` shapes to pre-compile as TensorRT engine files during worker startup (`BGE_M3_EP=tensorrt` only). Default: `{1, 4, 16, 32} × {128, 512, 2048, 8192}` in batch-major order — the smallest batches finish first so common router shapes are warm quickly. Invalid tokens are skipped with a warning; empty or all-invalid values fall back to the default set. Each shape takes 30–170 s on the first deploy; subsequent starts reuse cached engines. Shrink the grid (e.g. `1x128`) for local development. |
+| `BGE_M3_WARMUP_ONLY` | `0` | When `1`, compile and fsync all TRT engine files then exit 0. No HTTP port is bound. Use as an ECS init container to pre-populate the shared engine cache before the main container starts — the main container then reaches healthy in seconds instead of 90–180 minutes on a cold cache. A `WARN` is logged if set with a non-`tensorrt` EP (exits 0 cleanly regardless). See [ECS Init Container Pattern](#ecs-init-container-pattern-tensorrt). |
 | `BGE_M3_LOG_FORMAT` | (text) | Set to `json` for structured JSON log output; omit for auto-detect (JSON in non-TTY, human-readable in TTY) |
 
 ### Auto-Budget Tuning (Linux)
@@ -372,6 +373,89 @@ verify in CloudWatch whether the persistent volume is actually being reused. Mou
 `cache_dir` volume across restarts to preserve compiled engines. TRT plan files embed the GPU
 compute capability and CUDA / TRT versions, so cache reuse is per-EC2-host: ASGs that mix
 instance families (T4 → A10G) will see expected cache misses on family transitions.
+
+### ECS Init Container Pattern (TensorRT)
+
+**Problem:** Compiling the default 16-shape warmup grid on an NVIDIA L4 takes **90–180 minutes**
+total on a cold cache. During that window the worker is busy compiling engines and `/health`
+returns `503 loading`, which keeps the ECS service in a perpetual "unhealthy" state unless
+`healthCheckGracePeriodSeconds` covers the full window.
+
+**Solution:** Run the server once as an ECS [init container](https://docs.aws.amazon.com/AmazonECS/latest/developerguide/task_definition_parameters.html#container_definition_dependsOn)
+with `BGE_M3_WARMUP_ONLY=1`. It compiles all engines, fsyncs them to the shared cache volume,
+logs `"warmup-only mode: all TRT engines compiled and cached, exiting"` with `engine_count` and
+`cache_path`, and exits 0. The main container then starts with a warm cache and reaches healthy
+in **seconds** rather than minutes.
+
+**Local smoke-test (single shape, fast):**
+
+```bash
+docker run --rm --gpus all \
+  -v /path/to/model-cache:/cache \
+  -e BGE_M3_EP=tensorrt \
+  -e BGE_M3_WARMUP_ONLY=1 \
+  -e BGE_M3_TRT_WARMUP_SHAPES=1x128 \
+  ghcr.io/fulton-engineering-services/bge-m3-embedding-server:latest-cuda
+# exits 0 after compiling the single 1×128 engine
+```
+
+**ECS task definition snippet (generic):**
+
+```json
+{
+  "containerDefinitions": [
+    {
+      "name": "trt-warmup",
+      "image": "ghcr.io/fulton-engineering-services/bge-m3-embedding-server:latest-cuda",
+      "essential": false,
+      "environment": [
+        { "name": "BGE_M3_EP",          "value": "tensorrt" },
+        { "name": "BGE_M3_WARMUP_ONLY", "value": "1" }
+      ],
+      "mountPoints": [
+        { "sourceVolume": "engine-cache", "containerPath": "/cache" }
+      ],
+      "resourceRequirements": [
+        { "type": "GPU", "value": "1" }
+      ]
+    },
+    {
+      "name": "bge-m3",
+      "image": "ghcr.io/fulton-engineering-services/bge-m3-embedding-server:latest-cuda",
+      "essential": true,
+      "environment": [
+        { "name": "BGE_M3_EP", "value": "tensorrt" }
+      ],
+      "mountPoints": [
+        { "sourceVolume": "engine-cache", "containerPath": "/cache" }
+      ],
+      "resourceRequirements": [
+        { "type": "GPU", "value": "1" }
+      ],
+      "dependsOn": [
+        { "containerName": "trt-warmup", "condition": "SUCCESS" }
+      ]
+    }
+  ]
+}
+```
+
+**Key deployment notes:**
+
+- **Both containers need GPU access** (`"type": "GPU", "value": "1"` in `resourceRequirements`).
+  The warmup container requires the GPU to compile TRT engines; the main container requires it for
+  inference.
+- **Both containers must mount the same cache volume.** The warmup container writes compiled
+  engines to `{cache}/trt-engines/`; the main container reads them on startup.
+- **`healthCheckGracePeriodSeconds` must cover the full warmup window.** ECS measures the grace
+  period from task start (not from when the main container starts). For a 16-shape grid on an L4,
+  set `healthCheckGracePeriodSeconds` to at least `10800` (3 hours) to be safe. Once the engine
+  cache is warm and reused on subsequent deploys, the grace period is not consumed. Tune down for
+  smaller warmup grids.
+- **TRT engine plans are compute-capability-specific.** Plans compiled on an L4 (`sm_89`) cannot
+  be used on an A10G (`sm_86`) or T4 (`sm_75`). Use a homogeneous ASG (all instances of the same
+  GPU family). An EFS-mounted cache shared across a mixed-GPU ASG will produce cache misses for
+  every new GPU family encountered.
 
 ## Docker
 
