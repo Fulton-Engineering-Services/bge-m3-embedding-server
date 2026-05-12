@@ -14,7 +14,7 @@
 
 use std::collections::HashMap;
 
-use super::super::{parse_trt_warmup_shapes, Config, ModelVariant};
+use super::super::{parse_trt_warmup_shapes, Config, EpSelection, ModelVariant};
 use super::helpers::lookup_from;
 use crate::binpack::CostModel;
 
@@ -196,4 +196,116 @@ fn trt_warmup_shapes_config_field_set_from_env() {
     let map = HashMap::from([("BGE_M3_TRT_WARMUP_SHAPES", "4x256,1x8192")]);
     let cfg = Config::from_lookup(lookup_from(&map));
     assert_eq!(cfg.trt_warmup_shapes, vec![(4, 256), (1, 8192)]);
+}
+
+// --- BGE_M3_EP (EpSelection) ---
+
+#[test]
+fn ep_defaults_to_cpu_when_unset() {
+    let map = HashMap::new();
+    let cfg = Config::from_lookup(lookup_from(&map));
+    assert_eq!(cfg.ep, EpSelection::Cpu);
+}
+
+#[test]
+fn ep_cuda_when_set() {
+    let map = HashMap::from([("BGE_M3_EP", "cuda")]);
+    let cfg = Config::from_lookup(lookup_from(&map));
+    assert_eq!(cfg.ep, EpSelection::Cuda);
+}
+
+#[test]
+fn ep_tensorrt_when_set() {
+    let map = HashMap::from([("BGE_M3_EP", "tensorrt")]);
+    let cfg = Config::from_lookup(lookup_from(&map));
+    assert_eq!(cfg.ep, EpSelection::TensorRt);
+}
+
+#[test]
+fn ep_unknown_value_falls_back_to_cpu() {
+    let map = HashMap::from([("BGE_M3_EP", "unknown_value")]);
+    let cfg = Config::from_lookup(lookup_from(&map));
+    assert_eq!(cfg.ep, EpSelection::Cpu);
+}
+
+#[test]
+fn ep_selection_display() {
+    assert_eq!(EpSelection::Cpu.to_string(), "cpu");
+    assert_eq!(EpSelection::Cuda.to_string(), "cuda");
+    assert_eq!(EpSelection::TensorRt.to_string(), "tensorrt");
+}
+
+// --- BGE_M3_GPU_VRAM_BUDGET_BYTES ---
+
+#[test]
+fn gpu_vram_budget_set_to_valid_value() {
+    let map = HashMap::from([("BGE_M3_GPU_VRAM_BUDGET_BYTES", "10737418240")]);
+    let cfg = Config::from_lookup(lookup_from(&map));
+    assert_eq!(cfg.gpu_vram_budget_bytes, Some(10_737_418_240));
+}
+
+#[test]
+fn gpu_vram_budget_unset_yields_none() {
+    let map = HashMap::new();
+    let cfg = Config::from_lookup(lookup_from(&map));
+    assert_eq!(cfg.gpu_vram_budget_bytes, None);
+}
+
+#[test]
+fn gpu_vram_budget_invalid_value_yields_none() {
+    let map = HashMap::from([("BGE_M3_GPU_VRAM_BUDGET_BYTES", "not_a_number")]);
+    let cfg = Config::from_lookup(lookup_from(&map));
+    assert_eq!(cfg.gpu_vram_budget_bytes, None);
+}
+
+// --- GPU EP cost-model override ---
+
+#[test]
+fn gpu_ep_forces_cost_model_override_with_default_vram_budget() {
+    // When a GPU EP is active and BGE_M3_GPU_VRAM_BUDGET_BYTES is unset,
+    // cost_model_override is set to conservative(10 GiB) — the host-RAM
+    // probe is bypassed and the default VRAM ceiling drives bin-packing.
+    let map = HashMap::from([("BGE_M3_EP", "cuda")]);
+    let cfg = Config::from_lookup(lookup_from(&map));
+    let cm = cfg
+        .cost_model_override
+        .expect("GPU EP must set cost_model_override");
+    let expected_vram: usize = 10 * 1024 * 1024 * 1024;
+    assert_eq!(
+        cm.max_workspace_bytes, expected_vram,
+        "default VRAM budget should be 10 GiB"
+    );
+    assert!((cm.a - CostModel::CONSERVATIVE_A).abs() < f64::EPSILON);
+    assert!((cm.b - CostModel::CONSERVATIVE_B).abs() < f64::EPSILON);
+}
+
+#[test]
+fn gpu_ep_forces_cost_model_override_with_explicit_vram_budget() {
+    // When BGE_M3_GPU_VRAM_BUDGET_BYTES is set alongside a GPU EP, the
+    // explicit budget replaces the 10 GiB default.
+    const EIGHT_GIB: usize = 8 * 1024 * 1024 * 1024;
+    let map = HashMap::from([
+        ("BGE_M3_EP", "tensorrt"),
+        ("BGE_M3_GPU_VRAM_BUDGET_BYTES", "8589934592"),
+    ]);
+    let cfg = Config::from_lookup(lookup_from(&map));
+    let cm = cfg
+        .cost_model_override
+        .expect("GPU EP must set cost_model_override");
+    assert_eq!(
+        cm.max_workspace_bytes, EIGHT_GIB,
+        "explicit VRAM budget should override the 10 GiB default"
+    );
+}
+
+#[test]
+fn cpu_ep_does_not_force_cost_model_override() {
+    // CPU EP leaves cost_model_override as resolved by the non-GPU path
+    // (None → probe runs). Confirming CPU does NOT trigger the GPU override.
+    let map = HashMap::from([("BGE_M3_EP", "cpu")]);
+    let cfg = Config::from_lookup(lookup_from(&map));
+    assert!(
+        cfg.cost_model_override.is_none(),
+        "CPU EP should not override cost model — probe must run"
+    );
 }
