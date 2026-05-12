@@ -345,6 +345,62 @@ fn gpu_vram_budget_invalid_value_yields_none() {
     assert_eq!(cfg.gpu_vram_budget_bytes, None);
 }
 
+// --- BGE_M3_GPU_COUNT ---
+
+#[test]
+fn gpu_count_defaults_to_at_least_one() {
+    let map = HashMap::new();
+    let cfg = Config::from_lookup(lookup_from(&map));
+    assert!(cfg.gpu_count >= 1, "gpu_count must always be ≥ 1");
+}
+
+#[test]
+fn gpu_count_env_override_respected() {
+    let map = HashMap::from([("BGE_M3_GPU_COUNT", "4")]);
+    let cfg = Config::from_lookup(lookup_from(&map));
+    assert_eq!(cfg.gpu_count, 4);
+}
+
+#[test]
+fn gpu_count_env_override_eight() {
+    let map = HashMap::from([("BGE_M3_GPU_COUNT", "8")]);
+    let cfg = Config::from_lookup(lookup_from(&map));
+    assert_eq!(cfg.gpu_count, 8);
+}
+
+#[test]
+fn gpu_count_env_zero_clamps_to_one() {
+    let map = HashMap::from([("BGE_M3_GPU_COUNT", "0")]);
+    let cfg = Config::from_lookup(lookup_from(&map));
+    assert_eq!(cfg.gpu_count, 1);
+}
+
+#[test]
+fn gpu_count_invalid_value_yields_default() {
+    let map = HashMap::from([("BGE_M3_GPU_COUNT", "not_a_number")]);
+    let cfg = Config::from_lookup(lookup_from(&map));
+    assert!(
+        cfg.gpu_count >= 1,
+        "invalid BGE_M3_GPU_COUNT should fall back to at least 1"
+    );
+}
+
+// --- GPU EP workers clamp via EmbedPool (config stores raw workers) ---
+
+#[test]
+fn workers_field_unaffected_by_ep_in_config() {
+    // The workers clamp for GPU EPs happens in EmbedPool::spawn (not config).
+    // Config stores the raw parsed value so the health endpoint can report it.
+    let map = HashMap::from([
+        ("BGE_M3_WORKERS", "4"),
+        ("BGE_M3_EP", "cuda"),
+        ("BGE_M3_GPU_COUNT", "4"),
+    ]);
+    let cfg = Config::from_lookup(lookup_from(&map));
+    assert_eq!(cfg.workers, 4);
+    assert_eq!(cfg.gpu_count, 4);
+}
+
 // --- GPU EP cost-model override ---
 
 #[test]

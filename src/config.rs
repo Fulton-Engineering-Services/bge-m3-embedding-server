@@ -19,6 +19,7 @@
 //! corresponding environment variable name and default value.
 
 use crate::binpack::CostModel;
+use crate::sysinfo;
 use std::env;
 use std::time::Duration;
 use tracing::{info, warn};
@@ -99,14 +100,17 @@ pub enum EpSelection {
     Cpu,
     /// NVIDIA CUDA execution provider (requires `cuda` feature and a CUDA ORT build).
     ///
-    /// Set `BGE_M3_EP=cuda` to enable. Automatically clamps `BGE_M3_WORKERS` to 1 —
-    /// the GPU is the serial inference resource; multi-stream concurrency is a future
-    /// enhancement.
+    /// Set `BGE_M3_EP=cuda` to enable. `BGE_M3_WORKERS` is clamped to
+    /// `BGE_M3_GPU_COUNT` so each worker is pinned to a distinct CUDA device.
+    /// Set `BGE_M3_GPU_COUNT` to match the number of GPUs on the instance for
+    /// maximum parallel inference throughput.
     Cuda,
     /// NVIDIA `TensorRT` execution provider (requires `tensorrt` feature and a TRT ORT build).
     ///
-    /// Set `BGE_M3_EP=tensorrt` to enable. Falls back to the CUDA EP for ops that TRT
-    /// cannot handle. Automatically clamps `BGE_M3_WORKERS` to 1.
+    /// Set `BGE_M3_EP=tensorrt` to enable. Falls back to CUDA for ops TRT cannot
+    /// handle. `BGE_M3_WORKERS` is clamped to `BGE_M3_GPU_COUNT`; each worker
+    /// compiles its own per-GPU TRT shard of the warmup shapes during startup,
+    /// enabling parallel engine compilation across GPUs.
     TensorRt,
 }
 
@@ -227,9 +231,23 @@ pub struct Config {
     /// this setting. Requires the corresponding Cargo feature (`cuda` or
     /// `tensorrt`) to be enabled at build time for GPU EPs.
     ///
-    /// When set to `"cuda"` or `"tensorrt"`, `BGE_M3_WORKERS` is clamped
-    /// to 1 and the host-RAM probe is bypassed in favour of the VRAM budget.
+    /// When set to `"cuda"` or `"tensorrt"`, the host-RAM probe is bypassed
+    /// in favour of the VRAM budget, and `BGE_M3_WORKERS` is clamped to
+    /// `BGE_M3_GPU_COUNT` in `EmbedPool::spawn`.
     pub ep: EpSelection,
+
+    /// Number of GPU devices available on this instance.
+    ///
+    /// Set with `BGE_M3_GPU_COUNT`. When a GPU execution provider (`cuda` or
+    /// `tensorrt`) is active, `BGE_M3_WORKERS` is clamped to this value in
+    /// `EmbedPool::spawn` so each worker is pinned to a distinct CUDA device
+    /// (`device_id = worker_index % gpu_count`).
+    ///
+    /// Auto-detected on Linux from `/proc/driver/nvidia/gpus/` entry count.
+    /// Defaults to `1` on macOS (`CoreML` is always single-device) and on
+    /// Linux when the driver proc path is absent. Override explicitly on
+    /// multi-GPU ECS instances: `BGE_M3_GPU_COUNT=8`.
+    pub gpu_count: usize,
 
     /// VRAM workspace ceiling (bytes) when a GPU execution provider is active.
     ///
@@ -398,6 +416,10 @@ impl Config {
             Some(CostModel::conservative(vram_budget))
         };
 
+        let gpu_count = sysinfo::detect_gpu_count(
+            lookup("BGE_M3_GPU_COUNT").and_then(|v| v.parse::<usize>().ok()),
+        );
+
         let trt_warmup_shapes = parse_trt_warmup_shapes(lookup("BGE_M3_TRT_WARMUP_SHAPES"));
 
         let warmup_only = lookup("BGE_M3_WARMUP_ONLY")
@@ -426,6 +448,7 @@ impl Config {
             heartbeat_secs,
             ep,
             gpu_vram_budget_bytes,
+            gpu_count,
             trt_warmup_shapes,
             warmup_only,
         }

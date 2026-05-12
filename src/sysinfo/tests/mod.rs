@@ -16,6 +16,8 @@
 //!
 //! - `detection`: basic memory detection and `MemorySource` display.
 //! - `cgroup`: `cgroup_v2_walk` unit tests using a fake filesystem (Linux only).
+//! - `gpu`: `detect_gpu_count` override and fallback behaviour.
 
 mod cgroup;
 mod detection;
+mod gpu;

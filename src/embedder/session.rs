@@ -32,22 +32,26 @@ use crate::config::{EpSelection, ModelVariant};
 /// `BGE_M3_COREML_STRATEGY=default`), regardless of `ep`.
 ///
 /// On Linux with the `tensorrt` feature: selects `TensorRT` when
-/// `ep == EpSelection::TensorRt`, with engine caching and FP16 enabled.
+/// `ep == EpSelection::TensorRt`, with engine caching, FP16, and the
+/// specified `device_id` enabled.
 ///
 /// On Linux with the `cuda` feature: selects CUDA when
-/// `ep == EpSelection::Cuda` or `ep == EpSelection::TensorRt` (TRT requires
-/// the CUDA EP registered underneath it).
+/// `ep == EpSelection::Cuda`, pinned to `device_id`.
 ///
 /// CPU fallback: returns an empty list so ORT falls back to MLAS.
+///
+/// `device_id` is computed by `EmbedPool::spawn` as
+/// `worker_index % gpu_count` and is ignored on CPU EP and macOS.
 pub(super) fn execution_providers(
     cache_dir: &Path,
     ep: EpSelection,
+    device_id: u32,
 ) -> Vec<ort::ep::ExecutionProviderDispatch> {
     // macOS: always CoreML regardless of BGE_M3_EP.
     // The cfg blocks are mutually exclusive so only one branch is compiled per target.
     #[cfg(target_os = "macos")]
     {
-        let _ = ep;
+        let _ = (ep, device_id);
         let coreml_cache = cache_dir.join("coreml");
         let strategy = match std::env::var("BGE_M3_COREML_STRATEGY").ok().as_deref() {
             Some("default") => ort::ep::coreml::SpecializationStrategy::Default,
@@ -84,6 +88,7 @@ pub(super) fn execution_providers(
             // a cold engine cache benefits from a warm timing cache when
             // multiple shapes are compiled in the same warmup sweep.
             return vec![ort::ep::TensorRT::default()
+                .with_device_id(device_id as i32)
                 .with_engine_cache(true)
                 .with_engine_cache_path(cache_info.path.display().to_string())
                 .with_timing_cache(true)
@@ -94,13 +99,15 @@ pub(super) fn execution_providers(
 
         // Linux CUDA (feature-gated).
         #[cfg(feature = "cuda")]
-        if ep == EpSelection::Cuda || ep == EpSelection::TensorRt {
+        if ep == EpSelection::Cuda {
             let _ = cache_dir;
-            return vec![ort::ep::CUDA::default().with_device_id(0).build()];
+            return vec![ort::ep::CUDA::default()
+                .with_device_id(device_id as i32)
+                .build()];
         }
 
         // CPU fallback (always available).
-        let _ = (cache_dir, ep);
+        let _ = (cache_dir, ep, device_id);
         vec![]
     }
 }
@@ -133,6 +140,10 @@ pub(super) fn load_session(
 
 /// Downloads (if not already cached) and loads both the ORT session and the
 /// tokenizer for the given model variant, returning them as a pair.
+///
+/// `device_id` selects the CUDA/TRT GPU device for this session. Computed by
+/// `EmbedPool::spawn` as `worker_index % gpu_count`. Ignored on CPU EP and
+/// macOS.
 pub(super) fn load_models(
     cache_dir: &Path,
     show_download_progress: bool,
@@ -140,10 +151,11 @@ pub(super) fn load_models(
     max_seq_length: usize,
     intra_threads: usize,
     ep: EpSelection,
+    device_id: u32,
 ) -> Result<(ort::session::Session, tokenizers::Tokenizer)> {
     let files = download_model_files(cache_dir, show_download_progress, model_variant)?;
     let tokenizer = load_tokenizer(&files.tokenizer_path, max_seq_length)?;
-    let eps = execution_providers(cache_dir, ep);
+    let eps = execution_providers(cache_dir, ep, device_id);
     let session = load_session(&files.onnx_path, eps, intra_threads)?;
     Ok((session, tokenizer))
 }

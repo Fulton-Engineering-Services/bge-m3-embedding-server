@@ -17,7 +17,7 @@
 //! - `helpers`: `lookup_from` test helper.
 //! - `defaults`: default values and clamp behaviour for workers, batches, and seq length.
 //! - `features`: cost-model overrides, idle timeout, memory safety, model variants,
-//!   and heartbeat settings.
+//!   heartbeat settings, GPU count, and EP selection.
 
 mod defaults;
 mod features;

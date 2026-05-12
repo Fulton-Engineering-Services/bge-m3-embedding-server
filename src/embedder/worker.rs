@@ -88,8 +88,24 @@ pub struct WorkerConfig {
     ///
     /// Only applied when `ep == EpSelection::TensorRt`. Sourced from
     /// `BGE_M3_TRT_WARMUP_SHAPES` via [`crate::config::Config::trt_warmup_shapes`].
-    /// An empty list skips pre-warming entirely.
+    /// With multiple workers, `EmbedPool::spawn` shards the full shape list
+    /// across workers (stride partition) so each GPU compiles a disjoint subset
+    /// in parallel. An empty list skips pre-warming entirely.
     pub trt_warmup_shapes: Vec<(usize, usize)>,
+
+    /// CUDA/TRT device ID for this specific worker.
+    ///
+    /// Set by `EmbedPool::spawn` as `worker_index % gpu_count`. Forwarded to
+    /// [`super::session::execution_providers`] so the ORT session binds to the
+    /// correct GPU. Ignored on CPU EP and macOS (`CoreML` is single-device).
+    pub device_id: u32,
+
+    /// Total number of GPU devices on this instance.
+    ///
+    /// Propagated from [`crate::config::Config::gpu_count`]. Used by
+    /// `EmbedPool::spawn` to compute per-worker `device_id` values and to
+    /// clamp `BGE_M3_WORKERS` for GPU execution providers.
+    pub gpu_count: usize,
 }
 
 /// Runs a single `session.run()` for the probe, measuring RSS before and after.
@@ -196,6 +212,12 @@ pub(super) fn run_worker(
     let span = info_span!("worker", id = id);
     let _span_guard = span.enter();
 
+    tracing::debug!(
+        worker_id = id,
+        gpu_device = config.device_id,
+        ep = %config.ep,
+        "worker assigned to GPU device"
+    );
     info!("Loading models (worker {id})...");
     let load_start = std::time::Instant::now();
     let rt = Handle::current();
@@ -211,6 +233,7 @@ pub(super) fn run_worker(
         config.max_seq_length,
         config.intra_threads,
         config.ep,
+        config.device_id,
     ) {
         Ok(mut models) => {
             // Prime the ORT session arena with a tiny session.run() BEFORE
@@ -267,10 +290,11 @@ pub(super) fn run_worker(
     if config.ep == EpSelection::TensorRt && !config.trt_warmup_shapes.is_empty() {
         tracing::info!(
             worker_id = id,
-            shapes = config.trt_warmup_shapes.len(),
-            "TensorRT pre-warm: compiling engine cache for {} shape(s) \
-             (first run per shape takes 30–170 s; subsequent starts reuse cache)",
-            config.trt_warmup_shapes.len()
+            gpu_device = config.device_id,
+            shape_count = config.trt_warmup_shapes.len(),
+            shapes = ?config.trt_warmup_shapes,
+            "TensorRT pre-warm: worker compiling shard \
+             (first run per shape takes 30–170 s; subsequent starts reuse cache)"
         );
         let warmed = trt_prewarm(
             &mut initial_models.0,
@@ -332,6 +356,7 @@ pub(super) fn run_worker(
                         config.max_seq_length,
                         config.intra_threads,
                         config.ep,
+                        config.device_id,
                     ) {
                         Ok(mut m) => {
                             // Prime the freshly-loaded session arena so the

@@ -24,6 +24,7 @@ use tokio::task::JoinHandle;
 use tracing::{info, info_span, Instrument};
 
 use super::math::median_usize;
+use super::trt_warmup::shard_shapes;
 use super::types::{DualEmbedding, EmbedRequest, EmbedStats, ProbeResult, SparseEmbedding};
 use super::worker::{run_worker, WorkerConfig};
 use crate::config::EpSelection;
@@ -62,25 +63,28 @@ impl EmbedPool {
     /// handle that resolves once all workers have finished loading their models.
     ///
     /// When a GPU execution provider (`cuda` or `tensorrt`) is selected, `n` is
-    /// clamped to 1: the GPU is a serial inference resource and loading multiple
-    /// ORT sessions against it wastes VRAM with no throughput benefit. Multi-stream
-    /// GPU concurrency is a future enhancement.
+    /// clamped to `config.gpu_count`: each worker is pinned to a distinct CUDA
+    /// device (`device_id = worker_index % gpu_count`). For TRT, the full
+    /// warmup shape list is sharded across workers via a stride partition so
+    /// each GPU compiles a disjoint subset in parallel, then shares the results
+    /// via the EFS engine cache.
     #[allow(clippy::too_many_lines)]
     pub fn spawn(
         n: usize,
         cache_dir: PathBuf,
         config: WorkerConfig,
     ) -> (Self, JoinHandle<Result<()>>) {
-        let n = if config.ep != EpSelection::Cpu && n > 1 {
+        let gpu_count = config.gpu_count.max(1);
+        let n = if config.ep != EpSelection::Cpu && n > gpu_count {
             tracing::warn!(
                 requested = n,
-                clamped = 1,
+                clamped = gpu_count,
                 ep = %config.ep,
-                "GPU execution provider selected — clamping BGE_M3_WORKERS to 1 \
-                 (the GPU is the serial inference resource; multi-stream concurrency \
-                 is a future enhancement)"
+                gpu_count,
+                "BGE_M3_WORKERS exceeds BGE_M3_GPU_COUNT for GPU EP — clamping. \
+                 Set BGE_M3_GPU_COUNT to match the number of GPU devices on this instance."
             );
-            1
+            gpu_count
         } else {
             n
         };
@@ -124,6 +128,33 @@ impl EmbedPool {
                     })
                 };
 
+                // Build a per-worker config: assign CUDA device ID and, for TRT
+                // EP with multiple workers, shard the warmup shapes across GPUs.
+                // The device_id is computed as `worker_index % gpu_count` so
+                // workers round-robin across available GPUs. Shard partition is
+                // stride-based so the most expensive shapes land on different
+                // workers — see `trt_warmup::shard_shapes` for the rationale.
+                let make_worker_config = |id: usize| -> WorkerConfig {
+                    let mut wc = config.clone();
+                    wc.device_id =
+                        u32::try_from(id).unwrap_or(0) % u32::try_from(gpu_count).unwrap_or(1);
+                    if config.ep == EpSelection::TensorRt
+                        && n > 1
+                        && !config.trt_warmup_shapes.is_empty()
+                    {
+                        wc.trt_warmup_shapes = shard_shapes(&config.trt_warmup_shapes, id, n);
+                        info!(
+                            worker_id = id,
+                            gpu_device = wc.device_id,
+                            shard_shapes = wc.trt_warmup_shapes.len(),
+                            total_shapes = config.trt_warmup_shapes.len(),
+                            total_workers = n,
+                            "TRT multi-GPU: worker assigned GPU device with warmup shard"
+                        );
+                    }
+                    wc
+                };
+
                 // Collect per-worker RSS deltas for median aggregation.
                 // Median is robust to one outlier from transient kernel snapshot
                 // quirk (page-cache settling, ORT arena init jitter) while still
@@ -131,7 +162,7 @@ impl EmbedPool {
                 let mut rss_deltas: Vec<usize> = Vec::with_capacity(n);
 
                 // --- Phase 1: spawn leader worker (may download models) ---
-                worker_handles.push(spawn_worker(0, ready_tx.clone(), config.clone()));
+                worker_handles.push(spawn_worker(0, ready_tx.clone(), make_worker_config(0)));
 
                 match ready_rx.recv().await {
                     Some(Ok(delta)) => {
@@ -166,7 +197,7 @@ impl EmbedPool {
                 // Startup cost: ~4-6s per worker × 6 followers ≈ 24-36s total,
                 // well within the configured startPeriod (300s).
                 for id in 1..n {
-                    worker_handles.push(spawn_worker(id, ready_tx.clone(), config.clone()));
+                    worker_handles.push(spawn_worker(id, ready_tx.clone(), make_worker_config(id)));
 
                     match ready_rx.recv().await {
                         Some(Ok(delta)) => {

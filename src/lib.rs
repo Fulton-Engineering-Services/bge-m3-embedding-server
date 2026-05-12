@@ -127,6 +127,10 @@ pub async fn run() -> anyhow::Result<()> {
             intra_threads: cfg.intra_threads,
             ep: cfg.ep,
             trt_warmup_shapes: cfg.trt_warmup_shapes,
+            // device_id is overridden per-worker by EmbedPool::spawn;
+            // the initial value here is a harmless placeholder.
+            device_id: 0,
+            gpu_count: cfg.gpu_count,
         },
     );
 
