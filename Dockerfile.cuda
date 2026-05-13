@@ -98,18 +98,47 @@ RUN apt-get update \
 RUN groupadd --gid 10002 bge \
     && useradd --uid 10002 --gid bge --no-create-home --shell /sbin/nologin bge
 
-# Copy the ORT provider shared libraries from the builder.
-# `libonnxruntime.a` is statically linked into the binary at build time, but
-# the per-EP factories live in dynamically-loaded shared libraries that ORT
-# `dlopen`s on first registration. They must be present on the runtime
-# image's library path or registration fails (silently, before this fix —
-# loudly, after it). `/usr/local/lib/onnxruntime/` is added to the linker
-# search path via the `.conf` file below.
-COPY --from=builder /opt/ort/libonnxruntime_providers_shared.so /usr/local/lib/onnxruntime/
-COPY --from=builder /opt/ort/libonnxruntime_providers_tensorrt.so /usr/local/lib/onnxruntime/
-COPY --from=builder /opt/ort/libonnxruntime_providers_cuda.so /usr/local/lib/onnxruntime/
-RUN echo "/usr/local/lib/onnxruntime" > /etc/ld.so.conf.d/onnxruntime.conf \
-    && ldconfig
+# Copy the ORT provider shared libraries from the builder, placed NEXT TO
+# the binary in `/usr/local/bin/`. This is required for the static-linked
+# ORT case, and `LD_LIBRARY_PATH`/`ldconfig` *cannot* fix it. Detail below.
+#
+# `libonnxruntime.a` is statically linked into the binary; the per-EP
+# factories live in dynamically-loaded shared libraries that ORT `dlopen`s
+# on first registration. ORT's `provider_bridge_ort.cc::ProviderLibrary::Load`
+# computes the dlopen path as
+#
+#     full_path = Env::Default().GetRuntimePath() + filename;
+#
+# where `GetRuntimePath` is implemented in `core/platform/posix/env.cc`:
+#
+#     dladdr(&Env::Default, &dl_info);
+#     auto p = std::filesystem::path{dl_info.dli_fname};
+#     return std::filesystem::absolute(p).remove_filename();
+#
+# When ORT is statically linked, `dladdr` returns
+# `dl_info.dli_fname == argv[0]` (glibc 2.39 on Ubuntu 24.04 uses argv[0],
+# NOT `AT_EXECFN`, for the main executable's `dli_fname`).
+#
+# This means:
+#   * If argv[0] is RELATIVE (e.g. `CMD ["bge-m3-embedding-server"]` →
+#     argv[0]="bge-m3-embedding-server"), `absolute()` resolves it against
+#     the process's cwd. With the default Docker cwd of `/`, the runtime
+#     path is `/`, and ORT tries to dlopen
+#     `/libonnxruntime_providers_shared.so` — an absolute path that does not
+#     exist and which `dlopen` will NOT search via `LD_LIBRARY_PATH` or
+#     `ld.so.cache` (because per `dlopen(3)`, any `/` in the filename forces
+#     pathname interpretation). That was the 2026-05 root cause.
+#   * If argv[0] is ABSOLUTE (`CMD ["/usr/local/bin/bge-m3-embedding-server"]`),
+#     `dli_fname` is absolute, `remove_filename()` returns `/usr/local/bin/`,
+#     and ORT looks for providers there — independent of cwd.
+#
+# Fix: place provider `.so` files in `/usr/local/bin/` next to the binary,
+# AND invoke the binary by absolute path in `CMD`. This is cwd-invariant
+# and works regardless of how the container is started (ECS, k8s, plain
+# `docker run`, `docker exec`, etc.).
+COPY --from=builder /opt/ort/libonnxruntime_providers_shared.so /usr/local/bin/
+COPY --from=builder /opt/ort/libonnxruntime_providers_tensorrt.so /usr/local/bin/
+COPY --from=builder /opt/ort/libonnxruntime_providers_cuda.so /usr/local/bin/
 
 COPY --from=builder /app/target/release/bge-m3-embedding-server /usr/local/bin/
 USER bge
@@ -118,4 +147,7 @@ HEALTHCHECK --interval=10s --timeout=3s --start-period=120s --retries=3 \
     CMD curl --fail --silent http://localhost:8081/health || exit 1
 
 EXPOSE 8081
-CMD ["bge-m3-embedding-server"]
+# Absolute path is REQUIRED. See the comment above the COPY block —
+# argv[0] must be absolute so ORT's `dladdr`-based provider lookup
+# produces `/usr/local/bin/` as the runtime path.
+CMD ["/usr/local/bin/bge-m3-embedding-server"]
