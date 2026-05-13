@@ -33,7 +33,10 @@ use super::session::load_models;
 use super::sparse::embed_sparse;
 use super::tokenize::{build_chunk_arrays, tokenize_no_pad};
 use super::trt_cache;
-use super::trt_warmup::{prewarm_persistence_postcondition_failed, trt_prewarm};
+use super::trt_warmup::{
+    prewarm_persistence_postcondition_failed, prewarm_persistence_suspicious_undercount,
+    trt_prewarm,
+};
 use super::types::{EmbedRequest, ProbeResult};
 use crate::binpack::CostModel;
 use crate::config::{EpSelection, ModelVariant};
@@ -323,6 +326,31 @@ pub(super) fn run_worker(
                 "TensorRT pre-warm postcondition failed: \
                  compile-success events present but no .engine files on disk; \
                  TRT EP may be silently failing to persist engine plan files"
+            );
+        } else if prewarm_persistence_suspicious_undercount(
+            stats.fresh_compiles,
+            stats.engine_count_delta,
+        ) {
+            // Non-fatal: TRT EP can legitimately reuse a single `.engine`
+            // file across many input shapes (engine plans are keyed by
+            // fused-subgraph identity + precision + GPU SM, not by
+            // `(batch, seq)`). A 1:2 ratio is tolerated silently; this
+            // WARN fires only when delta * 2 < fresh_compiles AND the
+            // postcondition above did not already trigger. Greppable
+            // tag: "engine_count_delta is suspiciously low".
+            tracing::warn!(
+                worker_id = id,
+                gpu_device = config.device_id,
+                fresh_compiles = stats.fresh_compiles,
+                engine_count_before = stats.engine_count_before,
+                engine_count_after = stats.engine_count_after,
+                engine_count_delta = stats.engine_count_delta,
+                cache_path = %trt_cache::engine_cache_path(&cache_dir).display(),
+                "TensorRT pre-warm: engine_count_delta is suspiciously low \
+                 relative to fresh_compiles (delta * 2 < fresh_compiles); \
+                 some engine plans may not have persisted to disk despite \
+                 session.run() reporting Ok — investigate cache path \
+                 resolution and EFS mount durability"
             );
         }
         tracing::info!(

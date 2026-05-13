@@ -94,12 +94,91 @@ pub(super) const CACHE_HIT_THRESHOLD_MS: u64 = 5_000;
 /// failure in `CloudWatch` immediately rather than discovering it later
 /// from cold-cache compile times. Non-fresh-compile shards (cache hits
 /// only) and shards that produced positive deltas are accepted.
+///
+/// This rule is **deliberately loose**: ORT's TRT EP names `.engine` files
+/// by fused-subgraph identity + precision + GPU SM
+/// (`TensorrtExecutionProvider_TRTKernel_<hash>_<precision>_sm<XX>.engine`),
+/// not by `(batch, seq)`.  Many shapes legitimately share one engine file,
+/// and profile-range extension can rewrite an existing engine in place — so
+/// `engine_count_delta < fresh_compiles` is not on its own a defect.  The
+/// "any positive delta passes" rule is intentionally tolerant of those
+/// legitimate undercounts while still catching the 1215 → 0 catastrophic
+/// case.  See [`prewarm_persistence_suspicious_undercount`] for a separate,
+/// non-fatal WARN that flags large undercounts where the ERROR rule passes
+/// but the ratio is still anomalous.
 #[must_use]
 pub(super) fn prewarm_persistence_postcondition_failed(
     fresh_compiles: usize,
     engine_count_delta: i64,
 ) -> bool {
     fresh_compiles > 0 && engine_count_delta <= 0
+}
+
+/// Denominator for the suspicious-undercount heuristic in
+/// [`prewarm_persistence_suspicious_undercount`]: an `engine_count_delta`
+/// less than `fresh_compiles / UNDERCOUNT_RATIO_DIVISOR` is treated as
+/// suspiciously low and produces a non-fatal WARN.
+///
+/// `2` is a conservative choice — it permits a 1:2 ratio (engine reuse
+/// across multiple compiles) before raising any signal, so a worker that
+/// compiles 16 shapes but produces 8 engine files is silent, while a
+/// worker that compiles 1215 shapes but produces 5 engine files (the
+/// kind of anomaly worth investigating) trips the warning.
+pub(super) const UNDERCOUNT_RATIO_DIVISOR: i64 = 2;
+
+/// Minimum `fresh_compiles` count below which the suspicious-undercount
+/// check is suppressed.
+///
+/// Tiny shards (one or two fresh compiles) generate too much noise relative
+/// to their signal — a single-shape worker that reuses an existing engine
+/// plan can show `fresh=1, delta=0` and be perfectly healthy (the loose
+/// postcondition handles `delta=0` separately; here we want to avoid even
+/// the WARN-level chatter).  At `fresh ≥ 2` the ratio test becomes
+/// meaningful.
+pub(super) const SUSPICIOUS_UNDERCOUNT_MIN_FRESH: usize = 2;
+
+/// Decides whether the on-disk `.engine` count is **suspiciously low**
+/// relative to the number of fresh compiles reported by `session.run()`,
+/// in a way that is NOT already caught by
+/// [`prewarm_persistence_postcondition_failed`].
+///
+/// This is a **non-fatal diagnostic signal** intended to back a `WARN`
+/// log only — it must never cause the process to exit non-zero.  ORT's TRT
+/// EP can legitimately produce one `.engine` file per fused subgraph and
+/// reuse it across many input shapes (the engine plan is keyed by
+/// fused-subgraph identity + precision + GPU SM, not by `(batch, seq)`).
+/// On a healthy worker compiling 4 distinct shapes you may see `delta = 1`
+/// because the engine was rebuilt three times with expanding profile
+/// ranges before settling on the final one.
+///
+/// The heuristic is "fewer than half as many engines as compiles":
+///
+/// ```text
+/// engine_count_delta * UNDERCOUNT_RATIO_DIVISOR  <  fresh_compiles
+/// ```
+///
+/// Suppressed when:
+/// - `fresh_compiles < SUSPICIOUS_UNDERCOUNT_MIN_FRESH` — too noisy for tiny shards
+/// - [`prewarm_persistence_postcondition_failed`] already returns `true`
+///   — that path emits a louder `ERROR`, no need to double-fire on the
+///   same evidence
+///
+/// Returning `true` should produce a `WARN` log with structured fields so
+/// operators can investigate in `CloudWatch`.  It does **not** affect process
+/// exit code, the `/health` endpoint, or any production logic.
+#[must_use]
+pub(super) fn prewarm_persistence_suspicious_undercount(
+    fresh_compiles: usize,
+    engine_count_delta: i64,
+) -> bool {
+    if prewarm_persistence_postcondition_failed(fresh_compiles, engine_count_delta) {
+        return false;
+    }
+    if fresh_compiles < SUSPICIOUS_UNDERCOUNT_MIN_FRESH {
+        return false;
+    }
+    let fresh_i64 = i64::try_from(fresh_compiles).unwrap_or(i64::MAX);
+    engine_count_delta.saturating_mul(UNDERCOUNT_RATIO_DIVISOR) < fresh_i64
 }
 
 /// Aggregate per-worker statistics returned by [`trt_prewarm`].
@@ -539,8 +618,9 @@ pub(super) fn trt_prewarm(
 #[cfg(test)]
 mod tests {
     use super::{
-        coverage_check_shapes, prewarm_persistence_postcondition_failed, shard_shapes,
-        CACHE_HIT_THRESHOLD_MS,
+        coverage_check_shapes, prewarm_persistence_postcondition_failed,
+        prewarm_persistence_suspicious_undercount, shard_shapes, CACHE_HIT_THRESHOLD_MS,
+        SUSPICIOUS_UNDERCOUNT_MIN_FRESH, UNDERCOUNT_RATIO_DIVISOR,
     };
 
     /// Default 16-shape grid for stride-sharding and coverage-check tests.
@@ -918,18 +998,179 @@ mod tests {
         assert!(!prewarm_persistence_postcondition_failed(0, 4));
     }
 
-    /// A small delta short of the compile count is also a defect signal:
-    /// 16 compiles claimed, only 1 engine actually persisted → flag.
-    /// (The exact threshold for "less than expected" is a follow-up; the
-    /// minimum invariant guarded here is "≥ 1 fresh compile and ≤ 0 delta
-    /// is always wrong".)
+    // The follow-up referenced by the original
+    // `postcondition_accepts_undercount_above_zero_delta` placeholder has
+    // been resolved by splitting the rule in two:
+    //
+    //   • `prewarm_persistence_postcondition_failed` remains the **loose**
+    //     fatal signal: `fresh > 0 && delta ≤ 0`. ORT TRT EP legitimately
+    //     reuses one `.engine` file across many shapes (engine plans key on
+    //     fused-subgraph identity + precision + SM, NOT on `(batch, seq)`),
+    //     so a stricter `delta < fresh - 1` rule would fire false-positive
+    //     ERRORs on healthy clusters.
+    //   • `prewarm_persistence_suspicious_undercount` is a separate,
+    //     **non-fatal** WARN signal that catches large ratio anomalies
+    //     (`delta * 2 < fresh_compiles`) the loose rule cannot.
+    //
+    // The tests below pin down both: the loose-pass cases retained
+    // for the existing ERROR rule, the boundary cases requested in the
+    // follow-up note, and the tightened-fail cases now covered by the WARN
+    // helper.
+
+    /// Retained loose-pass case: 16 compiles + 1 engine on disk does NOT
+    /// trip the **ERROR** postcondition (it would now trip the WARN
+    /// helper; see the suspicious-undercount tests below).
     #[test]
-    fn postcondition_accepts_undercount_above_zero_delta() {
-        // Degenerate case is intentionally accepted by the current helper:
-        // a single non-zero delta is counted as evidence of persistence.
-        // Tightening this would require correlating fresh_compiles and
-        // delta — see the recommended follow-up.
+    fn postcondition_loose_pass_retained_for_undercount_above_zero_delta() {
         assert!(!prewarm_persistence_postcondition_failed(16, 1));
+    }
+
+    /// Boundary case: `fresh=1, delta=1` is a healthy single-shape
+    /// compile. Must not trip either signal.
+    #[test]
+    fn postcondition_boundary_fresh_one_delta_one_passes() {
+        assert!(!prewarm_persistence_postcondition_failed(1, 1));
+    }
+
+    /// Boundary case: `fresh=2, delta=1` is a healthy two-shape compile
+    /// where ORT TRT EP reused one engine plan across both shapes. Must
+    /// not trip the loose ERROR.
+    #[test]
+    fn postcondition_boundary_fresh_two_delta_one_passes() {
+        assert!(!prewarm_persistence_postcondition_failed(2, 1));
+    }
+
+    /// Boundary case: `fresh=N, delta=N` is the perfect-1:1 cold-cache
+    /// outcome. Must not trip the loose ERROR for any reasonable `N`.
+    #[test]
+    fn postcondition_boundary_fresh_equals_delta_passes() {
+        for n in [1, 2, 4, 16, 128, 1215] {
+            assert!(
+                !prewarm_persistence_postcondition_failed(n, i64::try_from(n).unwrap()),
+                "fresh=delta={n} must not trip loose ERROR"
+            );
+        }
+    }
+
+    /// Boundary case: `fresh=0, delta=0` is the warm-cache fast-path
+    /// outcome. Must not trip the loose ERROR.
+    #[test]
+    fn postcondition_boundary_fresh_zero_delta_zero_passes() {
+        assert!(!prewarm_persistence_postcondition_failed(0, 0));
+    }
+
+    // ─── prewarm_persistence_suspicious_undercount ────────────────────────
+    //
+    // Non-fatal WARN helper. Fires when `delta * 2 < fresh_compiles` AND
+    // the loose ERROR is not already firing AND `fresh_compiles >= 2`.
+
+    /// Tightened-fail case from the follow-up note: `fresh=10, delta=1`.
+    /// The loose ERROR does not trip (delta > 0); the WARN does.
+    #[test]
+    fn suspicious_undercount_flags_tightened_fail_case() {
+        assert!(
+            !prewarm_persistence_postcondition_failed(10, 1),
+            "loose ERROR must not fire for fresh=10, delta=1"
+        );
+        assert!(
+            prewarm_persistence_suspicious_undercount(10, 1),
+            "WARN must fire for fresh=10, delta=1 (delta*2=2 < fresh=10)"
+        );
+    }
+
+    /// Production-scale anomaly: 1215 compiles, 5 engines persisted.
+    /// Loose ERROR passes (delta > 0); WARN fires loudly.
+    #[test]
+    fn suspicious_undercount_flags_production_scale_anomaly() {
+        assert!(!prewarm_persistence_postcondition_failed(1215, 5));
+        assert!(prewarm_persistence_suspicious_undercount(1215, 5));
+    }
+
+    /// WARN must NOT double-fire on top of the loose ERROR. When
+    /// `delta <= 0 && fresh > 0`, only the ERROR is informative; the WARN
+    /// suppresses itself so operators do not see the same evidence
+    /// reported under two different severity levels.
+    #[test]
+    fn suspicious_undercount_suppressed_when_loose_error_fires() {
+        assert!(prewarm_persistence_postcondition_failed(1215, 0));
+        assert!(
+            !prewarm_persistence_suspicious_undercount(1215, 0),
+            "WARN must not fire when ERROR is already covering the same case"
+        );
+        assert!(prewarm_persistence_postcondition_failed(4, -2));
+        assert!(!prewarm_persistence_suspicious_undercount(4, -2));
+    }
+
+    /// WARN is silent for trivial shards (`fresh < MIN_FRESH`). A single
+    /// fresh compile that produced zero engine files would already be
+    /// flagged by the loose ERROR; below the `MIN_FRESH` floor the WARN
+    /// ratio test would generate noise without signal.
+    #[test]
+    fn suspicious_undercount_silent_below_min_fresh_threshold() {
+        // `fresh = 0` is the warm-cache case — never flag.
+        assert!(!prewarm_persistence_suspicious_undercount(0, 0));
+        assert!(!prewarm_persistence_suspicious_undercount(0, 4));
+        // `fresh = 1` is below the min-fresh floor — never flag.
+        assert!(!prewarm_persistence_suspicious_undercount(1, 1));
+        // Compile-time pin: changing the floor below 2 would make
+        // single-compile boundary cases noisy.
+        const { assert!(SUSPICIOUS_UNDERCOUNT_MIN_FRESH >= 2) }
+    }
+
+    /// Healthy 1:1 (`fresh = delta`) and 1:2 (`fresh = 2 * delta`) ratios
+    /// are silent — these are the patterns engine reuse produces on a
+    /// real GPU and the WARN must accept them.
+    #[test]
+    fn suspicious_undercount_silent_for_healthy_ratios() {
+        for &(fresh, delta) in &[
+            (2_usize, 1_i64), // exactly the 2:1 boundary
+            (4, 2),           // 2:1
+            (16, 8),          // 2:1
+            (16, 16),         // 1:1 cold cache
+            (1215, 1215),     // production-scale 1:1
+            (1215, 700),      // production-scale >1:2
+        ] {
+            assert!(
+                !prewarm_persistence_suspicious_undercount(fresh, delta),
+                "WARN must not fire for healthy ratio fresh={fresh}, delta={delta}"
+            );
+        }
+    }
+
+    /// Just-below-half is the smallest interesting WARN-positive case.
+    /// `fresh = 16, delta = 7` → delta*2 = 14 < 16 → WARN.
+    /// `fresh = 16, delta = 8` → delta*2 = 16 ≮ 16 → silent.
+    #[test]
+    fn suspicious_undercount_boundary_just_below_half() {
+        assert!(prewarm_persistence_suspicious_undercount(16, 7));
+        assert!(!prewarm_persistence_suspicious_undercount(16, 8));
+    }
+
+    /// Pin the ratio divisor at the value the docs and warn message
+    /// claim. Changing this constant alters the heuristic and the
+    /// suppression-vs-fire boundary, so an unintentional flip would be
+    /// caught here rather than at deploy time.
+    #[test]
+    fn suspicious_undercount_ratio_divisor_is_two() {
+        assert_eq!(
+            UNDERCOUNT_RATIO_DIVISOR, 2,
+            "WARN message and CloudWatch guidance reference a 2:1 ratio; \
+             do not change this divisor without updating both"
+        );
+    }
+
+    /// Saturating multiplication must not panic on absurd inputs that
+    /// might arrive from a corrupt aggregator or a future i64 overflow.
+    /// `i64::MAX * 2` saturates rather than wrapping.
+    #[test]
+    fn suspicious_undercount_saturates_on_overflow_inputs() {
+        // delta = i64::MAX, fresh = 4 → delta*2 saturates to i64::MAX,
+        // which is NOT < 4, so WARN stays silent.
+        assert!(!prewarm_persistence_suspicious_undercount(4, i64::MAX));
+        // delta = i64::MIN, fresh = 4 → loose ERROR fires first
+        // (delta ≤ 0), so WARN suppresses; no overflow path.
+        assert!(prewarm_persistence_postcondition_failed(4, i64::MIN));
+        assert!(!prewarm_persistence_suspicious_undercount(4, i64::MIN));
     }
 
     // ─── engine count snapshot wiring (filesystem-backed) ─────────────────
