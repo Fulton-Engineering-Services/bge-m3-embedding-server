@@ -33,7 +33,7 @@ use super::session::load_models;
 use super::sparse::embed_sparse;
 use super::tokenize::{build_chunk_arrays, tokenize_no_pad};
 use super::trt_cache;
-use super::trt_warmup::trt_prewarm;
+use super::trt_warmup::{prewarm_persistence_postcondition_failed, trt_prewarm};
 use super::types::{EmbedRequest, ProbeResult};
 use crate::binpack::CostModel;
 use crate::config::{EpSelection, ModelVariant};
@@ -304,11 +304,36 @@ pub(super) fn run_worker(
             id,
             &cache_dir,
         );
+        // Per-worker postcondition: if the shard reported one or more fresh
+        // (non-cache-hit) compiles but the on-disk engine count did not
+        // increase, surface an ERROR. This is the in-process counterpart to
+        // the postcondition check at the end of the warmup-only path in
+        // lib.rs, intended to catch the silent-persistence failure mode that
+        // produced the 2026-05 codekeeper outage.
+        if prewarm_persistence_postcondition_failed(stats.fresh_compiles, stats.engine_count_delta)
+        {
+            tracing::error!(
+                worker_id = id,
+                gpu_device = config.device_id,
+                fresh_compiles = stats.fresh_compiles,
+                engine_count_before = stats.engine_count_before,
+                engine_count_after = stats.engine_count_after,
+                engine_count_delta = stats.engine_count_delta,
+                cache_path = %trt_cache::engine_cache_path(&cache_dir).display(),
+                "TensorRT pre-warm postcondition failed: \
+                 compile-success events present but no .engine files on disk; \
+                 TRT EP may be silently failing to persist engine plan files"
+            );
+        }
         tracing::info!(
             worker_id = id,
             warmed = stats.warmed,
             skipped = stats.skipped,
             fully_cached = stats.fully_cached,
+            fresh_compiles = stats.fresh_compiles,
+            engine_count_before = stats.engine_count_before,
+            engine_count_after = stats.engine_count_after,
+            engine_count_delta = stats.engine_count_delta,
             total = config.trt_warmup_shapes.len(),
             total_compile_ms = stats.total_compile_ms,
             total_fsync_ms = stats.total_fsync_ms,

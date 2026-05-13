@@ -42,6 +42,11 @@ use crate::config::{EpSelection, ModelVariant};
 ///
 /// `device_id` is computed by `EmbedPool::spawn` as
 /// `worker_index % gpu_count` and is ignored on CPU EP and macOS.
+///
+/// Emits a single `INFO` log line tagged `"ORT execution providers configured"`
+/// describing the configured EP, the EP that was actually built (the "active"
+/// EP), and any cache paths handed to it. This is the source of truth in
+/// `CloudWatch` for "is `TensorRT` really active or did we silently fall back?".
 pub(super) fn execution_providers(
     cache_dir: &Path,
     ep: EpSelection,
@@ -51,7 +56,7 @@ pub(super) fn execution_providers(
     // The cfg blocks are mutually exclusive so only one branch is compiled per target.
     #[cfg(target_os = "macos")]
     {
-        let _ = (ep, device_id);
+        let _ = device_id;
         let coreml_cache = cache_dir.join("coreml");
         let strategy = match std::env::var("BGE_M3_COREML_STRATEGY").ok().as_deref() {
             Some("default") => ort::ep::coreml::SpecializationStrategy::Default,
@@ -63,6 +68,12 @@ pub(super) fn execution_providers(
             .with_model_cache_dir(coreml_cache.display().to_string());
         #[cfg(feature = "coreml-profile")]
         let builder = builder.with_profile_compute_plan(true);
+        tracing::info!(
+            ep_selection = %ep,
+            ep_active = "CoreML",
+            coreml_cache_path = %coreml_cache.display(),
+            "ORT execution providers configured"
+        );
         vec![builder.build()]
     }
 
@@ -87,6 +98,15 @@ pub(super) fn execution_providers(
             // engine build. It is complementary to the engine cache — even
             // a cold engine cache benefits from a warm timing cache when
             // multiple shapes are compiled in the same warmup sweep.
+            tracing::info!(
+                ep_selection = %ep,
+                ep_active = "TensorRT",
+                device_id,
+                engine_cache_path = %cache_info.path.display(),
+                timing_cache_path = %timing_cache.display(),
+                fp16 = true,
+                "ORT execution providers configured"
+            );
             return vec![ort::ep::TensorRT::default()
                 .with_device_id(device_id.cast_signed())
                 .with_engine_cache(true)
@@ -101,13 +121,24 @@ pub(super) fn execution_providers(
         #[cfg(feature = "cuda")]
         if ep == EpSelection::Cuda {
             let _ = cache_dir;
+            tracing::info!(
+                ep_selection = %ep,
+                ep_active = "CUDA",
+                device_id,
+                "ORT execution providers configured"
+            );
             return vec![ort::ep::CUDA::default()
                 .with_device_id(device_id.cast_signed())
                 .build()];
         }
 
         // CPU fallback (always available).
-        let _ = (cache_dir, ep, device_id);
+        let _ = (cache_dir, device_id);
+        tracing::info!(
+            ep_selection = %ep,
+            ep_active = "CPU/MLAS",
+            "ORT execution providers configured"
+        );
         vec![]
     }
 }

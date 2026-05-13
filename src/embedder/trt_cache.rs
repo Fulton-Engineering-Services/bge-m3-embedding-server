@@ -518,4 +518,62 @@ mod tests {
         let missing = tmp.path().join("nope");
         assert!(super::engine_basenames_in_dir_sorted(&missing).is_err());
     }
+
+    /// Models the production failure shape from the 2026-05 codekeeper
+    /// outage: the engine cache directory exists (created via
+    /// `ensure_and_inspect` on every container start) but the prewarm
+    /// loop emitted "compile success" without TRT actually writing any
+    /// `.engine` files. `ensure_and_inspect` must return
+    /// `engine_count = 0` on this state so the warmup-only postcondition
+    /// in `lib.rs` can fail the deployment loudly.
+    #[test]
+    fn ensure_and_inspect_surfaces_empty_cache_after_supposed_writes() {
+        let tmp = TempDir::new().expect("tempdir");
+        let cache_root = tmp.path();
+
+        // Pretend the prewarm loop ran: directory exists, but the
+        // expected `.engine` files were never persisted.
+        let info = ensure_and_inspect(cache_root);
+        assert!(info.path.is_dir(), "cache dir must exist");
+        assert_eq!(
+            info.engine_count, 0,
+            "an empty cache directory after prewarm must report \
+             engine_count=0 — this is the postcondition signal"
+        );
+
+        // Add a non-`.engine` file to confirm we don't mis-count
+        // sidecar artifacts as engines.
+        fs::write(info.path.join("notes.txt"), b"not an engine").unwrap();
+        let reinspected = ensure_and_inspect(cache_root);
+        assert_eq!(reinspected.engine_count, 0);
+    }
+
+    /// After a real successful prewarm sweep, `ensure_and_inspect` must
+    /// see the persisted `.engine` files. This is the positive control
+    /// for the test above: same directory shape, same caller, but with
+    /// the artifacts actually present.
+    #[test]
+    fn ensure_and_inspect_counts_engines_after_real_writes() {
+        let tmp = TempDir::new().expect("tempdir");
+        let cache_root = tmp.path();
+        let initial = ensure_and_inspect(cache_root);
+        assert_eq!(initial.engine_count, 0);
+
+        // Simulate the TRT EP writing a plan file during prewarm.
+        let engine_dir = initial.path.clone();
+        fs::write(
+            engine_dir.join("TensorrtExecutionProvider_TRTKernel_real_sm89.engine"),
+            b"plan",
+        )
+        .unwrap();
+        fs::write(
+            engine_dir.join("TensorrtExecutionProvider_TRTKernel_real_sm89.profile"),
+            b"profile",
+        )
+        .unwrap();
+
+        let post = ensure_and_inspect(cache_root);
+        assert_eq!(post.engine_count, 1);
+        assert_eq!(post.profile_count, 1);
+    }
 }

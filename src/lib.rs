@@ -43,7 +43,7 @@ pub mod sysinfo;
 pub mod weights;
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -53,10 +53,64 @@ use tracing::info;
 
 use crate::binpack::CostModel;
 use crate::bootstrap::{build_router, run_readiness_probe};
-use crate::config::Config;
+use crate::config::{Config, EpSelection};
 use crate::embedder::{EmbedPool, WorkerConfig};
 use crate::gpu_stats::GpuStatsCollector;
 use crate::state::{AppState, ProbeStatus};
+
+/// Process-exit code emitted by the warmup-only path when the postcondition
+/// fails (compile-success events present but no `.engine` files on disk).
+///
+/// Distinct from `1` (general failure) so operators can tell the warmup
+/// container "compiled successfully but did not persist anything" apart
+/// from "compile errored mid-run". Surfaced in the wrapping ECS task /
+/// EC2 userdata log group as the container's `exitCode`.
+pub const WARMUP_POSTCONDITION_FAILED_EXIT_CODE: i32 = 2;
+
+/// Decides whether the warmup-only postcondition is violated.
+///
+/// The postcondition is: when `BGE_M3_EP=tensorrt` is set and the warmup-only
+/// path has run to completion, at least one `.engine` file must exist in the
+/// engine cache directory. A `true` return value should produce an `ERROR`
+/// log and a non-zero exit so deployments fail loudly instead of silently
+/// looking healthy with a perpetually-cold cache.
+///
+/// Non-TensorRT EPs are exempt — they do not produce engine plan files at
+/// all, so an empty engine cache directory is the expected steady state.
+#[must_use]
+pub fn warmup_postcondition_failed(ep: EpSelection, engine_count: usize) -> bool {
+    ep == EpSelection::TensorRt && engine_count == 0
+}
+
+/// Polls `live_workers` until it reaches zero or `timeout` elapses.
+///
+/// Used by the warmup-only path after the [`EmbedPool`] handle has been
+/// dropped: closing the request channel asks each worker to break out of
+/// its receive loop, drop its `ort::session::Session`, and return — but
+/// dropping the pool only signals intent. The actual worker exit happens
+/// asynchronously on a `spawn_blocking` thread, and we want the ORT/TRT
+/// destructor to run BEFORE the process exits so any session-shutdown
+/// flushes (e.g. the TRT timing cache) make it to disk.
+///
+/// Returns silently on timeout — callers proceed to fsync + exit regardless.
+/// Engine plan files are durable independent of this wait (each shape
+/// fsyncs before returning from `run_warmup_shape`), so a slow worker
+/// shutdown only loses ancillary state.
+async fn wait_for_workers_to_exit(live_workers: &Arc<AtomicUsize>, timeout: Duration) {
+    let deadline = std::time::Instant::now() + timeout;
+    while live_workers.load(Ordering::Acquire) > 0 {
+        if std::time::Instant::now() >= deadline {
+            tracing::warn!(
+                live_workers = live_workers.load(Ordering::Acquire),
+                timeout_secs = timeout.as_secs(),
+                "warmup-only mode: timed out waiting for workers to exit; \
+                 proceeding to fsync and process exit"
+            );
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
 
 /// Runs the embedding server end-to-end: load config, spawn the worker pool,
 /// install the readiness probe, start the heartbeat, and serve HTTP traffic.
@@ -137,9 +191,10 @@ pub async fn run() -> anyhow::Result<()> {
     );
 
     // Warmup-only path: wait for all workers (and TRT engine compilation) to
-    // finish, log the engine count, then exit 0.  No HTTP listener is bound —
-    // intended for use as an ECS init container that pre-populates the shared
-    // EFS engine cache before the main container starts.
+    // finish, log the engine count, verify the on-disk postcondition, and
+    // exit cleanly through `main.rs`.  No HTTP listener is bound — intended
+    // for use as an ECS init container that pre-populates the shared EFS
+    // engine cache before the main container starts.
     if cfg.warmup_only {
         // Emit GPU heartbeats while engines are compiling so operators have
         // VRAM and temperature visibility in CloudWatch during the warmup
@@ -169,14 +224,61 @@ pub async fn run() -> anyhow::Result<()> {
             h.abort();
         }
 
-        let trt_info =
-            crate::embedder::trt_cache::ensure_and_inspect(&PathBuf::from(&cfg.cache_dir));
+        // Explicit teardown BEFORE the postcondition check and exit.
+        //
+        // Dropping `pool` releases the only `mpsc::Sender<EmbedRequest>`
+        // owned outside the worker threads, which closes the channel.
+        // Each worker's recv() call returns `Ok(None)`, the worker breaks
+        // out of its loop, drops its `ort::session::Session`, and exits.
+        //
+        // ORT TRT EP writes engine plan files synchronously inside
+        // `session.run()`, but it can buffer auxiliary state (e.g. the
+        // timing cache) that is only flushed on session destruction.
+        // Calling `process::exit(0)` while sessions are still alive would
+        // skip those destructors, which is the failure mode we are
+        // engineering away from.  After dropping the pool we wait briefly
+        // for `live_workers` to drain so worker drop paths can run.
+        let cache_dir_path = PathBuf::from(&cfg.cache_dir);
+        let live_workers = pool.live_worker_count();
+        let live_workers_arc = pool.live_workers_for_shutdown();
+        drop(pool);
+
+        wait_for_workers_to_exit(&live_workers_arc, Duration::from_secs(10)).await;
+        let live_workers_after = live_workers_arc.load(Ordering::Acquire);
+        info!(
+            live_workers_before = live_workers,
+            live_workers_after, "warmup-only mode: pool dropped, waited for worker teardown"
+        );
+
+        // Final fsync sweep covers any sidecar files (timing cache,
+        // `.profile`) that may have been written during the session-drop
+        // path. Engine plan files were already fsynced inside
+        // `run_warmup_shape`, so this second pass is belt-and-braces.
+        let engine_cache_dir = crate::embedder::trt_cache::engine_cache_path(&cache_dir_path);
+        crate::embedder::trt_cache::fsync_cache_dir(&engine_cache_dir);
+
+        let trt_info = crate::embedder::trt_cache::ensure_and_inspect(&cache_dir_path);
+
+        if warmup_postcondition_failed(cfg.ep, trt_info.engine_count) {
+            tracing::error!(
+                engine_count = trt_info.engine_count,
+                cache_path = %trt_info.path.display(),
+                ep = %cfg.ep,
+                "warmup-only postcondition failed: compile-success events \
+                 present but no .engine files on disk; check TRT EP \
+                 construction, EFS mount, and engine cache path resolution"
+            );
+            std::process::exit(WARMUP_POSTCONDITION_FAILED_EXIT_CODE);
+        }
+
         info!(
             engine_count = trt_info.engine_count,
+            profile_count = trt_info.profile_count,
             cache_path = %trt_info.path.display(),
+            ep = %cfg.ep,
             "warmup-only mode: all TRT engines compiled and cached, exiting"
         );
-        std::process::exit(0);
+        return Ok(());
     }
 
     let state = Arc::new(AppState {
@@ -256,4 +358,116 @@ pub async fn run() -> anyhow::Result<()> {
 
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ─── warmup_postcondition_failed ──────────────────────────────────────
+
+    #[test]
+    fn postcondition_passes_for_tensorrt_with_engines_present() {
+        assert!(!warmup_postcondition_failed(EpSelection::TensorRt, 1));
+        assert!(!warmup_postcondition_failed(EpSelection::TensorRt, 16));
+    }
+
+    #[test]
+    fn postcondition_fails_for_tensorrt_with_zero_engines() {
+        assert!(
+            warmup_postcondition_failed(EpSelection::TensorRt, 0),
+            "TRT EP + 0 engines must be flagged as a postcondition failure"
+        );
+    }
+
+    #[test]
+    fn postcondition_passes_for_cpu_ep_regardless_of_engine_count() {
+        assert!(!warmup_postcondition_failed(EpSelection::Cpu, 0));
+        assert!(!warmup_postcondition_failed(EpSelection::Cpu, 16));
+    }
+
+    #[test]
+    fn postcondition_passes_for_cuda_ep_regardless_of_engine_count() {
+        assert!(!warmup_postcondition_failed(EpSelection::Cuda, 0));
+        assert!(!warmup_postcondition_failed(EpSelection::Cuda, 16));
+    }
+
+    #[test]
+    fn warmup_postcondition_exit_code_is_distinct_from_general_failure() {
+        assert_eq!(
+            WARMUP_POSTCONDITION_FAILED_EXIT_CODE, 2,
+            "operators rely on exit_code=2 being specific to the warmup-only \
+             postcondition; do not collapse it back into 1"
+        );
+    }
+
+    // ─── wait_for_workers_to_exit ─────────────────────────────────────────
+    //
+    // These tests use real time deliberately: the helper polls a
+    // `live_workers` atomic on a 100 ms tokio::time::sleep cadence, which
+    // we want to exercise end-to-end. Adding `tokio/test-util` purely to
+    // virtualise time would buy little here.
+
+    /// When `live_workers` is already 0, the helper returns immediately
+    /// without sleeping for the entire timeout window.
+    #[tokio::test(flavor = "current_thread")]
+    async fn wait_for_workers_returns_immediately_when_already_zero() {
+        let live = Arc::new(AtomicUsize::new(0));
+        let start = std::time::Instant::now();
+        wait_for_workers_to_exit(&live, Duration::from_secs(60)).await;
+        assert!(
+            start.elapsed() < Duration::from_millis(200),
+            "wait should return immediately when live_workers is already zero; \
+             elapsed={:?}",
+            start.elapsed()
+        );
+    }
+
+    /// Workers transitioning to zero mid-wait causes the helper to return
+    /// well before the timeout.
+    #[tokio::test(flavor = "current_thread")]
+    async fn wait_for_workers_returns_when_count_reaches_zero() {
+        let live = Arc::new(AtomicUsize::new(2));
+        let live_for_task = Arc::clone(&live);
+        let drainer = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            live_for_task.store(0, Ordering::Release);
+        });
+
+        let start = std::time::Instant::now();
+        wait_for_workers_to_exit(&live, Duration::from_secs(60)).await;
+        let elapsed = start.elapsed();
+        drainer.await.unwrap();
+
+        assert_eq!(live.load(Ordering::Acquire), 0);
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "wait should have returned soon after counter reached zero; \
+             elapsed={elapsed:?}"
+        );
+    }
+
+    /// When `live_workers` never reaches zero, the helper returns at the
+    /// timeout without blocking forever.
+    #[tokio::test(flavor = "current_thread")]
+    async fn wait_for_workers_times_out_when_count_stays_positive() {
+        let live = Arc::new(AtomicUsize::new(3));
+        let start = std::time::Instant::now();
+        wait_for_workers_to_exit(&live, Duration::from_millis(300)).await;
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed >= Duration::from_millis(280),
+            "wait should have honored the timeout; elapsed={elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "wait should not block past the timeout by more than one poll; \
+             elapsed={elapsed:?}"
+        );
+        assert_eq!(
+            live.load(Ordering::Acquire),
+            3,
+            "live counter must be untouched after timeout"
+        );
+    }
 }

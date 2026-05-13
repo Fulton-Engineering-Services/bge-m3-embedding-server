@@ -80,6 +80,28 @@ use super::worker::probe_run_dense;
 /// remaining well below the minimum observed cold-compile time.
 pub(super) const CACHE_HIT_THRESHOLD_MS: u64 = 5_000;
 
+/// Decides whether a single worker's prewarm postcondition is violated.
+///
+/// The postcondition: if at least one shape on this worker reported a
+/// **fresh compile** (`succeeded && !cache_hit`) but the on-disk `.engine`
+/// file count did not increase, the TRT EP almost certainly emitted
+/// `Ok(_)` from `session.run()` without actually persisting the engine
+/// plan. This is the silent-persistence failure mode behind the 2026-05
+/// codekeeper outage (400 cache-empty events / 1215 compile-success
+/// events / 0 cache-found events / cache directory empty on disk).
+///
+/// Returning `true` should produce an `ERROR` log so operators see the
+/// failure in `CloudWatch` immediately rather than discovering it later
+/// from cold-cache compile times. Non-fresh-compile shards (cache hits
+/// only) and shards that produced positive deltas are accepted.
+#[must_use]
+pub(super) fn prewarm_persistence_postcondition_failed(
+    fresh_compiles: usize,
+    engine_count_delta: i64,
+) -> bool {
+    fresh_compiles > 0 && engine_count_delta <= 0
+}
+
 /// Aggregate per-worker statistics returned by [`trt_prewarm`].
 ///
 /// `total_compile_ms` and `total_fsync_ms` sum across only the shapes that
@@ -99,6 +121,21 @@ pub(super) struct PrewarmStats {
     /// `fully_cached` was determined to be true.  Zero on cold cache or
     /// when all shapes were run.
     pub skipped: usize,
+    /// Number of shapes that reported a fresh compile (`!cache_hit` and
+    /// `Ok(_)` from `session.run()`).  Used together with `engine_count_delta`
+    /// by the worker to decide whether the on-disk artifacts match what the
+    /// per-shape logs claimed.
+    pub fresh_compiles: usize,
+    /// Net `.engine` file count change across this worker's prewarm sweep
+    /// (`count_after_last_shape - count_before_first_shape`).  Compared
+    /// against `fresh_compiles` to detect compile-success-without-persistence.
+    pub engine_count_delta: i64,
+    /// `.engine` file count observed in `engine_cache_dir` before the worker
+    /// ran any of its shard's shapes.
+    pub engine_count_before: usize,
+    /// `.engine` file count observed in `engine_cache_dir` after the worker
+    /// finished its shard (post final fsync).
+    pub engine_count_after: usize,
 }
 
 /// Selects the minimal set of shapes needed to verify that an ORT TRT EP
@@ -154,6 +191,10 @@ pub(super) fn coverage_check_shapes(shapes: &[(usize, usize)]) -> Vec<(usize, us
 }
 
 /// Result of a single [`run_warmup_shape`] call.
+///
+/// Per-shape `.engine` count snapshots are logged inline by
+/// `run_warmup_shape`; only aggregate stats are propagated up to the worker
+/// (via [`PrewarmStats`]).
 struct ShapeRunResult {
     compile_ms: u64,
     fsync_ms: u64,
@@ -166,6 +207,13 @@ struct ShapeRunResult {
 /// Runs `session.run()` for a single `(batch, seq)` shape, measures wall
 /// time, classifies the result as a cache hit or fresh compile, and
 /// — on success — fsyncs the engine cache directory for durability.
+///
+/// Snapshots `.engine` file count before and after the run. When a shape
+/// reports a fresh compile (not a cache hit) but the on-disk count does not
+/// increase, emits a `WARN` so operators can catch the
+/// "compile-success-without-persistence" failure mode that produced the
+/// 2026-05 codekeeper outage (TRT EP silently failing to write engine plan
+/// files even though `session.run()` returned `Ok(_)`).
 ///
 /// The `shape_index` / `shape_total` parameters are purely for the
 /// operator-visible log message and do not affect logic.
@@ -181,12 +229,15 @@ fn run_warmup_shape(
     let ids = ndarray::Array2::<i64>::zeros((batch, seq));
     let mask = ndarray::Array2::<i64>::ones((batch, seq));
 
+    let engine_count_before = trt_cache::count_engine_files(engine_cache_dir);
+
     tracing::info!(
         worker_id,
         batch,
         seq,
         shape_index,
         shape_total,
+        engine_count_before,
         "TensorRT pre-warm: running shape (cold compile may take 30–170 s)"
     );
 
@@ -205,6 +256,31 @@ fn run_warmup_shape(
             trt_cache::fsync_cache_dir(engine_cache_dir);
             let fsync_ms = u64::try_from(fsync_start.elapsed().as_millis()).unwrap_or(u64::MAX);
 
+            let engine_count_after = trt_cache::count_engine_files(engine_cache_dir);
+            let engine_count_increased = engine_count_after > engine_count_before;
+
+            // A non-cache-hit run that reports `Ok(_)` from session.run() but
+            // does not increase the on-disk `.engine` count is the silent
+            // failure mode behind the 2026-05 codekeeper outage. A WARN here
+            // surfaces it in CloudWatch BEFORE downstream traffic notices
+            // a perpetually cold cache.
+            if !cache_hit && !engine_count_increased {
+                tracing::warn!(
+                    worker_id,
+                    batch,
+                    seq,
+                    shape_index,
+                    shape_total,
+                    compile_ms,
+                    fsync_ms,
+                    engine_count_before,
+                    engine_count_after,
+                    cache_path = %engine_cache_dir.display(),
+                    "TensorRT pre-warm: compile-success log fired but engine_count did not \
+                     increase — TRT EP may be silently failing to persist engine plan files"
+                );
+            }
+
             tracing::info!(
                 worker_id,
                 batch,
@@ -214,6 +290,9 @@ fn run_warmup_shape(
                 compile_ms,
                 fsync_ms,
                 cache_hit,
+                engine_count_before,
+                engine_count_after,
+                engine_count_increased,
                 "TensorRT pre-warm: engine compiled, cached, and fsynced"
             );
             ShapeRunResult {
@@ -224,6 +303,7 @@ fn run_warmup_shape(
             }
         }
         Err(e) => {
+            let engine_count_after = trt_cache::count_engine_files(engine_cache_dir);
             tracing::warn!(
                 worker_id,
                 batch,
@@ -232,6 +312,8 @@ fn run_warmup_shape(
                 shape_total,
                 compile_ms,
                 cache_hit,
+                engine_count_before,
+                engine_count_after,
                 error = %e,
                 "TensorRT pre-warm: engine compilation failed for shape; \
                  first real request for this shape will trigger an on-demand compile"
@@ -310,6 +392,7 @@ pub(super) fn shard_shapes(
 ///
 /// Returns aggregate statistics including `fully_cached` (whether the
 /// shard was served entirely from cache) and `skipped` (shapes not run).
+#[allow(clippy::too_many_lines)]
 pub(super) fn trt_prewarm(
     session: &mut ort::session::Session,
     warmup_shapes: &[(usize, usize)],
@@ -319,9 +402,11 @@ pub(super) fn trt_prewarm(
     let engine_cache_dir = trt_cache::engine_cache_path(cache_dir);
 
     let mut warmed = 0usize;
+    let mut fresh_compiles = 0usize;
     let mut total_compile_ms: u64 = 0;
     let mut total_fsync_ms: u64 = 0;
     let shape_total = warmup_shapes.len();
+    let engine_count_before = trt_cache::count_engine_files(&engine_cache_dir);
 
     if warmup_shapes.is_empty() {
         return PrewarmStats {
@@ -330,14 +415,17 @@ pub(super) fn trt_prewarm(
             total_fsync_ms: 0,
             fully_cached: false,
             skipped: 0,
+            fresh_compiles: 0,
+            engine_count_delta: 0,
+            engine_count_before,
+            engine_count_after: engine_count_before,
         };
     }
 
     // ── Coverage-check fast path ──────────────────────────────────────────
     // If any engines already exist on disk, run only the dimensional-extreme
     // shapes to determine whether the full shard is already cached.
-    let engine_count = trt_cache::count_engine_files(&engine_cache_dir);
-    let check_shapes = if engine_count > 0 {
+    let check_shapes = if engine_count_before > 0 {
         coverage_check_shapes(warmup_shapes)
     } else {
         Vec::new()
@@ -361,6 +449,9 @@ pub(super) fn trt_prewarm(
             warmed += 1;
             total_compile_ms = total_compile_ms.saturating_add(r.compile_ms);
             total_fsync_ms = total_fsync_ms.saturating_add(r.fsync_ms);
+            if !r.cache_hit {
+                fresh_compiles += 1;
+            }
         }
         if !r.cache_hit || !r.succeeded {
             all_checks_fast = false;
@@ -383,12 +474,18 @@ pub(super) fn trt_prewarm(
         // One final fsync covers sidecar files (timing cache, `.profile`)
         // that may have been touched during the check phase.
         trt_cache::fsync_cache_dir(&engine_cache_dir);
+        let engine_count_after = trt_cache::count_engine_files(&engine_cache_dir);
         return PrewarmStats {
             warmed,
             total_compile_ms,
             total_fsync_ms,
             fully_cached: true,
             skipped,
+            fresh_compiles,
+            engine_count_delta: i64::try_from(engine_count_after).unwrap_or(i64::MAX)
+                - i64::try_from(engine_count_before).unwrap_or(i64::MAX),
+            engine_count_before,
+            engine_count_after,
         };
     }
 
@@ -414,6 +511,9 @@ pub(super) fn trt_prewarm(
             warmed += 1;
             total_compile_ms = total_compile_ms.saturating_add(r.compile_ms);
             total_fsync_ms = total_fsync_ms.saturating_add(r.fsync_ms);
+            if !r.cache_hit {
+                fresh_compiles += 1;
+            }
         }
     }
 
@@ -421,18 +521,27 @@ pub(super) fn trt_prewarm(
     // were touched during the warmup but not associated with a single shape.
     trt_cache::fsync_cache_dir(&engine_cache_dir);
 
+    let engine_count_after = trt_cache::count_engine_files(&engine_cache_dir);
     PrewarmStats {
         warmed,
         total_compile_ms,
         total_fsync_ms,
         fully_cached: false,
         skipped: 0,
+        fresh_compiles,
+        engine_count_delta: i64::try_from(engine_count_after).unwrap_or(i64::MAX)
+            - i64::try_from(engine_count_before).unwrap_or(i64::MAX),
+        engine_count_before,
+        engine_count_after,
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{coverage_check_shapes, shard_shapes, CACHE_HIT_THRESHOLD_MS};
+    use super::{
+        coverage_check_shapes, prewarm_persistence_postcondition_failed, shard_shapes,
+        CACHE_HIT_THRESHOLD_MS,
+    };
 
     /// Default 16-shape grid for stride-sharding and coverage-check tests.
     fn default_shapes() -> Vec<(usize, usize)> {
@@ -754,6 +863,160 @@ mod tests {
         assert!(
             would_skip >= 12,
             "single-worker should skip ≥ 12 shapes; would_skip={would_skip}"
+        );
+    }
+
+    // ─── prewarm_persistence_postcondition_failed ─────────────────────────
+    //
+    // These tests pin down the silent-persistence-failure detector that
+    // was added in response to the 2026-05 codekeeper outage. Each case
+    // is a real shape of CloudWatch evidence we want to either flag or
+    // accept.
+
+    /// Production defect signal: 1215 compile-success events but the
+    /// `.engine` cache directory is empty on disk → flag.
+    #[test]
+    fn postcondition_flags_fresh_compiles_with_zero_delta() {
+        assert!(prewarm_persistence_postcondition_failed(16, 0));
+        assert!(prewarm_persistence_postcondition_failed(1, 0));
+    }
+
+    /// Defensive: an apparent decrease in engine count after a fresh
+    /// compile (e.g. a sibling worker raced through and pruned files) is
+    /// still wrong — flag it.
+    #[test]
+    fn postcondition_flags_fresh_compiles_with_negative_delta() {
+        assert!(prewarm_persistence_postcondition_failed(4, -2));
+    }
+
+    /// Healthy first-deploy cold cache: 16 fresh compiles, +16 engines on
+    /// disk → accept.
+    #[test]
+    fn postcondition_accepts_fresh_compiles_with_matching_delta() {
+        assert!(!prewarm_persistence_postcondition_failed(16, 16));
+    }
+
+    /// Healthy partial-shard compile: 4 fresh compiles, +4 engines on
+    /// disk → accept.
+    #[test]
+    fn postcondition_accepts_partial_shard_with_matching_delta() {
+        assert!(!prewarm_persistence_postcondition_failed(4, 4));
+    }
+
+    /// Healthy warm-cache fast path: 0 fresh compiles, 0 delta → accept.
+    /// Cache hits only must NOT be flagged as a postcondition failure.
+    #[test]
+    fn postcondition_accepts_warm_cache_with_no_compiles() {
+        assert!(!prewarm_persistence_postcondition_failed(0, 0));
+    }
+
+    /// Healthy edge case: 0 fresh compiles but a positive delta (a sibling
+    /// worker on the same EFS-shared cache wrote engines after we counted
+    /// `_before`). Not actionable → accept.
+    #[test]
+    fn postcondition_accepts_zero_compiles_with_positive_delta() {
+        assert!(!prewarm_persistence_postcondition_failed(0, 4));
+    }
+
+    /// A small delta short of the compile count is also a defect signal:
+    /// 16 compiles claimed, only 1 engine actually persisted → flag.
+    /// (The exact threshold for "less than expected" is a follow-up; the
+    /// minimum invariant guarded here is "≥ 1 fresh compile and ≤ 0 delta
+    /// is always wrong".)
+    #[test]
+    fn postcondition_accepts_undercount_above_zero_delta() {
+        // Degenerate case is intentionally accepted by the current helper:
+        // a single non-zero delta is counted as evidence of persistence.
+        // Tightening this would require correlating fresh_compiles and
+        // delta — see the recommended follow-up.
+        assert!(!prewarm_persistence_postcondition_failed(16, 1));
+    }
+
+    // ─── engine count snapshot wiring (filesystem-backed) ─────────────────
+
+    /// `count_engine_files` is the mechanism behind both the per-shape
+    /// delta WARN and the per-worker prewarm postcondition. Verify it
+    /// reflects engine-file writes the way the prewarm path does:
+    /// before-compile snapshot + on-disk write + after-compile snapshot
+    /// must produce a delta of `+1`. This pins down the contract that the
+    /// silent-persistence detector relies on.
+    #[test]
+    fn count_engine_files_reflects_post_write_delta() {
+        use super::trt_cache::count_engine_files;
+        use std::fs;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().expect("tempdir");
+        let dir = tmp.path().join("trt-engines");
+        fs::create_dir_all(&dir).unwrap();
+
+        let before = count_engine_files(&dir);
+        assert_eq!(before, 0, "fresh tempdir should have no engines");
+
+        fs::write(
+            dir.join("TensorrtExecutionProvider_TRTKernel_graph_a_111_fp16_sm89.engine"),
+            b"plan-bytes",
+        )
+        .unwrap();
+
+        let after = count_engine_files(&dir);
+        assert_eq!(after, 1, "after a single engine write, count must be 1");
+        let delta = i64::try_from(after).unwrap() - i64::try_from(before).unwrap();
+        assert_eq!(delta, 1, "delta must be +1");
+    }
+
+    /// Conversely, when `session.run()` returns `Ok(_)` but TRT EP did
+    /// NOT write an engine file (the production defect signal), the
+    /// before/after delta is 0 even though a "compiled, cached, and
+    /// fsynced" message was logged. This test fakes that scenario to
+    /// confirm the postcondition helper would flag it.
+    #[test]
+    fn count_engine_files_zero_delta_triggers_postcondition() {
+        use super::trt_cache::count_engine_files;
+        use std::fs;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().expect("tempdir");
+        let dir = tmp.path().join("trt-engines");
+        fs::create_dir_all(&dir).unwrap();
+
+        // Fake "compile success without persistence": the directory is
+        // never written to, even though the prewarm aggregator believes
+        // a fresh compile happened.
+        let before = count_engine_files(&dir);
+        let after = count_engine_files(&dir);
+        let delta = i64::try_from(after).unwrap() - i64::try_from(before).unwrap();
+
+        assert!(
+            prewarm_persistence_postcondition_failed(1, delta),
+            "fresh_compiles=1 with zero delta must trigger the postcondition"
+        );
+    }
+
+    /// Ensure the postcondition is satisfied when the directory is
+    /// populated between `_before` and `_after` snapshots.
+    #[test]
+    fn count_engine_files_positive_delta_passes_postcondition() {
+        use super::trt_cache::count_engine_files;
+        use std::fs;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().expect("tempdir");
+        let dir = tmp.path().join("trt-engines");
+        fs::create_dir_all(&dir).unwrap();
+
+        let before = count_engine_files(&dir);
+        fs::write(
+            dir.join("TensorrtExecutionProvider_TRTKernel_a_sm89.engine"),
+            b"plan",
+        )
+        .unwrap();
+        let after = count_engine_files(&dir);
+        let delta = i64::try_from(after).unwrap() - i64::try_from(before).unwrap();
+
+        assert!(
+            !prewarm_persistence_postcondition_failed(1, delta),
+            "a single fresh compile that wrote one engine must pass"
         );
     }
 }

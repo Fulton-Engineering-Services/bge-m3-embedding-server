@@ -364,6 +364,22 @@ impl EmbedPool {
     pub fn model_rss_per_worker_bytes(&self) -> usize {
         self.model_rss_per_worker_bytes.load(Ordering::Acquire)
     }
+
+    /// Returns a clone of the `Arc<AtomicUsize>` backing `live_worker_count`.
+    ///
+    /// Used by the warmup-only path in `lib.rs` to poll worker exit progress
+    /// AFTER the [`EmbedPool`] itself has been dropped. Dropping the pool
+    /// closes the request channel, which signals workers to break out of
+    /// their receive loops and drop their ORT sessions; the live counter is
+    /// the only readable signal that those drop paths have completed.
+    ///
+    /// Returning a clone of the raw `Arc` (rather than a snapshot) lets the
+    /// caller hold a reference across the drop boundary without having to
+    /// keep the pool's other state alive.
+    #[must_use]
+    pub fn live_workers_for_shutdown(&self) -> Arc<AtomicUsize> {
+        Arc::clone(&self.live_workers)
+    }
 }
 
 // ---------------------------------------------------------------------------
