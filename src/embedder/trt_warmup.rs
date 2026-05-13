@@ -81,7 +81,7 @@ pub(super) use postcondition::{
 // Constants are re-exported only for the sibling `tests` module; production
 // callers reach them transitively through the postcondition predicates above.
 #[cfg(test)]
-pub(super) use postcondition::{SUSPICIOUS_UNDERCOUNT_MIN_FRESH, UNDERCOUNT_RATIO_DIVISOR};
+pub(super) use postcondition::SUSPICIOUS_UNDERCOUNT_MIN_FRESH;
 use runner::run_warmup_shape;
 
 /// Threshold (ms) below which a `session.run()` is classified as a TRT

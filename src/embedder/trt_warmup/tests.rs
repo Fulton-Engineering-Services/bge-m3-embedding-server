@@ -21,7 +21,7 @@
 use super::{
     coverage_check_shapes, prewarm_persistence_postcondition_failed,
     prewarm_persistence_suspicious_undercount, shard_shapes, CACHE_HIT_THRESHOLD_MS,
-    SUSPICIOUS_UNDERCOUNT_MIN_FRESH, UNDERCOUNT_RATIO_DIVISOR,
+    SUSPICIOUS_UNDERCOUNT_MIN_FRESH,
 };
 
 /// Default 16-shape grid for stride-sharding and coverage-check tests.
@@ -349,163 +349,171 @@ fn single_worker_check_shapes_skips_most_shapes() {
 
 // ─── prewarm_persistence_postcondition_failed ─────────────────────────
 //
-// These tests pin down the silent-persistence-failure detector that
-// was added in response to the 2026-05 codekeeper outage. Each case
-// is a real shape of CloudWatch evidence we want to either flag or
-// accept.
+// Signatures: (fresh_compiles: usize, engine_count_after: usize) -> bool
+// Logic:      fresh_compiles > 0 && engine_count_after == 0
+//
+// The postcondition is keyed on `engine_count_after == 0`, NOT on
+// `engine_count_delta <= 0`.  ORT's TRT EP writes one profile-based
+// `.engine` file and rewrites it in-place as the profile range expands
+// to cover more shapes — `delta == 0` at steady state is healthy.
+// Only `after == 0` (no engine file at all) is a persistence failure.
 
-/// Production defect signal: 1215 compile-success events but the
-/// `.engine` cache directory is empty on disk → flag.
+/// Exact production defect signal: fresh compiles occurred but the engine
+/// cache directory is empty (after == 0) → flag as ERROR.
 #[test]
-fn postcondition_flags_fresh_compiles_with_zero_delta() {
+fn postcondition_flags_fresh_compiles_with_zero_engine_count_after() {
     assert!(prewarm_persistence_postcondition_failed(16, 0));
     assert!(prewarm_persistence_postcondition_failed(1, 0));
+    // Production-scale: 1215 compile-success events, 0 engines on disk.
+    assert!(prewarm_persistence_postcondition_failed(1215, 0));
 }
 
-/// Defensive: an apparent decrease in engine count after a fresh
-/// compile (e.g. a sibling worker raced through and pruned files) is
-/// still wrong — flag it.
+/// Healthy first-deploy cold cache: 16 fresh compiles, engine file present
+/// → accept.  The exact count of engine files does not matter; >= 1 passes.
 #[test]
-fn postcondition_flags_fresh_compiles_with_negative_delta() {
-    assert!(prewarm_persistence_postcondition_failed(4, -2));
-}
-
-/// Healthy first-deploy cold cache: 16 fresh compiles, +16 engines on
-/// disk → accept.
-#[test]
-fn postcondition_accepts_fresh_compiles_with_matching_delta() {
+fn postcondition_accepts_fresh_compiles_with_engine_files_present() {
     assert!(!prewarm_persistence_postcondition_failed(16, 16));
+    assert!(!prewarm_persistence_postcondition_failed(16, 1));
 }
 
-/// Healthy partial-shard compile: 4 fresh compiles, +4 engines on
-/// disk → accept.
+/// Healthy partial-shard compile: 4 fresh compiles, engine file present
+/// → accept.
 #[test]
-fn postcondition_accepts_partial_shard_with_matching_delta() {
+fn postcondition_accepts_partial_shard_with_engine_files_present() {
     assert!(!prewarm_persistence_postcondition_failed(4, 4));
 }
 
-/// Healthy warm-cache fast path: 0 fresh compiles, 0 delta → accept.
-/// Cache hits only must NOT be flagged as a postcondition failure.
+/// Healthy warm-cache fast path: 0 fresh compiles, 0 engine files on disk
+/// → accept.  Cache hits only must NOT be flagged.
 #[test]
 fn postcondition_accepts_warm_cache_with_no_compiles() {
     assert!(!prewarm_persistence_postcondition_failed(0, 0));
 }
 
-/// Healthy edge case: 0 fresh compiles but a positive delta (a sibling
-/// worker on the same EFS-shared cache wrote engines after we counted
-/// `_before`). Not actionable → accept.
+/// Healthy: 0 fresh compiles but engine files already present (a sibling
+/// worker on the same EFS-shared cache wrote engines before we ran).
 #[test]
-fn postcondition_accepts_zero_compiles_with_positive_delta() {
+fn postcondition_accepts_zero_compiles_with_engine_files_present() {
     assert!(!prewarm_persistence_postcondition_failed(0, 4));
 }
 
-// The follow-up referenced by the original
-// `postcondition_accepts_undercount_above_zero_delta` placeholder has
-// been resolved by splitting the rule in two:
-//
-//   • `prewarm_persistence_postcondition_failed` remains the **loose**
-//     fatal signal: `fresh > 0 && delta ≤ 0`. ORT TRT EP legitimately
-//     reuses one `.engine` file across many shapes (engine plans key on
-//     fused-subgraph identity + precision + SM, NOT on `(batch, seq)`),
-//     so a stricter `delta < fresh - 1` rule would fire false-positive
-//     ERRORs on healthy clusters.
-//   • `prewarm_persistence_suspicious_undercount` is a separate,
-//     **non-fatal** WARN signal that catches large ratio anomalies
-//     (`delta * 2 < fresh_compiles`) the loose rule cannot.
-//
-// The tests below pin down both: the loose-pass cases retained
-// for the existing ERROR rule, the boundary cases requested in the
-// follow-up note, and the tightened-fail cases now covered by the WARN
-// helper.
-
-/// Retained loose-pass case: 16 compiles + 1 engine on disk does NOT
-/// trip the **ERROR** postcondition (it would now trip the WARN
-/// helper; see the suspicious-undercount tests below).
+/// KEY profile-update case (the false-positive the old delta-based rule
+/// produced): N fresh compiles occurred, engine file count stayed at 1
+/// because TRT EP rewrote the same file in-place for each new shape.
+/// Must NOT trip the ERROR postcondition.
+///
+/// Confirmed production evidence: every `engine compiled, cached, and
+/// fsynced` log showed `before=1, after=1, increased=0` on workers 0/1/3.
 #[test]
-fn postcondition_loose_pass_retained_for_undercount_above_zero_delta() {
-    assert!(!prewarm_persistence_postcondition_failed(16, 1));
-}
-
-/// Boundary case: `fresh=1, delta=1` is a healthy single-shape
-/// compile. Must not trip either signal.
-#[test]
-fn postcondition_boundary_fresh_one_delta_one_passes() {
-    assert!(!prewarm_persistence_postcondition_failed(1, 1));
-}
-
-/// Boundary case: `fresh=2, delta=1` is a healthy two-shape compile
-/// where ORT TRT EP reused one engine plan across both shapes. Must
-/// not trip the loose ERROR.
-#[test]
-fn postcondition_boundary_fresh_two_delta_one_passes() {
-    assert!(!prewarm_persistence_postcondition_failed(2, 1));
-}
-
-/// Boundary case: `fresh=N, delta=N` is the perfect-1:1 cold-cache
-/// outcome. Must not trip the loose ERROR for any reasonable `N`.
-#[test]
-fn postcondition_boundary_fresh_equals_delta_passes() {
-    for n in [1, 2, 4, 16, 128, 1215] {
+fn postcondition_accepts_profile_update_case_after_one() {
+    for fresh in [1_usize, 2, 4, 15, 16, 1215] {
         assert!(
-            !prewarm_persistence_postcondition_failed(n, i64::try_from(n).unwrap()),
-            "fresh=delta={n} must not trip loose ERROR"
+            !prewarm_persistence_postcondition_failed(fresh, 1),
+            "fresh={fresh}, after=1: profile-update case must not trip ERROR"
         );
     }
 }
 
-/// Boundary case: `fresh=0, delta=0` is the warm-cache fast-path
-/// outcome. Must not trip the loose ERROR.
+/// Boundary: `fresh=0, after=0` → no compiles, no files → accept (no work
+/// done on this shard; warm-cache skip path).
 #[test]
-fn postcondition_boundary_fresh_zero_delta_zero_passes() {
+fn postcondition_boundary_fresh_zero_after_zero_passes() {
     assert!(!prewarm_persistence_postcondition_failed(0, 0));
+}
+
+/// Boundary: `fresh=1, after=1` → one compile, file present → accept.
+#[test]
+fn postcondition_boundary_fresh_one_after_one_passes() {
+    assert!(!prewarm_persistence_postcondition_failed(1, 1));
+}
+
+/// Boundary: `fresh=2, after=1` → two compiles but only one engine file
+/// (profile-update rewrite) → accept.
+#[test]
+fn postcondition_boundary_fresh_two_after_one_passes() {
+    assert!(!prewarm_persistence_postcondition_failed(2, 1));
+}
+
+/// Boundary: `fresh=1, after=0` → one compile, no engine file → fail.
+/// This is the minimal form of the production defect.
+#[test]
+fn postcondition_boundary_fresh_one_after_zero_fails() {
+    assert!(prewarm_persistence_postcondition_failed(1, 0));
+}
+
+/// Any `fresh > 0` with `after > 0` must pass, regardless of the exact
+/// counts (covers engine reuse, multi-file, etc).
+#[test]
+fn postcondition_passes_whenever_engine_files_exist() {
+    for fresh in [1_usize, 2, 4, 16, 128, 1215] {
+        for after in [1_usize, 2, 16, 1215] {
+            assert!(
+                !prewarm_persistence_postcondition_failed(fresh, after),
+                "fresh={fresh}, after={after}: any after > 0 must pass"
+            );
+        }
+    }
 }
 
 // ─── prewarm_persistence_suspicious_undercount ────────────────────────
 //
-// Non-fatal WARN helper. Fires when `delta * 2 < fresh_compiles` AND
-// the loose ERROR is not already firing AND `fresh_compiles >= 2`.
+// Signatures: (fresh_compiles: usize, engine_count_after: usize) -> bool
+//
+// Current behaviour: always returns `false` when `engine_count_after > 0`.
+// TRT EP profile-based in-place engine rewrite means delta == 0 at
+// steady state; flagging that would produce false-positive WARNs on every
+// shape after the first compile.  The only actionable anomaly (after == 0)
+// is already covered by the ERROR predicate.
 
-/// Tightened-fail case from the follow-up note: `fresh=10, delta=1`.
-/// The loose ERROR does not trip (delta > 0); the WARN does.
+/// Profile-update case: fresh compiles but engine file count stays at 1
+/// (TRT EP in-place rewrite).  WARN must be silent — this is healthy.
 #[test]
-fn suspicious_undercount_flags_tightened_fail_case() {
-    assert!(
-        !prewarm_persistence_postcondition_failed(10, 1),
-        "loose ERROR must not fire for fresh=10, delta=1"
-    );
-    assert!(
-        prewarm_persistence_suspicious_undercount(10, 1),
-        "WARN must fire for fresh=10, delta=1 (delta*2=2 < fresh=10)"
-    );
+fn suspicious_undercount_silent_for_profile_update_case() {
+    for fresh in [1_usize, 2, 4, 10, 15, 16, 1215] {
+        assert!(
+            !prewarm_persistence_suspicious_undercount(fresh, 1),
+            "fresh={fresh}, after=1: profile-update case must not trip WARN"
+        );
+    }
 }
 
-/// Production-scale anomaly: 1215 compiles, 5 engines persisted.
-/// Loose ERROR passes (delta > 0); WARN fires loudly.
+/// WARN must be silent whenever engine files exist, regardless of how many
+/// fresh compiles were recorded.
 #[test]
-fn suspicious_undercount_flags_production_scale_anomaly() {
-    assert!(!prewarm_persistence_postcondition_failed(1215, 5));
-    assert!(prewarm_persistence_suspicious_undercount(1215, 5));
+fn suspicious_undercount_silent_when_engine_files_present() {
+    for &(fresh, after) in &[
+        (2_usize, 1_usize),
+        (4, 2),
+        (10, 1),
+        (16, 7),
+        (16, 8),
+        (16, 16),
+        (1215, 1),
+        (1215, 5),
+        (1215, 700),
+        (1215, 1215),
+    ] {
+        assert!(
+            !prewarm_persistence_suspicious_undercount(fresh, after),
+            "WARN must be silent for fresh={fresh}, after={after} (engine files present)"
+        );
+    }
 }
 
-/// WARN must NOT double-fire on top of the loose ERROR. When
-/// `delta <= 0 && fresh > 0`, only the ERROR is informative; the WARN
-/// suppresses itself so operators do not see the same evidence
-/// reported under two different severity levels.
+/// WARN must NOT double-fire on top of the ERROR.  When `after == 0` and
+/// `fresh > 0`, the ERROR postcondition fires; the WARN suppresses itself.
 #[test]
-fn suspicious_undercount_suppressed_when_loose_error_fires() {
+fn suspicious_undercount_suppressed_when_error_fires() {
     assert!(prewarm_persistence_postcondition_failed(1215, 0));
     assert!(
         !prewarm_persistence_suspicious_undercount(1215, 0),
         "WARN must not fire when ERROR is already covering the same case"
     );
-    assert!(prewarm_persistence_postcondition_failed(4, -2));
-    assert!(!prewarm_persistence_suspicious_undercount(4, -2));
+    assert!(prewarm_persistence_postcondition_failed(4, 0));
+    assert!(!prewarm_persistence_suspicious_undercount(4, 0));
 }
 
-/// WARN is silent for trivial shards (`fresh < MIN_FRESH`). A single
-/// fresh compile that produced zero engine files would already be
-/// flagged by the loose ERROR; below the `MIN_FRESH` floor the WARN
-/// ratio test would generate noise without signal.
+/// WARN is silent for trivial shards (`fresh < MIN_FRESH`).
 #[test]
 fn suspicious_undercount_silent_below_min_fresh_threshold() {
     // `fresh = 0` is the warm-cache case — never flag.
@@ -518,60 +526,15 @@ fn suspicious_undercount_silent_below_min_fresh_threshold() {
     const { assert!(SUSPICIOUS_UNDERCOUNT_MIN_FRESH >= 2) }
 }
 
-/// Healthy 1:1 (`fresh = delta`) and 1:2 (`fresh = 2 * delta`) ratios
-/// are silent — these are the patterns engine reuse produces on a
-/// real GPU and the WARN must accept them.
+/// Robustness: large `after` values (e.g. an unusually large engine cache)
+/// must not panic and must remain silent.
 #[test]
-fn suspicious_undercount_silent_for_healthy_ratios() {
-    for &(fresh, delta) in &[
-        (2_usize, 1_i64), // exactly the 2:1 boundary
-        (4, 2),           // 2:1
-        (16, 8),          // 2:1
-        (16, 16),         // 1:1 cold cache
-        (1215, 1215),     // production-scale 1:1
-        (1215, 700),      // production-scale >1:2
-    ] {
-        assert!(
-            !prewarm_persistence_suspicious_undercount(fresh, delta),
-            "WARN must not fire for healthy ratio fresh={fresh}, delta={delta}"
-        );
-    }
-}
-
-/// Just-below-half is the smallest interesting WARN-positive case.
-/// `fresh = 16, delta = 7` → delta*2 = 14 < 16 → WARN.
-/// `fresh = 16, delta = 8` → delta*2 = 16 ≮ 16 → silent.
-#[test]
-fn suspicious_undercount_boundary_just_below_half() {
-    assert!(prewarm_persistence_suspicious_undercount(16, 7));
-    assert!(!prewarm_persistence_suspicious_undercount(16, 8));
-}
-
-/// Pin the ratio divisor at the value the docs and warn message
-/// claim. Changing this constant alters the heuristic and the
-/// suppression-vs-fire boundary, so an unintentional flip would be
-/// caught here rather than at deploy time.
-#[test]
-fn suspicious_undercount_ratio_divisor_is_two() {
-    assert_eq!(
-        UNDERCOUNT_RATIO_DIVISOR, 2,
-        "WARN message and CloudWatch guidance reference a 2:1 ratio; \
-         do not change this divisor without updating both"
-    );
-}
-
-/// Saturating multiplication must not panic on absurd inputs that
-/// might arrive from a corrupt aggregator or a future i64 overflow.
-/// `i64::MAX * 2` saturates rather than wrapping.
-#[test]
-fn suspicious_undercount_saturates_on_overflow_inputs() {
-    // delta = i64::MAX, fresh = 4 → delta*2 saturates to i64::MAX,
-    // which is NOT < 4, so WARN stays silent.
-    assert!(!prewarm_persistence_suspicious_undercount(4, i64::MAX));
-    // delta = i64::MIN, fresh = 4 → loose ERROR fires first
-    // (delta ≤ 0), so WARN suppresses; no overflow path.
-    assert!(prewarm_persistence_postcondition_failed(4, i64::MIN));
-    assert!(!prewarm_persistence_suspicious_undercount(4, i64::MIN));
+fn suspicious_undercount_silent_for_large_engine_counts() {
+    assert!(!prewarm_persistence_suspicious_undercount(4, usize::MAX));
+    assert!(!prewarm_persistence_suspicious_undercount(
+        usize::MAX,
+        usize::MAX
+    ));
 }
 
 // ─── engine count snapshot wiring (filesystem-backed) ─────────────────
@@ -607,13 +570,40 @@ fn count_engine_files_reflects_post_write_delta() {
     assert_eq!(delta, 1, "delta must be +1");
 }
 
-/// Conversely, when `session.run()` returns `Ok(_)` but TRT EP did
-/// NOT write an engine file (the production defect signal), the
-/// before/after delta is 0 even though a "compiled, cached, and
-/// fsynced" message was logged. This test fakes that scenario to
-/// confirm the postcondition helper would flag it.
+/// When `session.run()` returns `Ok(_)` but TRT EP did NOT write an engine
+/// file (the production defect signal), `count_engine_files` returns 0.
+/// The postcondition helper must flag it.
+///
+/// Note: the postcondition now takes `engine_count_after` directly rather
+/// than a computed delta — `after == 0` is the actionable condition.
 #[test]
-fn count_engine_files_zero_delta_triggers_postcondition() {
+fn count_engine_files_zero_after_triggers_postcondition() {
+    use super::trt_cache::count_engine_files;
+    use tempfile::TempDir;
+
+    let tmp = TempDir::new().expect("tempdir");
+    let dir = tmp.path().join("trt-engines");
+    std::fs::create_dir_all(&dir).unwrap();
+
+    // Fake "compile success without persistence": the directory is
+    // never written to, even though the prewarm aggregator believes
+    // a fresh compile happened.
+    let after = count_engine_files(&dir);
+    assert_eq!(after, 0);
+
+    assert!(
+        prewarm_persistence_postcondition_failed(1, after),
+        "fresh_compiles=1 with after=0 must trigger the postcondition"
+    );
+}
+
+/// Profile-update case: the engine file already existed before this shape
+/// was compiled (from a previous shape's cold compile), and TRT EP rewrote
+/// it in-place.  `after == before == 1`, delta == 0.
+///
+/// The postcondition must NOT fire — the file is still there.
+#[test]
+fn count_engine_files_profile_update_passes_postcondition() {
     use super::trt_cache::count_engine_files;
     use std::fs;
     use tempfile::TempDir;
@@ -622,23 +612,39 @@ fn count_engine_files_zero_delta_triggers_postcondition() {
     let dir = tmp.path().join("trt-engines");
     fs::create_dir_all(&dir).unwrap();
 
-    // Fake "compile success without persistence": the directory is
-    // never written to, even though the prewarm aggregator believes
-    // a fresh compile happened.
-    let before = count_engine_files(&dir);
-    let after = count_engine_files(&dir);
-    let delta = i64::try_from(after).unwrap() - i64::try_from(before).unwrap();
+    // Write an engine file to simulate the state after the first compile.
+    fs::write(
+        dir.join("TensorrtExecutionProvider_TRTKernel_a_sm89.engine"),
+        b"plan-v1",
+    )
+    .unwrap();
 
+    // Simulate TRT EP "rewriting in-place": overwrite with updated profile.
+    fs::write(
+        dir.join("TensorrtExecutionProvider_TRTKernel_a_sm89.engine"),
+        b"plan-v2-extended-profile",
+    )
+    .unwrap();
+
+    let after = count_engine_files(&dir);
+    assert_eq!(after, 1, "in-place rewrite must not change the file count");
+
+    // 15 more fresh compiles happened (shapes 2-16 of a 16-shape shard),
+    // each reusing/rewriting the same file.  after==1 must pass.
     assert!(
-        prewarm_persistence_postcondition_failed(1, delta),
-        "fresh_compiles=1 with zero delta must trigger the postcondition"
+        !prewarm_persistence_postcondition_failed(15, after),
+        "fresh_compiles=15 with after=1 must pass (profile-update case)"
+    );
+    assert!(
+        !prewarm_persistence_suspicious_undercount(15, after),
+        "WARN must be silent for profile-update case"
     );
 }
 
 /// Ensure the postcondition is satisfied when the directory is
 /// populated between `_before` and `_after` snapshots.
 #[test]
-fn count_engine_files_positive_delta_passes_postcondition() {
+fn count_engine_files_positive_after_passes_postcondition() {
     use super::trt_cache::count_engine_files;
     use std::fs;
     use tempfile::TempDir;
@@ -647,17 +653,15 @@ fn count_engine_files_positive_delta_passes_postcondition() {
     let dir = tmp.path().join("trt-engines");
     fs::create_dir_all(&dir).unwrap();
 
-    let before = count_engine_files(&dir);
     fs::write(
         dir.join("TensorrtExecutionProvider_TRTKernel_a_sm89.engine"),
         b"plan",
     )
     .unwrap();
     let after = count_engine_files(&dir);
-    let delta = i64::try_from(after).unwrap() - i64::try_from(before).unwrap();
 
     assert!(
-        !prewarm_persistence_postcondition_failed(1, delta),
+        !prewarm_persistence_postcondition_failed(1, after),
         "a single fresh compile that wrote one engine must pass"
     );
 }

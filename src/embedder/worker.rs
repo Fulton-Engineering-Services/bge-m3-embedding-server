@@ -313,7 +313,7 @@ pub(super) fn run_worker(
         // the postcondition check at the end of the warmup-only path in
         // lib.rs, intended to catch the silent-persistence failure mode that
         // produced the 2026-05 codekeeper outage.
-        if prewarm_persistence_postcondition_failed(stats.fresh_compiles, stats.engine_count_delta)
+        if prewarm_persistence_postcondition_failed(stats.fresh_compiles, stats.engine_count_after)
         {
             tracing::error!(
                 worker_id = id,
@@ -329,7 +329,7 @@ pub(super) fn run_worker(
             );
         } else if prewarm_persistence_suspicious_undercount(
             stats.fresh_compiles,
-            stats.engine_count_delta,
+            stats.engine_count_after,
         ) {
             // Non-fatal: TRT EP can legitimately reuse a single `.engine`
             // file across many input shapes (engine plans are keyed by

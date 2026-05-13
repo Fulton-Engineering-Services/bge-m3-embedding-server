@@ -99,11 +99,18 @@ pub(super) fn run_warmup_shape(
             let engine_count_increased = engine_count_after > engine_count_before;
 
             // A non-cache-hit run that reports `Ok(_)` from session.run() but
-            // does not increase the on-disk `.engine` count is the silent
-            // failure mode behind the 2026-05 codekeeper outage. A WARN here
-            // surfaces it in CloudWatch BEFORE downstream traffic notices
-            // a perpetually cold cache.
-            if !cache_hit && !engine_count_increased {
+            // leaves the on-disk `.engine` count at zero is the silent failure
+            // mode behind the 2026-05 codekeeper outage.
+            //
+            // NOTE: The condition is `engine_count_after == 0`, NOT
+            // `!engine_count_increased`. ORT's TRT EP writes one profile-based
+            // engine file that covers all (batch, seq) shapes via [min, max]
+            // ranges — it rewrites that file in-place as the profile expands,
+            // so `engine_count_before == engine_count_after` (delta == 0) is
+            // the normal steady-state after the first compile. A WARN on every
+            // delta==0 shape is a false positive; WARN only when no file
+            // exists at all.
+            if !cache_hit && engine_count_after == 0 {
                 tracing::warn!(
                     worker_id,
                     batch,
@@ -115,8 +122,8 @@ pub(super) fn run_warmup_shape(
                     engine_count_before,
                     engine_count_after,
                     cache_path = %engine_cache_dir.display(),
-                    "TensorRT pre-warm: compile-success log fired but engine_count did not \
-                     increase — TRT EP may be silently failing to persist engine plan files"
+                    "TensorRT pre-warm: compile-success log fired but engine_count is still \
+                     zero — TRT EP may not be persisting engine plan files"
                 );
             }
 
