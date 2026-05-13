@@ -101,6 +101,23 @@ pub(crate) fn timing_cache_path(cache_dir: &Path) -> PathBuf {
 /// whether the persistent cache is being reused or whether the container
 /// must compile every shape from scratch.
 ///
+/// In addition to the count snapshot, this function performs a one-shot
+/// write/read/delete probe of a sentinel file (`.write_probe`) under the
+/// cache directory so operators can definitively rule in/out filesystem
+/// permission and EFS-AP issues at next boot. The probe emits one of:
+///
+/// * `INFO "trt cache: write probe succeeded"` (greppable; carries
+///   `cache_path`, `bytes_written`, `bytes_read_back`)
+/// * `ERROR "trt cache: write probe failed"` (greppable; carries
+///   `cache_path`, `phase`, `error`) — `phase` is `create` / `write` /
+///   `read` / `mismatch` / `unlink` so operators can see exactly which
+///   syscall in the round-trip blocked.
+///
+/// The probe is best-effort: a failed probe does not abort startup — TRT
+/// will surface the same problem (loudly, now that `error_on_failure` is
+/// set on the EP dispatch) on the first engine compile if writes are
+/// genuinely blocked.
+///
 /// Logs a `WARN` (but does not error) if the directory cannot be created —
 /// TRT will fail in a more diagnostic way on the next compile attempt, and
 /// surfacing the error here would mask CPU-EP startup paths that share this
@@ -122,12 +139,137 @@ pub(crate) fn ensure_and_inspect(cache_dir: &Path) -> TrtCacheInfo {
         };
     }
 
+    run_write_probe(&path);
+
     let (engine_count, profile_count) = count_cache_entries(&path);
     TrtCacheInfo {
         path,
         engine_count,
         profile_count,
     }
+}
+
+/// One-shot write/read/delete sentinel probe under `dir`.
+///
+/// The probe rules in/out the "EFS access point POSIX uid mapping blocks
+/// regular `creat(2) + write(2) + unlink(2)`" hypothesis at next boot.
+/// It writes a 9-byte sentinel `b"trt-probe"` to `<dir>/.write_probe`,
+/// reads it back, verifies the round-trip, and deletes the file. Each
+/// distinct failure mode (`create`, `write`, `read`, `mismatch`, `unlink`)
+/// fires a tagged `ERROR` so operators can disambiguate without
+/// instrumenting the filesystem from outside.
+///
+/// The probe path is fixed (`.write_probe`) so it is greppable and never
+/// collides with TRT's own filenames (which all begin with
+/// `TensorrtExecutionProvider_TRTKernel_`). Hidden by leading dot so
+/// `count_cache_entries` and `count_engine_files` ignore it without any
+/// extra filtering.
+fn run_write_probe(dir: &Path) {
+    use std::io::{Read, Write};
+
+    const PROBE_NAME: &str = ".write_probe";
+    const PROBE_DATA: &[u8] = b"trt-probe";
+
+    let probe_path = dir.join(PROBE_NAME);
+
+    // Best-effort cleanup of any stale probe file from a previous boot —
+    // this is not the failure mode we are testing, so silently ignore the
+    // `NotFound` case and let the create call below surface real problems.
+    let _ = std::fs::remove_file(&probe_path);
+
+    let create = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&probe_path);
+    let mut file = match create {
+        Ok(f) => f,
+        Err(e) => {
+            tracing::error!(
+                cache_path = %dir.display(),
+                phase = "create",
+                error = %e,
+                "trt cache: write probe failed"
+            );
+            return;
+        }
+    };
+
+    if let Err(e) = file.write_all(PROBE_DATA) {
+        tracing::error!(
+            cache_path = %dir.display(),
+            phase = "write",
+            error = %e,
+            "trt cache: write probe failed"
+        );
+        let _ = std::fs::remove_file(&probe_path);
+        return;
+    }
+    drop(file);
+
+    let mut buf = Vec::with_capacity(PROBE_DATA.len());
+    let mut reader = match std::fs::File::open(&probe_path) {
+        Ok(f) => f,
+        Err(e) => {
+            tracing::error!(
+                cache_path = %dir.display(),
+                phase = "read",
+                error = %e,
+                "trt cache: write probe failed"
+            );
+            let _ = std::fs::remove_file(&probe_path);
+            return;
+        }
+    };
+    if let Err(e) = reader.read_to_end(&mut buf) {
+        tracing::error!(
+            cache_path = %dir.display(),
+            phase = "read",
+            error = %e,
+            "trt cache: write probe failed"
+        );
+        let _ = std::fs::remove_file(&probe_path);
+        return;
+    }
+    drop(reader);
+
+    if buf != PROBE_DATA {
+        tracing::error!(
+            cache_path = %dir.display(),
+            phase = "mismatch",
+            bytes_written = PROBE_DATA.len(),
+            bytes_read_back = buf.len(),
+            "trt cache: write probe failed"
+        );
+        let _ = std::fs::remove_file(&probe_path);
+        return;
+    }
+
+    if let Err(e) = std::fs::remove_file(&probe_path) {
+        // Read+write succeeded but unlink didn't — still emit the success
+        // INFO so the success-path counter is accurate, then a separate
+        // ERROR documenting the unlink failure (the directory will
+        // accumulate `.write_probe` files across restarts otherwise).
+        tracing::info!(
+            cache_path = %dir.display(),
+            bytes_written = PROBE_DATA.len(),
+            bytes_read_back = buf.len(),
+            "trt cache: write probe succeeded"
+        );
+        tracing::error!(
+            cache_path = %dir.display(),
+            phase = "unlink",
+            error = %e,
+            "trt cache: write probe failed"
+        );
+        return;
+    }
+
+    tracing::info!(
+        cache_path = %dir.display(),
+        bytes_written = PROBE_DATA.len(),
+        bytes_read_back = buf.len(),
+        "trt cache: write probe succeeded"
+    );
 }
 
 /// Counts `.engine` and `.profile` files in `dir`. Returns `(0, 0)` if the
@@ -575,5 +717,104 @@ mod tests {
         let post = ensure_and_inspect(cache_root);
         assert_eq!(post.engine_count, 1);
         assert_eq!(post.profile_count, 1);
+    }
+
+    /// On a writable directory, the probe runs to completion and leaves
+    /// no `.write_probe` artifact behind for `count_cache_entries` to
+    /// stumble over.
+    #[test]
+    fn write_probe_leaves_no_artifact_on_success() {
+        let tmp = TempDir::new().expect("tempdir");
+        let dir = tmp.path().join("trt-engines");
+        fs::create_dir_all(&dir).unwrap();
+
+        run_write_probe(&dir);
+
+        // Probe file must be gone (otherwise it would accumulate across
+        // restarts and pollute the engine_count signal).
+        assert!(
+            !dir.join(".write_probe").exists(),
+            "write probe must clean up its sentinel on success"
+        );
+    }
+
+    /// `ensure_and_inspect` must NOT count the transient `.write_probe`
+    /// sentinel as either an engine or a profile, even if the probe is
+    /// running in parallel with other work. This is enforced by the
+    /// dot-prefixed name and the `.engine` / `.profile` suffix filter in
+    /// `count_cache_entries`. We assert it directly here so a future
+    /// refactor that changes the suffix filter would catch it.
+    #[test]
+    fn write_probe_artifact_is_never_counted_as_engine() {
+        let tmp = TempDir::new().expect("tempdir");
+        let dir = tmp.path().join("trt-engines");
+        fs::create_dir_all(&dir).unwrap();
+
+        // Simulate a stuck probe file (e.g. from a prior crash).
+        fs::write(dir.join(".write_probe"), b"trt-probe").unwrap();
+        // Plus a real engine file to anchor the assertion.
+        fs::write(
+            dir.join("TensorrtExecutionProvider_TRTKernel_a_b_sm89.engine"),
+            b"plan",
+        )
+        .unwrap();
+
+        let (engines, profiles) = count_cache_entries(&dir);
+        assert_eq!(
+            engines, 1,
+            "stale .write_probe must not be miscounted as an engine"
+        );
+        assert_eq!(
+            profiles, 0,
+            ".write_probe must not be miscounted as a profile either"
+        );
+    }
+
+    /// Stale probe files left over from a prior crashed boot must be
+    /// cleaned up by the next probe run, not multiplied. Documents the
+    /// idempotence contract of `run_write_probe`.
+    #[test]
+    fn write_probe_overwrites_stale_artifact_idempotently() {
+        let tmp = TempDir::new().expect("tempdir");
+        let dir = tmp.path().join("trt-engines");
+        fs::create_dir_all(&dir).unwrap();
+
+        // Simulate a stale probe file from a previous crashed boot.
+        fs::write(dir.join(".write_probe"), b"stale-data").unwrap();
+
+        run_write_probe(&dir);
+
+        assert!(
+            !dir.join(".write_probe").exists(),
+            "stale probe must be cleaned up after a successful run"
+        );
+    }
+
+    /// On Linux only: a directory with `0o555` (read+execute, no write)
+    /// must produce a probe failure rather than panicking. This is the
+    /// closest standalone unit-test analogue of the EFS-AP-blocks-write
+    /// scenario described in the production gotcha. The probe should
+    /// log an ERROR and return without aborting startup.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn write_probe_failure_does_not_panic_on_readonly_dir() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = TempDir::new().expect("tempdir");
+        let dir = tmp.path().join("trt-engines");
+        fs::create_dir_all(&dir).unwrap();
+
+        // Drop write permission before running the probe.
+        let mut perms = fs::metadata(&dir).unwrap().permissions();
+        perms.set_mode(0o555);
+        fs::set_permissions(&dir, perms).unwrap();
+
+        // Probe must return cleanly (logs an ERROR with phase=create).
+        run_write_probe(&dir);
+
+        // Restore write permission so TempDir's cleanup can proceed.
+        let mut perms = fs::metadata(&dir).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&dir, perms).unwrap();
     }
 }

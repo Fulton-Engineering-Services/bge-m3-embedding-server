@@ -23,15 +23,35 @@ RUN BASE="https://static.rust-lang.org/rustup/archive/${RUSTUP_VERSION}/x86_64-u
 ENV PATH="/root/.cargo/bin:${PATH}"
 
 # Download the pinned ORT prebuilt for CUDA + TensorRT, verify SHA-256, then extract.
-# The pyke.io CDN publishes an "nvrtx" (NVIDIA TensorRT) prebuilt for
-# x86_64-unknown-linux-gnu that includes both the CUDA EP and the TensorRT EP.
-# Checksum taken from ort-sys-2.0.0-rc.12/build/download/dist.txt (feature set "nvrtx").
+#
+# IMPORTANT — pyke.io artifact selection (corrected after the 2026-05 codekeeper outage):
+# The previous build used the "nvrtx" feature artifact. Inspection of that archive
+# (`x86_64-unknown-linux-gnu+nvrtx.tar.lzma2`) showed it contains ONLY:
+#   - libonnxruntime.a
+#   - libonnxruntime_providers_shared.so
+#   - libonnxruntime_providers_nv_tensorrt_rtx.so   <-- new "NvTensorRtRtx" EP
+# It does NOT contain `libonnxruntime_providers_tensorrt.so`, the standard
+# `TensorrtExecutionProvider` EP that our Rust code requests via
+# `ort::ep::TensorRT`. With that .so missing at runtime, ORT silently falls
+# back to MLAS/CPU when our code asks for TensorRT, no engines are written
+# to `{BGE_M3_CACHE_DIR}/trt-engines/`, and `session.run()` keeps returning
+# `Ok(_)` because CPU inference works fine. That was the entire 2026-05
+# silent-persistence failure mode.
+#
+# The "cu12" feature artifact contains BOTH EPs (verified by extracting the
+# tarball and listing contents):
+#   - libonnxruntime.a
+#   - libonnxruntime_providers_cuda.so
+#   - libonnxruntime_providers_nv_tensorrt_rtx.so
+#   - libonnxruntime_providers_shared.so
+#   - libonnxruntime_providers_tensorrt.so          <-- the EP we actually need
+# Checksum taken from ort-sys-2.0.0-rc.12/build/download/dist.txt (feature set "cu12").
 # Same lzma2 FORMAT_RAW extraction as the CPU Dockerfile (no XZ container).
 ARG ORT_VERSION=1.24.2
-ARG ORT_NVRTX_URL=https://cdn.pyke.io/0/pyke:ort-rs/ms@1.24.2/x86_64-unknown-linux-gnu+nvrtx.tar.lzma2
-ARG ORT_NVRTX_SHA256=41a35588fd9f7cb6c570e82d3cb6cc6de2dd6fa09bac751dd8890c07d8f1e5d1
-RUN curl --proto '=https' --tlsv1.2 -sSfL "$ORT_NVRTX_URL" -o /tmp/ort.tar.lzma2 \
-    && echo "${ORT_NVRTX_SHA256}  /tmp/ort.tar.lzma2" | sha256sum -c - \
+ARG ORT_CU12_URL=https://cdn.pyke.io/0/pyke:ort-rs/ms@1.24.2/x86_64-unknown-linux-gnu+cu12.tar.lzma2
+ARG ORT_CU12_SHA256=6e7848acdb7284feb44e2781583a90e820839767459ad8fa2abf7dd63b731fd9
+RUN curl --proto '=https' --tlsv1.2 -sSfL "$ORT_CU12_URL" -o /tmp/ort.tar.lzma2 \
+    && echo "${ORT_CU12_SHA256}  /tmp/ort.tar.lzma2" | sha256sum -c - \
     && python3 -c "import lzma, tarfile, io, os; data = open('/tmp/ort.tar.lzma2', 'rb').read(); dec = lzma.decompress(data, format=lzma.FORMAT_RAW, filters=[{'id': lzma.FILTER_LZMA2, 'dict_size': 1<<26}]); os.makedirs('/opt/ort', exist_ok=True); tf = tarfile.open(fileobj=io.BytesIO(dec)); tf.extractall('/opt/ort', filter='data'); tf.close()" \
     && rm /tmp/ort.tar.lzma2
 ENV ORT_LIB_LOCATION=/opt/ort
@@ -57,13 +77,39 @@ RUN touch src/main.rs && cargo build --release --features cuda,tensorrt
 # image (no nvcc, no headers, no static libraries).
 FROM nvidia/cuda:12.6.0-cudnn-runtime-ubuntu24.04
 
+# Install the TensorRT 10 runtime libraries that
+# `libonnxruntime_providers_tensorrt.so` `dlopen`s at runtime.
+#
+# The pyke.io ORT prebuilt links against `libnvinfer.so.10`, `libnvinfer_plugin.so.10`,
+# and `libnvonnxparser.so.10` (per `nm`/`strings` on `libonnxruntime_providers_tensorrt.so`).
+# Without these, ORT's TRT EP registration would fail loudly at startup
+# (now that `error_on_failure` is set on the dispatch in `session.rs`).
+# NVIDIA's CUDA APT repo carries them as `libnvinfer-dispatch10`,
+# `libnvinfer-plugin10`, and `libnvonnxparsers10` for Ubuntu 24.04 x86_64.
+#
+# Note: we deliberately do NOT install `libnvinfer-headers-dev` or `libnvinfer-bin`
+# — those are devel/builder-side. Only the runtime `.so`s are needed here.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl libssl3t64 \
+       libnvinfer10 libnvinfer-plugin10 libnvonnxparsers10 \
     && rm -rf /var/lib/apt/lists/*
 
 # UID/GID must match EFS model-cache access point in Codekeeper CDK (10002).
 RUN groupadd --gid 10002 bge \
     && useradd --uid 10002 --gid bge --no-create-home --shell /sbin/nologin bge
+
+# Copy the ORT provider shared libraries from the builder.
+# `libonnxruntime.a` is statically linked into the binary at build time, but
+# the per-EP factories live in dynamically-loaded shared libraries that ORT
+# `dlopen`s on first registration. They must be present on the runtime
+# image's library path or registration fails (silently, before this fix —
+# loudly, after it). `/usr/local/lib/onnxruntime/` is added to the linker
+# search path via the `.conf` file below.
+COPY --from=builder /opt/ort/libonnxruntime_providers_shared.so /usr/local/lib/onnxruntime/
+COPY --from=builder /opt/ort/libonnxruntime_providers_tensorrt.so /usr/local/lib/onnxruntime/
+COPY --from=builder /opt/ort/libonnxruntime_providers_cuda.so /usr/local/lib/onnxruntime/
+RUN echo "/usr/local/lib/onnxruntime" > /etc/ld.so.conf.d/onnxruntime.conf \
+    && ldconfig
 
 COPY --from=builder /app/target/release/bge-m3-embedding-server /usr/local/bin/
 USER bge

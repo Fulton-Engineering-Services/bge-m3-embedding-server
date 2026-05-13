@@ -1,6 +1,6 @@
 [package]
 name = "bge-m3-embedding-server"
-version = "1.2.0-rc12"
+version = "1.2.0-rc13"
 edition = "2021"
 license = "Apache-2.0"
 description = "Axum HTTP server serving BGE-M3 dense and sparse embeddings via ONNX Runtime"
@@ -24,7 +24,14 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 arc-swap = "1"
-ort = { version = "=2.0.0-rc.12", features = ["coreml", "ndarray", "std", "api-24"], default-features = false }
+## `tracing` is required so the ORT crate's own `crate::info!`/`warn!`/`error!`
+## calls — including `apply_execution_providers`' "Successfully registered" /
+## "Couldn't register" / "An error occurred when attempting to register" lines
+## and the C-side `tracing_logger` callback — actually fire. Without it, ORT
+## registration failures are completely silent, which masked the
+## `nvrtx`-prebuilt / standard-TRT-EP-missing failure that produced the
+## 2026-05 codekeeper outage. Greppable in CloudWatch via `target=ort` events.
+ort = { version = "=2.0.0-rc.12", features = ["coreml", "ndarray", "std", "api-24", "tracing"], default-features = false }
 hf-hub = "0.5"
 tokenizers = { version = "0.23", default-features = false, features = ["onig"] }
 safetensors = "0.7"

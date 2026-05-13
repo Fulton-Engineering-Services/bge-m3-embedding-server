@@ -105,8 +105,22 @@ pub(super) fn execution_providers(
                 engine_cache_path = %cache_info.path.display(),
                 timing_cache_path = %timing_cache.display(),
                 fp16 = true,
+                error_on_failure = true,
                 "ORT execution providers configured"
             );
+            // `.error_on_failure()` upgrades the default silent-CPU-fallback
+            // path to a hard error. ORT's `apply_execution_providers` defaults
+            // `error_on_failure = false`, which means a failed registration
+            // (e.g. `libonnxruntime_providers_tensorrt.so` missing from the
+            // image — the 2026-05 codekeeper outage root cause) is logged as
+            // a `WARN`/`ERROR` via the `ort` crate's internal tracing macros
+            // and the loop falls back to CPU/MLAS without surfacing the
+            // failure. With this set, `Session::builder().with_execution_providers(...)`
+            // returns the error verbatim, which `load_session` already
+            // converts into a worker-load failure — the worker exits non-zero
+            // instead of silently serving CPU inference. Greppable in
+            // CloudWatch via the new field `error_on_failure: true` on the
+            // "ORT execution providers configured" event.
             return vec![ort::ep::TensorRT::default()
                 .with_device_id(device_id.cast_signed())
                 .with_engine_cache(true)
@@ -114,7 +128,8 @@ pub(super) fn execution_providers(
                 .with_timing_cache(true)
                 .with_timing_cache_path(timing_cache.display().to_string())
                 .with_fp16(true)
-                .build()];
+                .build()
+                .error_on_failure()];
         }
 
         // Linux CUDA (feature-gated).
@@ -125,11 +140,13 @@ pub(super) fn execution_providers(
                 ep_selection = %ep,
                 ep_active = "CUDA",
                 device_id,
+                error_on_failure = true,
                 "ORT execution providers configured"
             );
             return vec![ort::ep::CUDA::default()
                 .with_device_id(device_id.cast_signed())
-                .build()];
+                .build()
+                .error_on_failure()];
         }
 
         // CPU fallback (always available).
