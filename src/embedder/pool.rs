@@ -29,6 +29,52 @@ use super::types::{DualEmbedding, EmbedRequest, EmbedStats, ProbeResult, SparseE
 use super::worker::{run_worker, WorkerConfig};
 use crate::config::EpSelection;
 
+/// Awaits worker `id`'s readiness signal, but also resolves immediately if the
+/// worker's `JoinHandle` finishes before signaling readiness.
+///
+/// This is the defensive half of the leader-failure fix: `EmbedPool::spawn`
+/// itself owns the original `ready_tx`, which it cannot drop until after every
+/// follower has been spawned. If the worker panics — or for any future reason
+/// drops its `ready_tx` clone before sending — `ready_rx.recv()` would never
+/// see `None` (the init task's own clone is still alive) and the init future
+/// would park forever. Selecting on the `JoinHandle` guarantees we always make
+/// progress when the worker exits, regardless of whether the worker had a
+/// chance to send its outcome.
+///
+/// Returns the worker's `rss_delta` on success. Both branches are propagated
+/// as a typed `Result<usize>` so callers can short-circuit with `?` and avoid
+/// duplicating error-construction logic at every spawn site.
+async fn await_worker_signal(
+    id: usize,
+    handle: &mut JoinHandle<Result<()>>,
+    ready_rx: &mut mpsc::Receiver<Result<usize>>,
+) -> Result<usize> {
+    tokio::select! {
+        // Bias toward the explicit ready signal: if the worker both sent
+        // `Err(...)` and then returned `Err(...)`, both branches are ready and
+        // the in-band failure message is more actionable than the join error.
+        biased;
+        msg = ready_rx.recv() => match msg {
+            Some(Ok(delta)) => Ok(delta),
+            Some(Err(e)) => Err(anyhow::anyhow!("Worker {id} failed to load models: {e}")),
+            None => Err(anyhow::anyhow!(
+                "Worker {id} exited before signaling readiness"
+            )),
+        },
+        join_res = handle => match join_res {
+            Ok(Ok(())) => Err(anyhow::anyhow!(
+                "Worker {id} exited cleanly without signaling readiness"
+            )),
+            Ok(Err(e)) => Err(anyhow::anyhow!(
+                "Worker {id} exited with error before signaling ready: {e}"
+            )),
+            Err(panic_err) => Err(anyhow::anyhow!(
+                "Worker {id} panicked before signaling ready: {panic_err}"
+            )),
+        },
+    }
+}
+
 /// Async handle to the embedding worker thread pool.
 ///
 /// Wraps a bounded `mpsc` channel shared by `n` `spawn_blocking` worker threads.
@@ -162,26 +208,15 @@ impl EmbedPool {
                 let mut rss_deltas: Vec<usize> = Vec::with_capacity(n);
 
                 // --- Phase 1: spawn leader worker (may download models) ---
-                worker_handles.push(spawn_worker(0, ready_tx.clone(), make_worker_config(0)));
-
-                match ready_rx.recv().await {
-                    Some(Ok(delta)) => {
-                        loaded_workers_for_init.fetch_add(1, Ordering::AcqRel);
-                        rss_deltas.push(delta);
-                        info!(
-                            rss_delta_mb = delta / (1024 * 1024),
-                            "Leader worker ready, model cache warm (1/{n})"
-                        );
-                    }
-                    Some(Err(e)) => {
-                        return Err(anyhow::anyhow!("Leader worker failed to load models: {e}"));
-                    }
-                    None => {
-                        return Err(anyhow::anyhow!(
-                            "Leader worker exited before signaling readiness"
-                        ));
-                    }
-                }
+                let mut leader_handle = spawn_worker(0, ready_tx.clone(), make_worker_config(0));
+                let leader_msg = await_worker_signal(0, &mut leader_handle, &mut ready_rx).await?;
+                worker_handles.push(leader_handle);
+                loaded_workers_for_init.fetch_add(1, Ordering::AcqRel);
+                rss_deltas.push(leader_msg);
+                info!(
+                    rss_delta_mb = leader_msg / (1024 * 1024),
+                    "Leader worker ready, model cache warm (1/{n})"
+                );
 
                 // --- Phase 2: spawn follower workers one at a time.
                 //
@@ -197,27 +232,16 @@ impl EmbedPool {
                 // Startup cost: ~4-6s per worker × 6 followers ≈ 24-36s total,
                 // well within the configured startPeriod (300s).
                 for id in 1..n {
-                    worker_handles.push(spawn_worker(id, ready_tx.clone(), make_worker_config(id)));
-
-                    match ready_rx.recv().await {
-                        Some(Ok(delta)) => {
-                            loaded_workers_for_init.fetch_add(1, Ordering::AcqRel);
-                            rss_deltas.push(delta);
-                            info!(
-                                rss_delta_mb = delta / (1024 * 1024),
-                                "Follower worker signaled ready ({}/{n})",
-                                id + 1
-                            );
-                        }
-                        Some(Err(e)) => {
-                            return Err(anyhow::anyhow!("Worker {id} failed to load models: {e}"));
-                        }
-                        None => {
-                            return Err(anyhow::anyhow!(
-                                "Worker {id} exited before signaling readiness ({id}/{n})"
-                            ));
-                        }
-                    }
+                    let mut handle = spawn_worker(id, ready_tx.clone(), make_worker_config(id));
+                    let delta = await_worker_signal(id, &mut handle, &mut ready_rx).await?;
+                    worker_handles.push(handle);
+                    loaded_workers_for_init.fetch_add(1, Ordering::AcqRel);
+                    rss_deltas.push(delta);
+                    info!(
+                        rss_delta_mb = delta / (1024 * 1024),
+                        "Follower worker signaled ready ({}/{n})",
+                        id + 1
+                    );
                 }
 
                 drop(ready_tx);

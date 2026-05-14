@@ -70,6 +70,28 @@ pub(super) fn download_model_files(
     show_progress: bool,
     variant: ModelVariant,
 ) -> Result<ModelFiles> {
+    // Fail fast if the cache directory is structurally invalid (e.g. a path
+    // component is a regular file or a non-directory device, the parent is
+    // read-only, or the operator pointed `BGE_M3_CACHE_DIR` at something we
+    // can never write to). `create_dir_all` is idempotent on an already-valid
+    // directory, so this is a no-op on a healthy production setup. The check
+    // is cheap and runs before any network syscall.
+    //
+    // Without this check, `hf_hub::ApiBuilder` defers cache validation until
+    // mid-download — after a `metadata()` HTTP round-trip that has *no*
+    // default ureq timeout. On a runner with a misconfigured cache dir AND
+    // unreliable IPv6 connectivity (notably GitHub Actions), the connect
+    // call to huggingface.co blocks indefinitely instead of letting the
+    // doomed mkdir surface as the actual cause. That hang reaches all the
+    // way up to `EmbedPool::spawn`'s init task, which never sees a ready
+    // signal — manifesting as the spawn-tests timeout on CI.
+    std::fs::create_dir_all(cache_dir).map_err(|e| {
+        anyhow::anyhow!(
+            "Cannot create or access model cache directory {}: {e}",
+            cache_dir.display()
+        )
+    })?;
+
     let (repo_id, repo_revision) = match variant {
         ModelVariant::Fp32 => (REPO_ID, REPO_REVISION),
         ModelVariant::Fp16 | ModelVariant::Int8 => (XENOVA_REPO_ID, XENOVA_REPO_REVISION),
@@ -139,4 +161,43 @@ pub(super) fn download_model_files(
         onnx_path,
         tokenizer_path,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::ModelVariant;
+
+    /// `download_model_files` must fail synchronously — without ever issuing a
+    /// network request — when the cache directory is structurally impossible
+    /// to create. `/dev/null/impossible` is the canonical bad-cache fixture
+    /// used by `EmbedPool::spawn` tests: `/dev/null` is a character device on
+    /// every Unix, so `mkdir /dev/null/impossible` reliably returns ENOTDIR.
+    ///
+    /// Regression guard: before the upfront `create_dir_all` validation,
+    /// hf-hub's lazy cache layout meant this code path executed a metadata
+    /// HTTP call to huggingface.co first and only attempted the doomed mkdir
+    /// inside the download flow. On runners with no IPv6 connectivity and
+    /// ureq's default `None` connect timeout, that call blocked indefinitely
+    /// and the leader-failure spawn tests timed out on CI.
+    #[cfg(unix)]
+    #[test]
+    fn download_model_files_fails_fast_on_unwritable_cache_dir() {
+        let bad = Path::new("/dev/null/impossible");
+        let started = std::time::Instant::now();
+        let result = download_model_files(bad, false, ModelVariant::Fp32);
+        let elapsed = started.elapsed();
+        let Err(err) = result else {
+            panic!("expected Err for an unwritable cache dir, got Ok");
+        };
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "validation should fail without a network round-trip; took {elapsed:?}"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("cache directory"),
+            "error should mention the cache directory; got: {msg}"
+        );
+    }
 }
