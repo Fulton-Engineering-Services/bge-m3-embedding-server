@@ -14,16 +14,113 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `BGE_M3_GPU_VRAM_BUDGET_BYTES` environment variable — VRAM workspace ceiling (default 10 GiB)
   when a GPU EP is active. The host-RAM startup probe is bypassed when `BGE_M3_EP` is `cuda` or
   `tensorrt`.
-- `Dockerfile.cuda` — multi-stage CUDA image based on `nvidia/cuda:12.6.0-cudnn-*-ubuntu24.04`
-  (linux/amd64 only). Uses the `download-ort` feature to fetch a CUDA+TRT-enabled ORT binary at
-  build time.
+- `BGE_M3_GPU_COUNT` environment variable — number of GPU devices on the instance.
+  Auto-detected on Linux from `/proc/driver/nvidia/gpus/`; defaults to `1` on macOS and on
+  Linux without an NVIDIA driver. Used to clamp `BGE_M3_WORKERS` and to pin each worker to a
+  distinct CUDA device (`device_id = worker_index % gpu_count`).
+- `BGE_M3_TRT_WARMUP_SHAPES` environment variable — pre-compiles TensorRT engine files for a
+  configurable set of `(batch, seq)` shapes during worker startup. Default is a 16-shape 2D
+  grid `{1, 4, 16, 32} × {128, 512, 2048, 8192}` in batch-major order. Multi-worker runs
+  automatically stride-partition the grid so each GPU compiles a disjoint subset in parallel,
+  reducing cold-compile wall-clock time roughly proportionally to GPU count.
+- `BGE_M3_WARMUP_ONLY` environment variable — when `1`, the server initialises normally,
+  compiles + fsyncs all configured TRT engine files, then exits 0. No HTTP listener is bound.
+  Designed as an ECS init container that pre-populates the shared TRT engine cache before the
+  main container starts, so `/health` reaches `ok` in seconds rather than 90–180 minutes on a
+  cold cache. Heartbeat logging (including the per-device GPU heartbeat) still fires during
+  warmup so operators can monitor VRAM and temperature in CloudWatch while engines compile.
+- TensorRT engine-cache durability — every regular file under `{BGE_M3_CACHE_DIR}/trt-engines/`
+  plus the directory itself is fsynced after each successful warmup compile, so an ECS
+  `OutOfMemoryError` SIGKILL (`exitCode 137`) cannot strand a half-written engine plan in the
+  kernel page cache. Cache state is logged at every container start as `trt cache: found N
+  cached engines at <path>` (warm) or `trt cache: empty (will compile)` (cold).
+- TensorRT timing cache at `{BGE_M3_CACHE_DIR}/trt-timing` — persists per-tactic kernel timings
+  so the TRT builder can skip tactic-selection on subsequent engine builds. Enabled
+  unconditionally alongside the engine cache.
+- TRT warm-cache fast path — `trt_prewarm` runs at most 4 dimensional-extreme `(batch, seq)`
+  shapes (one per `min_batch`, `max_batch`, `min_seq`, `max_seq`); if all four are under
+  `CACHE_HIT_THRESHOLD_MS = 5000 ms` the remaining warmup shapes are skipped as `fully_cached:
+  true`, eliminating ~16–48 s of redundant cache-hit loads on every warm restart. Zero false
+  positives: an in-range hit on all four extremes mathematically guarantees every shard shape is
+  within the cached profile range.
+- NVML-backed GPU heartbeat (GPU builds only) — one additional `INFO` log event per CUDA device
+  per heartbeat tick, with `gpu_device`, `vram_used_mb`, `vram_total_mb`,
+  `vram_utilization_pct`, `gpu_utilization_pct`, `gpu_temp_c`, and `gpu_temp_f`. Driver/library
+  unavailability is logged once at `WARN` and silently skipped — never fatal. CPU builds compile
+  the GPU stats module as a zero-cost stub with no `nvml-wrapper` dependency.
+- Build-variant log tagging — every JSON log line now starts with `"bge_module":"server"` and
+  `"build":"cuda"` (when the `cuda`/`tensorrt` features are enabled, e.g. via `Dockerfile.cuda`)
+  or `"build":"cpu"` (default `Dockerfile`, MLAS EP). Use `filter build = "cuda"` in CloudWatch
+  Logs Insights to slice a mixed CPU/CUDA fleet.
+- `BGE_M3_HEARTBEAT_SECS` environment variable — periodic heartbeat log interval (default
+  `60`s; `0` disables). Each tick logs RSS, live/loaded workers, queue depth, available
+  permits, and probe status.
+- X-* HTTP header passthrough — embedding handlers extract a configurable allowlist of `X-*`
+  request headers (e.g. `X-Request-ID`, `X-Trace-ID`) and propagate them onto the
+  `embedding request complete` log event, so router-level correlation IDs survive the
+  upstream/CPU/GPU split.
+- Client-disconnect / abandoned-request logging — workers perform two best-effort
+  `oneshot::Sender::is_closed()` checks: pre-dispatch (`request abandoned by client before
+  dispatch`) skips inference for requests that were cancelled while queued, and
+  post-completion (`request abandoned by client during inference`) logs `inference_ms_so_far`
+  + `chunks` so operators can size the router's hedge budget against actual GPU wall time.
+- `Dockerfile.cuda` — multi-stage CUDA + TensorRT image based on
+  `nvidia/cuda:12.6.0-cudnn-*-ubuntu24.04` (linux/amd64 only). Downloads the **upstream
+  Microsoft ORT GPU prebuilt** (`onnxruntime-linux-x64-gpu-{VERSION}.tgz` from the official
+  `microsoft/onnxruntime` GitHub release), verifies SHA-256, and links ORT **dynamically** via
+  `ORT_PREFER_DYNAMIC_LINK=1` so `dladdr` resolves the runtime path from
+  `libonnxruntime.so.1.24.2` (not `argv[0]`). All provider `.so` files
+  (`libonnxruntime_providers_shared.so`, `libonnxruntime_providers_tensorrt.so`,
+  `libonnxruntime_providers_cuda.so`) plus `libonnxruntime.so.1.24.2` are installed to
+  `/usr/local/bin/` next to the binary; the `libonnxruntime.so.1` SONAME symlink is recreated
+  with `RUN ln -s` (Docker COPY dereferences symlinks). The runtime stage installs
+  `libnvinfer10`, `libnvinfer-plugin10`, `libnvonnxparsers10` from NVIDIA's CUDA APT repo for
+  the standard `TensorrtExecutionProvider`. **Production builds do NOT use the `download-ort`
+  Cargo feature** — that feature is reserved for CI environments where `ORT_LIB_LOCATION` is
+  unavailable.
 - Release workflow extended: publishes `<version>-cuda` / `latest-cuda` GHCR tags alongside the
   CPU (`latest`) multi-arch image.
 
 ### Changed
-- `BGE_M3_WORKERS` is automatically clamped to `1` with a `WARN` log line when `BGE_M3_EP` is
-  `cuda` or `tensorrt`. The GPU is a serial inference resource; multiple sessions on the same GPU
-  waste VRAM without throughput benefit.
+- **`BGE_M3_WORKERS` is automatically clamped to `BGE_M3_GPU_COUNT`** (not `1`) when
+  `BGE_M3_EP` is `cuda` or `tensorrt`, with a `WARN` log line if the requested count exceeds
+  it. Each worker is pinned to a distinct CUDA device (`device_id = worker_index % gpu_count`).
+  On a single-GPU instance the default `BGE_M3_GPU_COUNT=1` preserves the previous behavior;
+  on a multi-GPU instance, set `BGE_M3_WORKERS = BGE_M3_GPU_COUNT` for maximum parallel
+  inference throughput. Multi-stream concurrency on a single GPU remains a future enhancement.
+- `ort/tracing` Cargo feature is enabled in this crate so ORT's internal `info!`/`warn!`/
+  `error!` calls — including `apply_execution_providers`'s "Successfully registered" /
+  "Couldn't register" / "An error occurred when attempting to register" lines and the C-side
+  `tracing_logger` callback — are forwarded into `tracing` and visible under `target=ort` in
+  CloudWatch.
+- `error_on_failure()` is set on the `tensorrt` and `cuda` execution-provider dispatches in
+  `src/embedder/session.rs::execution_providers`, so a failed EP registration trips a clear
+  startup error instead of silently falling back to MLAS/CPU. Net effect: missing provider
+  `.so` files, missing TensorRT runtime libs, and CUDA driver problems are now hard worker-load
+  failures, not silent CPU fallbacks.
+
+### Fixed
+- **Fail-fast model cache directory validation** — `download_model_files` now calls
+  `std::fs::create_dir_all(cache_dir)` *before* constructing any `hf_hub::ApiBuilder`. A
+  structurally invalid cache path (a path component that's a regular file or non-directory
+  device, a read-only parent, a missing EFS access-point mount) now returns
+  `"Cannot create or access model cache directory <path>: <io::Error>"` immediately, instead
+  of stalling indefinitely on `hf-hub`'s mid-download metadata HTTP call (which has no default
+  ureq connect timeout). The previous behaviour caused `EmbedPool::spawn` to park forever
+  waiting for a ready signal on misconfigured cache paths combined with unreliable IPv6
+  connectivity (notably GitHub Actions). Companion `EmbedPool::spawn` change: a new
+  `await_worker_signal` helper resolves on either the worker's readiness mpsc message or its
+  `JoinHandle` exit (biased toward the explicit ready signal), so a worker that panics or
+  exits before dropping its `ready_tx` clone now surfaces an explicit "exited before signaling
+  readiness" / "panicked before signaling ready" error instead of stalling.
+- **TensorRT prewarm postcondition uses `engine_count_after > 0`, not
+  `engine_count_delta > 0`** — ORT's TRT EP stores one profile-based `.engine` file per fused
+  subgraph and rewrites that single file in place when a new shape expands the cached
+  `[min, max]` profile, so `engine_count_delta == 0` is the normal steady-state for every
+  shape after the first cold compile. The prior `engine_count_delta <= 0` ERROR rule produced
+  false-positive errors on every shape after the first; the postcondition now correctly
+  treats `engine_count_after == 0` (no engine file at all) as the persistence failure in both
+  `prewarm_persistence_postcondition_failed` and the per-shape WARN in `runner.rs`.
 
 ## [0.15.0] - 2026-05-10
 
