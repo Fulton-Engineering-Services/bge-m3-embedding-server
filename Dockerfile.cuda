@@ -8,7 +8,7 @@ FROM nvidia/cuda:12.6.0-cudnn-devel-ubuntu24.04 AS builder
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-       curl ca-certificates build-essential pkg-config libssl-dev python3 \
+       curl ca-certificates build-essential pkg-config libssl-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # Download rustup-init, verify the official SHA-256 sidecar, then install.
@@ -22,39 +22,38 @@ RUN BASE="https://static.rust-lang.org/rustup/archive/${RUSTUP_VERSION}/x86_64-u
     && rm /tmp/rustup-init /tmp/rustup-init.sha256
 ENV PATH="/root/.cargo/bin:${PATH}"
 
-# Download the pinned ORT prebuilt for CUDA + TensorRT, verify SHA-256, then extract.
+# Download the Microsoft ORT GPU prebuilt (standard gzip tarball — no lzma2 needed),
+# verify SHA-256, then extract.
 #
-# IMPORTANT — pyke.io artifact selection (corrected after the 2026-05 codekeeper outage):
-# The previous build used the "nvrtx" feature artifact. Inspection of that archive
-# (`x86_64-unknown-linux-gnu+nvrtx.tar.lzma2`) showed it contains ONLY:
-#   - libonnxruntime.a
-#   - libonnxruntime_providers_shared.so
-#   - libonnxruntime_providers_nv_tensorrt_rtx.so   <-- new "NvTensorRtRtx" EP
-# It does NOT contain `libonnxruntime_providers_tensorrt.so`, the standard
-# `TensorrtExecutionProvider` EP that our Rust code requests via
-# `ort::ep::TensorRT`. With that .so missing at runtime, ORT silently falls
-# back to MLAS/CPU when our code asks for TensorRT, no engines are written
-# to `{BGE_M3_CACHE_DIR}/trt-engines/`, and `session.run()` keeps returning
-# `Ok(_)` because CPU inference works fine. That was the entire 2026-05
-# silent-persistence failure mode.
+# This replaces the previous pyke.io download.  The Microsoft tarball ships everything
+# we need in one archive under `lib/`:
+#   libonnxruntime.so.1.24.2          — main shared library
+#   libonnxruntime.so.1               — soname symlink (→ .1.24.2)
+#   libonnxruntime.so                 — development symlink (→ .so.1)
+#   libonnxruntime_providers_shared.so
+#   libonnxruntime_providers_tensorrt.so   ← standard TensorrtExecutionProvider
+#   libonnxruntime_providers_cuda.so
 #
-# The "cu12" feature artifact contains BOTH EPs (verified by extracting the
-# tarball and listing contents):
-#   - libonnxruntime.a
-#   - libonnxruntime_providers_cuda.so
-#   - libonnxruntime_providers_nv_tensorrt_rtx.so
-#   - libonnxruntime_providers_shared.so
-#   - libonnxruntime_providers_tensorrt.so          <-- the EP we actually need
-# Checksum taken from ort-sys-2.0.0-rc.12/build/download/dist.txt (feature set "cu12").
-# Same lzma2 FORMAT_RAW extraction as the CPU Dockerfile (no XZ container).
+# UPGRADING ORT: bump ORT_VERSION + ORT_MS_SHA256, update the `ln -s` symlink
+# version in the runtime stage below, and bump Cargo.toml `ort = "=X.Y.Z"`.
+# URL pattern: https://github.com/microsoft/onnxruntime/releases/download/v{V}/onnxruntime-linux-x64-gpu-{V}.tgz
 ARG ORT_VERSION=1.24.2
-ARG ORT_CU12_URL=https://cdn.pyke.io/0/pyke:ort-rs/ms@1.24.2/x86_64-unknown-linux-gnu+cu12.tar.lzma2
-ARG ORT_CU12_SHA256=6e7848acdb7284feb44e2781583a90e820839767459ad8fa2abf7dd63b731fd9
-RUN curl --proto '=https' --tlsv1.2 -sSfL "$ORT_CU12_URL" -o /tmp/ort.tar.lzma2 \
-    && echo "${ORT_CU12_SHA256}  /tmp/ort.tar.lzma2" | sha256sum -c - \
-    && python3 -c "import lzma, tarfile, io, os; data = open('/tmp/ort.tar.lzma2', 'rb').read(); dec = lzma.decompress(data, format=lzma.FORMAT_RAW, filters=[{'id': lzma.FILTER_LZMA2, 'dict_size': 1<<26}]); os.makedirs('/opt/ort', exist_ok=True); tf = tarfile.open(fileobj=io.BytesIO(dec)); tf.extractall('/opt/ort', filter='data'); tf.close()" \
-    && rm /tmp/ort.tar.lzma2
-ENV ORT_LIB_LOCATION=/opt/ort
+ARG ORT_MS_URL=https://github.com/microsoft/onnxruntime/releases/download/v${ORT_VERSION}/onnxruntime-linux-x64-gpu-${ORT_VERSION}.tgz
+ARG ORT_MS_SHA256=bcb42da041f42192e5579de175f7410313c114740a611e230afe9d79be65cc49
+RUN curl --proto '=https' --tlsv1.2 -sSfL "$ORT_MS_URL" -o /tmp/ort.tgz \
+    && echo "${ORT_MS_SHA256}  /tmp/ort.tgz" | sha256sum -c - \
+    && mkdir -p /opt/ort \
+    && tar xzf /tmp/ort.tgz -C /opt/ort --strip-components=1 \
+    && rm /tmp/ort.tgz
+
+# Point ort-sys at the extracted lib/ directory.
+# ORT_PREFER_DYNAMIC_LINK=1 switches ort-sys from linking libonnxruntime.a
+# statically to emitting `cargo:rustc-link-lib=dylib=onnxruntime`.
+# With dynamic linking, dladdr(&Env::Default, &dl_info) returns the path to
+# libonnxruntime.so.1.24.2 (not argv[0]), so GetRuntimePath() == dirname of
+# that .so — placing all providers in the same directory as the .so is enough.
+ENV ORT_LIB_LOCATION=/opt/ort/lib
+ENV ORT_PREFER_DYNAMIC_LINK=1
 
 WORKDIR /app
 
@@ -80,10 +79,11 @@ FROM nvidia/cuda:12.6.0-cudnn-runtime-ubuntu24.04
 # Install the TensorRT 10 runtime libraries that
 # `libonnxruntime_providers_tensorrt.so` `dlopen`s at runtime.
 #
-# The pyke.io ORT prebuilt links against `libnvinfer.so.10`, `libnvinfer_plugin.so.10`,
-# and `libnvonnxparser.so.10` (per `nm`/`strings` on `libonnxruntime_providers_tensorrt.so`).
-# Without these, ORT's TRT EP registration would fail loudly at startup
-# (now that `error_on_failure` is set on the dispatch in `session.rs`).
+# The Microsoft ORT GPU prebuilt links against `libnvinfer.so.10`,
+# `libnvinfer_plugin.so.10`, and `libnvonnxparser.so.10` (per `nm`/`strings`
+# on `libonnxruntime_providers_tensorrt.so`). Without these, ORT's TRT EP
+# registration fails loudly at startup (now that `error_on_failure` is set on
+# the dispatch in `session.rs`).
 # NVIDIA's CUDA APT repo carries them as `libnvinfer-dispatch10`,
 # `libnvinfer-plugin10`, and `libnvonnxparsers10` for Ubuntu 24.04 x86_64.
 #
@@ -98,47 +98,37 @@ RUN apt-get update \
 RUN groupadd --gid 10002 bge \
     && useradd --uid 10002 --gid bge --no-create-home --shell /sbin/nologin bge
 
-# Copy the ORT provider shared libraries from the builder, placed NEXT TO
-# the binary in `/usr/local/bin/`. This is required for the static-linked
-# ORT case, and `LD_LIBRARY_PATH`/`ldconfig` *cannot* fix it. Detail below.
+# Copy libonnxruntime.so.1.24.2 and all ORT provider shared libraries into
+# /usr/local/bin/ — the same directory as the application binary.
 #
-# `libonnxruntime.a` is statically linked into the binary; the per-EP
-# factories live in dynamically-loaded shared libraries that ORT `dlopen`s
-# on first registration. ORT's `provider_bridge_ort.cc::ProviderLibrary::Load`
-# computes the dlopen path as
+# With dynamic linking (ORT_PREFER_DYNAMIC_LINK=1 in the builder stage),
+# libonnxruntime.so.1.24.2 is loaded by the dynamic linker at startup.
+# ORT's provider_bridge_ort.cc::ProviderLibrary::Load then calls:
 #
-#     full_path = Env::Default().GetRuntimePath() + filename;
+#     dladdr(&Env::Default, &dl_info)   // Env::Default lives in the .so
+#     GetRuntimePath() == dirname(dl_info.dli_fname)
+#                      == dirname("/usr/local/bin/libonnxruntime.so.1.24.2")
+#                      == "/usr/local/bin/"
 #
-# where `GetRuntimePath` is implemented in `core/platform/posix/env.cc`:
+# So all providers must live in the SAME directory as libonnxruntime.so.1.24.2.
+# /usr/local/bin/ satisfies both constraints: it is where the binary is invoked
+# via absolute CMD path, AND it is where the .so (and providers) are placed.
 #
-#     dladdr(&Env::Default, &dl_info);
-#     auto p = std::filesystem::path{dl_info.dli_fname};
-#     return std::filesystem::absolute(p).remove_filename();
-#
-# When ORT is statically linked, `dladdr` returns
-# `dl_info.dli_fname == argv[0]` (glibc 2.39 on Ubuntu 24.04 uses argv[0],
-# NOT `AT_EXECFN`, for the main executable's `dli_fname`).
-#
-# This means:
-#   * If argv[0] is RELATIVE (e.g. `CMD ["bge-m3-embedding-server"]` →
-#     argv[0]="bge-m3-embedding-server"), `absolute()` resolves it against
-#     the process's cwd. With the default Docker cwd of `/`, the runtime
-#     path is `/`, and ORT tries to dlopen
-#     `/libonnxruntime_providers_shared.so` — an absolute path that does not
-#     exist and which `dlopen` will NOT search via `LD_LIBRARY_PATH` or
-#     `ld.so.cache` (because per `dlopen(3)`, any `/` in the filename forces
-#     pathname interpretation). That was the 2026-05 root cause.
-#   * If argv[0] is ABSOLUTE (`CMD ["/usr/local/bin/bge-m3-embedding-server"]`),
-#     `dli_fname` is absolute, `remove_filename()` returns `/usr/local/bin/`,
-#     and ORT looks for providers there — independent of cwd.
-#
-# Fix: place provider `.so` files in `/usr/local/bin/` next to the binary,
-# AND invoke the binary by absolute path in `CMD`. This is cwd-invariant
-# and works regardless of how the container is started (ECS, k8s, plain
-# `docker run`, `docker exec`, etc.).
-COPY --from=builder /opt/ort/libonnxruntime_providers_shared.so /usr/local/bin/
-COPY --from=builder /opt/ort/libonnxruntime_providers_tensorrt.so /usr/local/bin/
-COPY --from=builder /opt/ort/libonnxruntime_providers_cuda.so /usr/local/bin/
+# ldconfig is configured below to add /usr/local/bin/ to the dynamic-linker
+# cache so libonnxruntime.so.1 can be resolved at process startup.
+COPY --from=builder /opt/ort/lib/libonnxruntime.so.1.24.2           /usr/local/bin/
+COPY --from=builder /opt/ort/lib/libonnxruntime_providers_shared.so  /usr/local/bin/
+COPY --from=builder /opt/ort/lib/libonnxruntime_providers_tensorrt.so /usr/local/bin/
+COPY --from=builder /opt/ort/lib/libonnxruntime_providers_cuda.so    /usr/local/bin/
+
+# The tarball ships libonnxruntime.so.1 as a symlink, but Docker COPY
+# dereferences symlinks — recreate it explicitly.
+# The dynamic linker resolves `libonnxruntime.so.1` (the SONAME) to this symlink.
+RUN ln -s libonnxruntime.so.1.24.2 /usr/local/bin/libonnxruntime.so.1
+
+# Register /usr/local/bin/ with ldconfig so the dynamic linker finds
+# libonnxruntime.so.1 at process startup without LD_LIBRARY_PATH.
+RUN echo '/usr/local/bin' > /etc/ld.so.conf.d/onnxruntime.conf && ldconfig
 
 COPY --from=builder /app/target/release/bge-m3-embedding-server /usr/local/bin/
 USER bge
@@ -147,7 +137,7 @@ HEALTHCHECK --interval=10s --timeout=3s --start-period=120s --retries=3 \
     CMD curl --fail --silent http://localhost:8081/health || exit 1
 
 EXPOSE 8081
-# Absolute path is REQUIRED. See the comment above the COPY block —
-# argv[0] must be absolute so ORT's `dladdr`-based provider lookup
-# produces `/usr/local/bin/` as the runtime path.
+# Absolute path keeps the CMD cwd-invariant and is good practice regardless of
+# link mode. With dynamic linking, GetRuntimePath() uses dli_fname from the
+# .so itself (not argv[0]), but absolute CMD is still the correct default.
 CMD ["/usr/local/bin/bge-m3-embedding-server"]
