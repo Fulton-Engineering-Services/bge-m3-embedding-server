@@ -1,6 +1,6 @@
 [package]
 name = "bge-m3-embedding-server"
-version = "1.1.0"
+version = "1.2.0"
 edition = "2021"
 license = "Apache-2.0"
 description = "Axum HTTP server serving BGE-M3 dense and sparse embeddings via ONNX Runtime"
@@ -24,7 +24,14 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 arc-swap = "1"
-ort = { version = "=2.0.0-rc.12", features = ["coreml", "ndarray", "std", "api-24"], default-features = false }
+## `tracing` is required so the ORT crate's own `crate::info!`/`warn!`/`error!`
+## calls — including `apply_execution_providers`' "Successfully registered" /
+## "Couldn't register" / "An error occurred when attempting to register" lines
+## and the C-side `tracing_logger` callback — actually fire. Without it, ORT
+## registration failures are completely silent, which masked the
+## `nvrtx`-prebuilt / standard-TRT-EP-missing failure that produced the
+## 2026-05 codekeeper outage. Greppable in CloudWatch via `target=ort` events.
+ort = { version = "=2.0.0-rc.12", features = ["coreml", "ndarray", "std", "api-24", "tracing"], default-features = false }
 hf-hub = "0.5"
 tokenizers = { version = "0.23", default-features = false, features = ["onig"] }
 safetensors = "0.7"
@@ -34,6 +41,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 anyhow = "1"
 tower-http = { version = "0.6", features = ["trace", "request-id"] }
 uuid = { version = "1", features = ["v4"] }
+nvml-wrapper = { version = "0.12.1", optional = true }
 
 [features]
 ## Emit per-op CoreML hardware dispatch decisions to stderr at model load time.
@@ -49,6 +57,23 @@ coreml-profile = []
 ## Used in CI where ORT_LIB_LOCATION is unavailable. Never enable in
 ## production builds — use ORT_LIB_LOCATION with a locally built ORT instead.
 download-ort = ["ort/download-binaries", "ort/tls-rustls"]
+
+## Enable NVML-based per-device GPU VRAM and utilization heartbeat logging.
+## Pulled in automatically by the `cuda` and `tensorrt` features; never needs
+## to be set manually. CPU builds do not depend on nvml-wrapper at all.
+nvml = ["dep:nvml-wrapper"]
+
+## Enable the NVIDIA CUDA execution provider.
+## Requires a CUDA-enabled ORT build (ORT_LIB_LOCATION pointing to a CUDA EP build,
+## or `download-ort` with a CUDA prebuilt). CPU-only builds are unaffected by this
+## feature gate — it is a no-op on macOS (CoreML is always used there).
+cuda = ["ort/cuda", "nvml"]
+
+## Enable the NVIDIA TensorRT execution provider.
+## TRT requires the CUDA EP underneath; this feature pulls in both.
+## Requires a TensorRT-enabled ORT build. Falls back to the CUDA EP if TRT
+## registration fails at runtime. CPU-only builds are unaffected.
+tensorrt = ["ort/cuda", "ort/tensorrt", "nvml"]
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

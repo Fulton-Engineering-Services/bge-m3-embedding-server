@@ -1,0 +1,143 @@
+# CUDA + TensorRT execution provider build.
+# This image is linux/amd64 only — no ARM GPU instance types exist.
+# Requires NVIDIA Container Toolkit on the host / ECS GPU AMI.
+
+# ── Builder stage ─────────────────────────────────────────────────────────────
+# Use the CUDA devel image so nvcc and CUDA headers are present at build time.
+FROM nvidia/cuda:12.6.0-cudnn-devel-ubuntu24.04 AS builder
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+       curl ca-certificates build-essential pkg-config libssl-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Download rustup-init, verify the official SHA-256 sidecar, then install.
+ARG RUSTUP_VERSION=1.29.0
+RUN BASE="https://static.rust-lang.org/rustup/archive/${RUSTUP_VERSION}/x86_64-unknown-linux-gnu" \
+    && curl --proto '=https' --tlsv1.2 -sSf "${BASE}/rustup-init"        -o /tmp/rustup-init \
+    && curl --proto '=https' --tlsv1.2 -sSf "${BASE}/rustup-init.sha256"  -o /tmp/rustup-init.sha256 \
+    && cd /tmp && sha256sum -c rustup-init.sha256 \
+    && chmod +x /tmp/rustup-init \
+    && /tmp/rustup-init -y --no-modify-path --default-toolchain stable \
+    && rm /tmp/rustup-init /tmp/rustup-init.sha256
+ENV PATH="/root/.cargo/bin:${PATH}"
+
+# Download the Microsoft ORT GPU prebuilt (standard gzip tarball — no lzma2 needed),
+# verify SHA-256, then extract.
+#
+# This replaces the previous pyke.io download.  The Microsoft tarball ships everything
+# we need in one archive under `lib/`:
+#   libonnxruntime.so.1.24.2          — main shared library
+#   libonnxruntime.so.1               — soname symlink (→ .1.24.2)
+#   libonnxruntime.so                 — development symlink (→ .so.1)
+#   libonnxruntime_providers_shared.so
+#   libonnxruntime_providers_tensorrt.so   ← standard TensorrtExecutionProvider
+#   libonnxruntime_providers_cuda.so
+#
+# UPGRADING ORT: bump ORT_VERSION + ORT_MS_SHA256, update the `ln -s` symlink
+# version in the runtime stage below, and bump Cargo.toml `ort = "=X.Y.Z"`.
+# URL pattern: https://github.com/microsoft/onnxruntime/releases/download/v{V}/onnxruntime-linux-x64-gpu-{V}.tgz
+ARG ORT_VERSION=1.24.2
+ARG ORT_MS_URL=https://github.com/microsoft/onnxruntime/releases/download/v${ORT_VERSION}/onnxruntime-linux-x64-gpu-${ORT_VERSION}.tgz
+ARG ORT_MS_SHA256=bcb42da041f42192e5579de175f7410313c114740a611e230afe9d79be65cc49
+RUN curl --proto '=https' --tlsv1.2 -sSfL "$ORT_MS_URL" -o /tmp/ort.tgz \
+    && echo "${ORT_MS_SHA256}  /tmp/ort.tgz" | sha256sum -c - \
+    && mkdir -p /opt/ort \
+    && tar xzf /tmp/ort.tgz -C /opt/ort --strip-components=1 \
+    && rm /tmp/ort.tgz
+
+# Point ort-sys at the extracted lib/ directory.
+# ORT_PREFER_DYNAMIC_LINK=1 switches ort-sys from linking libonnxruntime.a
+# statically to emitting `cargo:rustc-link-lib=dylib=onnxruntime`.
+# With dynamic linking, dladdr(&Env::Default, &dl_info) returns the path to
+# libonnxruntime.so.1.24.2 (not argv[0]), so GetRuntimePath() == dirname of
+# that .so — placing all providers in the same directory as the .so is enough.
+ENV ORT_LIB_LOCATION=/opt/ort/lib
+ENV ORT_PREFER_DYNAMIC_LINK=1
+
+WORKDIR /app
+
+# Cache dependency compilation by building a dummy binary first.
+# benches/ stubs are required for all [[bench]] targets because Cargo validates
+# source paths at manifest parse time, even though cargo build --release skips
+# bench compilation.
+COPY Cargo.toml Cargo.lock build.rs ./
+RUN mkdir src && echo "fn main(){}" > src/main.rs && touch src/lib.rs \
+    && mkdir -p benches/coreml && touch benches/embeddings.rs benches/coreml/main.rs \
+    && cargo build --release --features cuda,tensorrt \
+    && rm -rf src benches
+
+COPY src ./src
+COPY benches ./benches
+RUN touch src/main.rs && cargo build --release --features cuda,tensorrt
+
+# ── Runtime stage ──────────────────────────────────────────────────────────────
+# Only the CUDA runtime libs are needed at inference time — not the full devel
+# image (no nvcc, no headers, no static libraries).
+FROM nvidia/cuda:12.6.0-cudnn-runtime-ubuntu24.04
+
+# Install the TensorRT 10 runtime libraries that
+# `libonnxruntime_providers_tensorrt.so` `dlopen`s at runtime.
+#
+# The Microsoft ORT GPU prebuilt links against `libnvinfer.so.10`,
+# `libnvinfer_plugin.so.10`, and `libnvonnxparser.so.10` (per `nm`/`strings`
+# on `libonnxruntime_providers_tensorrt.so`). Without these, ORT's TRT EP
+# registration fails loudly at startup (now that `error_on_failure` is set on
+# the dispatch in `session.rs`).
+# NVIDIA's CUDA APT repo carries them as `libnvinfer-dispatch10`,
+# `libnvinfer-plugin10`, and `libnvonnxparsers10` for Ubuntu 24.04 x86_64.
+#
+# Note: we deliberately do NOT install `libnvinfer-headers-dev` or `libnvinfer-bin`
+# — those are devel/builder-side. Only the runtime `.so`s are needed here.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates curl libssl3t64 \
+       libnvinfer10 libnvinfer-plugin10 libnvonnxparsers10 \
+    && rm -rf /var/lib/apt/lists/*
+
+# UID/GID must match EFS model-cache access point in Codekeeper CDK (10002).
+RUN groupadd --gid 10002 bge \
+    && useradd --uid 10002 --gid bge --no-create-home --shell /sbin/nologin bge
+
+# Copy libonnxruntime.so.1.24.2 and all ORT provider shared libraries into
+# /usr/local/bin/ — the same directory as the application binary.
+#
+# With dynamic linking (ORT_PREFER_DYNAMIC_LINK=1 in the builder stage),
+# libonnxruntime.so.1.24.2 is loaded by the dynamic linker at startup.
+# ORT's provider_bridge_ort.cc::ProviderLibrary::Load then calls:
+#
+#     dladdr(&Env::Default, &dl_info)   // Env::Default lives in the .so
+#     GetRuntimePath() == dirname(dl_info.dli_fname)
+#                      == dirname("/usr/local/bin/libonnxruntime.so.1.24.2")
+#                      == "/usr/local/bin/"
+#
+# So all providers must live in the SAME directory as libonnxruntime.so.1.24.2.
+# /usr/local/bin/ satisfies both constraints: it is where the binary is invoked
+# via absolute CMD path, AND it is where the .so (and providers) are placed.
+#
+# ldconfig is configured below to add /usr/local/bin/ to the dynamic-linker
+# cache so libonnxruntime.so.1 can be resolved at process startup.
+COPY --from=builder /opt/ort/lib/libonnxruntime.so.1.24.2           /usr/local/bin/
+COPY --from=builder /opt/ort/lib/libonnxruntime_providers_shared.so  /usr/local/bin/
+COPY --from=builder /opt/ort/lib/libonnxruntime_providers_tensorrt.so /usr/local/bin/
+COPY --from=builder /opt/ort/lib/libonnxruntime_providers_cuda.so    /usr/local/bin/
+
+# The tarball ships libonnxruntime.so.1 as a symlink, but Docker COPY
+# dereferences symlinks — recreate it explicitly.
+# The dynamic linker resolves `libonnxruntime.so.1` (the SONAME) to this symlink.
+RUN ln -s libonnxruntime.so.1.24.2 /usr/local/bin/libonnxruntime.so.1
+
+# Register /usr/local/bin/ with ldconfig so the dynamic linker finds
+# libonnxruntime.so.1 at process startup without LD_LIBRARY_PATH.
+RUN echo '/usr/local/bin' > /etc/ld.so.conf.d/onnxruntime.conf && ldconfig
+
+COPY --from=builder /app/target/release/bge-m3-embedding-server /usr/local/bin/
+USER bge
+
+HEALTHCHECK --interval=10s --timeout=3s --start-period=120s --retries=3 \
+    CMD curl --fail --silent http://localhost:8081/health || exit 1
+
+EXPOSE 8081
+# Absolute path keeps the CMD cwd-invariant and is good practice regardless of
+# link mode. With dynamic linking, GetRuntimePath() uses dli_fname from the
+# .so itself (not argv[0]), but absolute CMD is still the correct default.
+CMD ["/usr/local/bin/bge-m3-embedding-server"]

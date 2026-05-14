@@ -18,6 +18,7 @@ use std::sync::Arc;
 use arc_swap::ArcSwap;
 use axum::body::to_bytes;
 use axum::extract::State;
+use axum::http::HeaderMap;
 use axum::response::IntoResponse;
 use axum::Json;
 use tokio::sync::Semaphore;
@@ -38,7 +39,7 @@ async fn sparse_embeddings_rejects_when_not_ready() {
     let req = SparseRequest {
         input: TextInput(vec!["hello".to_string()]),
     };
-    let result = sparse_embeddings(State(state), Json(req)).await;
+    let result = sparse_embeddings(State(state), HeaderMap::new(), Json(req)).await;
     assert!(matches!(result, Err(AppError::ServiceUnavailable(_))));
 }
 
@@ -48,7 +49,7 @@ async fn sparse_embeddings_rejects_when_pool_dead() {
     let req = SparseRequest {
         input: TextInput(vec!["hello".to_string()]),
     };
-    let result = sparse_embeddings(State(state), Json(req)).await;
+    let result = sparse_embeddings(State(state), HeaderMap::new(), Json(req)).await;
     assert!(
         matches!(result, Err(AppError::ServiceUnavailable(msg)) if msg == "no workers available")
     );
@@ -60,7 +61,7 @@ async fn sparse_embeddings_rejects_empty_input() {
     let req = SparseRequest {
         input: TextInput(vec![]),
     };
-    let result = sparse_embeddings(State(state), Json(req)).await;
+    let result = sparse_embeddings(State(state), HeaderMap::new(), Json(req)).await;
     assert!(matches!(result, Err(AppError::ServiceUnavailable(_))));
 }
 
@@ -82,7 +83,7 @@ async fn sparse_embeddings_rejects_over_batch() {
     let req = SparseRequest {
         input: TextInput(vec!["a".into(), "b".into(), "c".into()]),
     };
-    let result = sparse_embeddings(State(state), Json(req)).await;
+    let result = sparse_embeddings(State(state), HeaderMap::new(), Json(req)).await;
     assert!(
         matches!(result, Err(AppError::InvalidRequest(ref msg)) if msg.contains("exceeds")),
         "expected InvalidRequest for over-batch, got: {result:?}"
@@ -111,7 +112,7 @@ async fn sparse_embeddings_returns_correct_shape() {
     let req = SparseRequest {
         input: TextInput(vec!["hello".into()]),
     };
-    let result = sparse_embeddings(State(state), Json(req)).await;
+    let result = sparse_embeddings(State(state), HeaderMap::new(), Json(req)).await;
     assert!(
         result.is_ok(),
         "expected Ok but got error from sparse handler"

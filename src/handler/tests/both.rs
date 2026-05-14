@@ -17,6 +17,7 @@ use std::sync::Arc;
 
 use arc_swap::ArcSwap;
 use axum::extract::State;
+use axum::http::HeaderMap;
 use axum::Json;
 use tokio::sync::Semaphore;
 
@@ -37,7 +38,7 @@ async fn both_embeddings_rejects_when_not_ready() {
         input: TextInput(vec!["hello".to_string()]),
         model: None,
     };
-    let result = both_embeddings(State(state), Json(req)).await;
+    let result = both_embeddings(State(state), HeaderMap::new(), Json(req)).await;
     assert!(matches!(result, Err(AppError::ServiceUnavailable(_))));
 }
 
@@ -48,7 +49,7 @@ async fn both_embeddings_rejects_when_pool_dead() {
         input: TextInput(vec!["hello".to_string()]),
         model: None,
     };
-    let result = both_embeddings(State(state), Json(req)).await;
+    let result = both_embeddings(State(state), HeaderMap::new(), Json(req)).await;
     assert!(
         matches!(result, Err(AppError::ServiceUnavailable(msg)) if msg == "no workers available")
     );
@@ -73,7 +74,7 @@ async fn both_embeddings_returns_invalid_request_for_empty_input_when_ready() {
         input: TextInput(vec![]),
         model: None,
     };
-    let result = both_embeddings(State(state), Json(req)).await;
+    let result = both_embeddings(State(state), HeaderMap::new(), Json(req)).await;
     assert!(
         matches!(result, Err(AppError::InvalidRequest(ref msg)) if msg.contains("empty")),
         "expected InvalidRequest for empty input, got: {result:?}"
@@ -99,7 +100,7 @@ async fn both_embeddings_returns_invalid_request_for_over_batch_when_ready() {
         input: TextInput(vec!["a".into(), "b".into(), "c".into()]),
         model: None,
     };
-    let result = both_embeddings(State(state), Json(req)).await;
+    let result = both_embeddings(State(state), HeaderMap::new(), Json(req)).await;
     assert!(
         matches!(result, Err(AppError::InvalidRequest(ref msg)) if msg.contains("exceeds")),
         "expected InvalidRequest for over-batch, got: {result:?}"
@@ -136,7 +137,7 @@ async fn both_embeddings_returns_correct_shape() {
         input: TextInput(vec!["hello".into(), "world".into()]),
         model: None,
     };
-    let result = both_embeddings(State(state), Json(req)).await;
+    let result = both_embeddings(State(state), HeaderMap::new(), Json(req)).await;
     assert!(result.is_ok(), "expected Ok but got: {:?}", result.err());
     let Json(resp) = result.expect("both_embeddings should succeed");
     assert_eq!(resp.object, "list");

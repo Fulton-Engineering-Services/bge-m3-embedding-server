@@ -29,6 +29,10 @@ async fn spawn_propagates_leader_load_failure() {
             model_variant: crate::config::ModelVariant::Fp32,
             max_seq_length: 512,
             intra_threads: 1,
+            ep: crate::config::EpSelection::Cpu,
+            trt_warmup_shapes: vec![],
+            device_id: 0,
+            gpu_count: 1,
         },
     );
 
@@ -50,6 +54,47 @@ async fn spawn_propagates_leader_load_failure() {
     assert_eq!(pool.loaded_worker_count(), 0);
 }
 
+/// When a GPU execution provider is selected and `BGE_M3_WORKERS` exceeds
+/// `gpu_count`, the pool clamps `n` to `gpu_count` before spawning workers.
+/// The clamping is synchronous — it happens inside `EmbedPool::spawn` before
+/// the async init task is scheduled — so `live_worker_count()` reflects the
+/// post-clamp value immediately after `spawn` returns and before the init
+/// task has had any chance to run.
+///
+/// We use a bad cache directory so the worker fails fast; the intent is
+/// to verify the clamp, not a successful model load.
+#[tokio::test]
+async fn gpu_ep_clamps_workers_to_gpu_count() {
+    let (pool, init_handle) = EmbedPool::spawn(
+        4,
+        bad_cache_dir(),
+        WorkerConfig {
+            cost_model: test_cost_model_handle(),
+            idle_timeout: None,
+            model_variant: crate::config::ModelVariant::Fp16,
+            max_seq_length: 128,
+            intra_threads: 1,
+            ep: crate::config::EpSelection::Cuda,
+            trt_warmup_shapes: vec![],
+            device_id: 0,
+            gpu_count: 1, // 4 workers requested, 1 GPU → clamped to 1
+        },
+    );
+
+    // `live_workers` is initialised to the post-clamp `n` (1, not 4) before
+    // the async init task is scheduled.  In the single-threaded
+    // `#[tokio::test]` executor no other task runs until we `.await`, so
+    // the atomic is still at its initial value here.
+    assert_eq!(
+        pool.live_worker_count(),
+        1,
+        "Cuda EP with gpu_count=1 should clamp requested workers (4) to 1"
+    );
+
+    // Drive the init task to completion (it will Err — bad cache dir).
+    let _ = tokio::time::timeout(Duration::from_secs(5), init_handle).await;
+}
+
 #[tokio::test]
 async fn spawn_multi_worker_fails_fast_on_leader_failure() {
     let (pool, init_handle) = EmbedPool::spawn(
@@ -61,6 +106,10 @@ async fn spawn_multi_worker_fails_fast_on_leader_failure() {
             model_variant: crate::config::ModelVariant::Fp32,
             max_seq_length: 512,
             intra_threads: 1,
+            ep: crate::config::EpSelection::Cpu,
+            trt_warmup_shapes: vec![],
+            device_id: 0,
+            gpu_count: 1,
         },
     );
 

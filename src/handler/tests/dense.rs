@@ -17,6 +17,7 @@ use std::sync::Arc;
 
 use arc_swap::ArcSwap;
 use axum::extract::State;
+use axum::http::HeaderMap;
 use axum::Json;
 use tokio::sync::Semaphore;
 
@@ -37,7 +38,7 @@ async fn dense_embeddings_rejects_when_not_ready() {
         input: TextInput(vec!["hello".to_string()]),
         model: None,
     };
-    let result = dense_embeddings(State(state), Json(req)).await;
+    let result = dense_embeddings(State(state), HeaderMap::new(), Json(req)).await;
     assert!(matches!(result, Err(AppError::ServiceUnavailable(_))));
 }
 
@@ -48,7 +49,7 @@ async fn dense_embeddings_rejects_when_pool_dead() {
         input: TextInput(vec!["hello".to_string()]),
         model: None,
     };
-    let result = dense_embeddings(State(state), Json(req)).await;
+    let result = dense_embeddings(State(state), HeaderMap::new(), Json(req)).await;
     assert!(
         matches!(result, Err(AppError::ServiceUnavailable(msg)) if msg == "no workers available")
     );
@@ -61,7 +62,7 @@ async fn dense_embeddings_rejects_empty_input() {
         input: TextInput(vec![]),
         model: None,
     };
-    let result = dense_embeddings(State(state), Json(req)).await;
+    let result = dense_embeddings(State(state), HeaderMap::new(), Json(req)).await;
     assert!(matches!(result, Err(AppError::ServiceUnavailable(_))));
 }
 
@@ -72,7 +73,7 @@ async fn dense_embeddings_rejects_over_batch() {
         input: TextInput(vec!["a".to_string(), "b".to_string(), "c".to_string()]),
         model: None,
     };
-    let result = dense_embeddings(State(state), Json(req)).await;
+    let result = dense_embeddings(State(state), HeaderMap::new(), Json(req)).await;
     assert!(matches!(result, Err(AppError::ServiceUnavailable(_))));
 }
 
@@ -98,7 +99,7 @@ async fn dense_embeddings_returns_correct_shape() {
         input: TextInput(vec!["hello".into(), "world".into()]),
         model: None,
     };
-    let result = dense_embeddings(State(state), Json(req)).await;
+    let result = dense_embeddings(State(state), HeaderMap::new(), Json(req)).await;
     assert!(result.is_ok(), "expected Ok but got: {:?}", result.err());
     let Json(resp) = result.expect("dense_embeddings should succeed");
     assert_eq!(resp.data.len(), 2);

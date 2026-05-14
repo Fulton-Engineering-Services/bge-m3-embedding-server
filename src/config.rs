@@ -19,9 +19,10 @@
 //! corresponding environment variable name and default value.
 
 use crate::binpack::CostModel;
+use crate::sysinfo;
 use std::env;
 use std::time::Duration;
-use tracing::warn;
+use tracing::{info, warn};
 
 /// ONNX model variant to load.
 ///
@@ -78,6 +79,47 @@ impl std::fmt::Display for ModelVariant {
             Self::Fp32 => f.write_str("fp32"),
             Self::Fp16 => f.write_str("fp16"),
             Self::Int8 => f.write_str("int8"),
+        }
+    }
+}
+
+/// VRAM workspace budget used for GPU EPs when `BGE_M3_GPU_VRAM_BUDGET_BYTES` is unset.
+///
+/// 10 GiB is a conservative ceiling for NVIDIA GPUs with ≥ 16 GiB VRAM (A10G, L4, H100 80GB).
+/// Override with `BGE_M3_GPU_VRAM_BUDGET_BYTES` for GPUs with less VRAM.
+const DEFAULT_GPU_VRAM_BUDGET_BYTES: usize = 10 * 1024 * 1024 * 1024;
+
+/// ONNX Runtime execution provider selection.
+///
+/// Controlled by `BGE_M3_EP`. Defaults to [`EpSelection::Cpu`].
+///
+/// On macOS the `CoreML` EP is always used regardless of this setting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EpSelection {
+    /// CPU inference via MLAS (default). Works everywhere, no GPU required.
+    Cpu,
+    /// NVIDIA CUDA execution provider (requires `cuda` feature and a CUDA ORT build).
+    ///
+    /// Set `BGE_M3_EP=cuda` to enable. `BGE_M3_WORKERS` is clamped to
+    /// `BGE_M3_GPU_COUNT` so each worker is pinned to a distinct CUDA device.
+    /// Set `BGE_M3_GPU_COUNT` to match the number of GPUs on the instance for
+    /// maximum parallel inference throughput.
+    Cuda,
+    /// NVIDIA `TensorRT` execution provider (requires `tensorrt` feature and a TRT ORT build).
+    ///
+    /// Set `BGE_M3_EP=tensorrt` to enable. Falls back to CUDA for ops TRT cannot
+    /// handle. `BGE_M3_WORKERS` is clamped to `BGE_M3_GPU_COUNT`; each worker
+    /// compiles its own per-GPU TRT shard of the warmup shapes during startup,
+    /// enabling parallel engine compilation across GPUs.
+    TensorRt,
+}
+
+impl std::fmt::Display for EpSelection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Cpu => f.write_str("cpu"),
+            Self::Cuda => f.write_str("cuda"),
+            Self::TensorRt => f.write_str("tensorrt"),
         }
     }
 }
@@ -181,6 +223,83 @@ pub struct Config {
     /// available request permits, and current probe status — useful for
     /// detecting slow memory leaks or queue saturation between requests.
     pub heartbeat_secs: u64,
+
+    /// ONNX Runtime execution provider to use.
+    ///
+    /// Set with `BGE_M3_EP`. Accepts `"cpu"`, `"cuda"`, or `"tensorrt"`.
+    /// Defaults to `"cpu"`. On macOS, `CoreML` is always used regardless of
+    /// this setting. Requires the corresponding Cargo feature (`cuda` or
+    /// `tensorrt`) to be enabled at build time for GPU EPs.
+    ///
+    /// When set to `"cuda"` or `"tensorrt"`, the host-RAM probe is bypassed
+    /// in favour of the VRAM budget, and `BGE_M3_WORKERS` is clamped to
+    /// `BGE_M3_GPU_COUNT` in `EmbedPool::spawn`.
+    pub ep: EpSelection,
+
+    /// Number of GPU devices available on this instance.
+    ///
+    /// Set with `BGE_M3_GPU_COUNT`. When a GPU execution provider (`cuda` or
+    /// `tensorrt`) is active, `BGE_M3_WORKERS` is clamped to this value in
+    /// `EmbedPool::spawn` so each worker is pinned to a distinct CUDA device
+    /// (`device_id = worker_index % gpu_count`).
+    ///
+    /// Auto-detected on Linux from `/proc/driver/nvidia/gpus/` entry count.
+    /// Defaults to `1` on macOS (`CoreML` is always single-device) and on
+    /// Linux when the driver proc path is absent. Override explicitly on
+    /// multi-GPU ECS instances: `BGE_M3_GPU_COUNT=8`.
+    pub gpu_count: usize,
+
+    /// VRAM workspace ceiling (bytes) when a GPU execution provider is active.
+    ///
+    /// Set with `BGE_M3_GPU_VRAM_BUDGET_BYTES`. Ignored when `ep == Cpu`.
+    /// Defaults to `None`, which causes the server to use 10 GiB as the
+    /// ceiling (suitable for GPUs with ≥ 16 GiB VRAM such as A10G / L4).
+    /// Lower this on GPUs with less VRAM (e.g. `8589934592` for 8 GiB).
+    pub gpu_vram_budget_bytes: Option<usize>,
+
+    /// List of `(batch_size, seq_len)` shapes to pre-compile as `TensorRT` engine
+    /// files during worker startup.
+    ///
+    /// Set with `BGE_M3_TRT_WARMUP_SHAPES` as a comma-separated list of `BxL`
+    /// tokens (e.g. `"1x128,4x512,16x2048,32x8192"`). Only used when
+    /// `ep == EpSelection::TensorRt`. Invalid tokens are skipped with a `WARN`.
+    /// An empty or all-invalid value falls back to the default set. Operators
+    /// can shrink the grid for local development (e.g. `"1x128"`) — the env
+    /// var override path is the canonical way to keep cold-start tractable on
+    /// workstations.
+    ///
+    /// Default: a 2D `{1, 4, 16, 32} × {128, 512, 2048, 8192}` grid composed
+    /// in batch-major order so the smallest batches finish first and the
+    /// most common router shapes (`chunks = 1–2 × max_chunk_seq up to ~6000`)
+    /// hit a pre-compiled engine on the very first real request. The expensive
+    /// `_ × 8192` shapes compile last (~30–170 s each) — total cold-cache
+    /// compile budget is roughly 6–12 minutes on first deploy. Subsequent
+    /// starts on the same EC2 instance reuse cached engine files (seconds).
+    ///
+    /// Each shape may take 30–170 s to compile on the first run; the worker
+    /// signals ready only after all shapes finish, so `/health` returns `503`
+    /// during this window.
+    pub trt_warmup_shapes: Vec<(usize, usize)>,
+
+    /// Exit cleanly after `TensorRT` engine compilation and cache flush.
+    ///
+    /// Set with `BGE_M3_WARMUP_ONLY`. Default `false`.
+    ///
+    /// When `true` the server initialises the model and ORT session exactly as
+    /// normal — loading ONNX weights, configuring the TRT EP, and running the
+    /// pre-warm shape compilation via the existing warmup path. After all
+    /// engines have been compiled and fsynced to the EFS cache the process
+    /// logs a single `INFO` line and calls `process::exit(0)`. No TCP listener
+    /// is bound; the HTTP server never starts.
+    ///
+    /// Primary use-case: ECS init container that pre-populates the shared EFS
+    /// engine cache before the main container starts, so the main container
+    /// always sees a warm cache and skips the 6–12 minute cold-compile window.
+    ///
+    /// A `WARN` is logged if this flag is set with `BGE_M3_EP` other than
+    /// `tensorrt` — warmup-only on CPU is a no-op (there is nothing to compile)
+    /// but the server still exits 0 cleanly rather than erroring.
+    pub warmup_only: bool,
 }
 
 impl Config {
@@ -272,6 +391,49 @@ impl Config {
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(60);
 
+        let ep = match lookup("BGE_M3_EP").as_deref() {
+            Some("cuda") => EpSelection::Cuda,
+            Some("tensorrt") => EpSelection::TensorRt,
+            _ => EpSelection::Cpu,
+        };
+
+        let gpu_vram_budget_bytes =
+            lookup("BGE_M3_GPU_VRAM_BUDGET_BYTES").and_then(|v| v.parse::<usize>().ok());
+
+        // When a GPU EP is active, the host-RAM probe is meaningless — VRAM is
+        // the constraint. Override the cost model unconditionally so the probe
+        // is skipped and the VRAM budget drives bin-packing instead.
+        let cost_model_override = if ep == EpSelection::Cpu {
+            cost_model_override
+        } else {
+            let vram_budget = gpu_vram_budget_bytes.unwrap_or(DEFAULT_GPU_VRAM_BUDGET_BYTES);
+            info!(
+                ep = %ep,
+                vram_budget_bytes = vram_budget,
+                "GPU execution provider selected — bypassing host-RAM probe; \
+                 using VRAM budget as the workspace ceiling"
+            );
+            Some(CostModel::conservative(vram_budget))
+        };
+
+        let gpu_count = sysinfo::detect_gpu_count(
+            lookup("BGE_M3_GPU_COUNT").and_then(|v| v.parse::<usize>().ok()),
+        );
+
+        let trt_warmup_shapes = parse_trt_warmup_shapes(lookup("BGE_M3_TRT_WARMUP_SHAPES"));
+
+        let warmup_only = lookup("BGE_M3_WARMUP_ONLY")
+            .is_some_and(|v| matches!(v.as_str(), "1" | "true" | "yes"));
+
+        if warmup_only && ep != EpSelection::TensorRt {
+            warn!(
+                ep = %ep,
+                "BGE_M3_WARMUP_ONLY=1 is set but BGE_M3_EP is not tensorrt — \
+                 warmup-only is a no-op on non-TRT EPs (nothing to compile); \
+                 the server will exit 0 without performing any engine compilation"
+            );
+        }
+
         Self {
             cache_dir: lookup("BGE_M3_CACHE_DIR").unwrap_or_else(|| "/cache".to_string()),
             bind_addr: lookup("BGE_M3_BIND").unwrap_or_else(|| "0.0.0.0:8081".to_string()),
@@ -284,7 +446,82 @@ impl Config {
             memory_safety_factor,
             cost_model_override,
             heartbeat_secs,
+            ep,
+            gpu_vram_budget_bytes,
+            gpu_count,
+            trt_warmup_shapes,
+            warmup_only,
         }
+    }
+}
+
+/// Default TRT warmup shapes: a 2D `{1, 4, 16, 32} × {128, 512, 2048, 8192}`
+/// grid composed in batch-major order.
+///
+/// Batch is the outer dimension so the smallest batches (which dominate
+/// real router traffic — `chunks = 1–2 × max_chunk_seq`) are fully compiled
+/// first; larger batches that are mostly observed during bulk re-indexing
+/// fill in afterwards. Within each batch the sequence dimension grows
+/// monotonically so the cheap `_ × 128` shape comes before the expensive
+/// `_ × 8192` shape — operators watching `/health` see progress quickly.
+///
+/// Production observation (2026-05 codekeeper investigation): real router
+/// traffic shows `chunks = 1–2 × max_chunk_seq` up to ~6 000 token positions.
+/// Previously-unseen shapes triggered in-band engine compilation in the middle
+/// of a real request, producing 56–356 s `inference_ms` values. This 16-shape
+/// grid covers the full realistic shape space so every router request hits
+/// a pre-compiled engine.
+const DEFAULT_TRT_WARMUP_SHAPES: &[(usize, usize)] = &[
+    (1, 128),
+    (1, 512),
+    (1, 2048),
+    (1, 8192),
+    (4, 128),
+    (4, 512),
+    (4, 2048),
+    (4, 8192),
+    (16, 128),
+    (16, 512),
+    (16, 2048),
+    (16, 8192),
+    (32, 128),
+    (32, 512),
+    (32, 2048),
+    (32, 8192),
+];
+
+/// Parses `BGE_M3_TRT_WARMUP_SHAPES` from its raw env-var value.
+///
+/// Accepts a comma-separated list of `BxL` tokens (e.g. `"1x128,1x512"`).
+/// Invalid tokens are skipped with a `WARN`. Returns the default shape set
+/// when `raw` is `None`, empty, or all tokens are invalid.
+pub(crate) fn parse_trt_warmup_shapes(raw: Option<String>) -> Vec<(usize, usize)> {
+    let Some(val) = raw else {
+        return DEFAULT_TRT_WARMUP_SHAPES.to_vec();
+    };
+    if val.trim().is_empty() {
+        return DEFAULT_TRT_WARMUP_SHAPES.to_vec();
+    }
+    let parsed: Vec<(usize, usize)> = val
+        .split(',')
+        .filter_map(|token| {
+            let token = token.trim();
+            let mut parts = token.splitn(2, 'x');
+            let batch = parts.next()?.parse::<usize>().ok()?;
+            let seq = parts.next()?.parse::<usize>().ok()?;
+            Some((batch, seq))
+        })
+        .collect();
+
+    if parsed.is_empty() {
+        warn!(
+            raw = %val,
+            "BGE_M3_TRT_WARMUP_SHAPES contained no valid BxL tokens; \
+             falling back to default warmup shapes"
+        );
+        DEFAULT_TRT_WARMUP_SHAPES.to_vec()
+    } else {
+        parsed
     }
 }
 

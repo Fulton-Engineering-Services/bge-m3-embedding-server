@@ -126,6 +126,64 @@ pub(crate) fn detect_available_memory() -> MemoryReading {
     }
 }
 
+/// Detects the number of NVIDIA GPU devices available on this instance.
+///
+/// Detection order (first success wins):
+/// 1. `override_val` — the parsed value of `BGE_M3_GPU_COUNT` env var, if set.
+/// 2. Linux `/proc/driver/nvidia/gpus/` directory entry count (compiled out on
+///    non-Linux targets).
+/// 3. Default: `1` (macOS `CoreML` is always single-device; Linux fallback when
+///    the NVIDIA driver proc path is absent or empty).
+///
+/// Returns at least `1` regardless of the detection path. Logs the chosen
+/// count and source at `INFO`.
+pub(crate) fn detect_gpu_count(override_val: Option<usize>) -> usize {
+    if let Some(n) = override_val {
+        let n = n.max(1);
+        tracing::info!(
+            gpu_count = n,
+            source = "env_override",
+            "detected GPU(s) on this instance"
+        );
+        return n;
+    }
+
+    #[cfg(target_os = "linux")]
+    if let Some(n) = count_nvidia_gpus_from_proc() {
+        tracing::info!(
+            gpu_count = n,
+            source = "proc_driver",
+            "detected GPU(s) on this instance"
+        );
+        return n;
+    }
+
+    tracing::info!(
+        gpu_count = 1_usize,
+        source = "default",
+        "detected GPU(s) on this instance"
+    );
+    1
+}
+
+/// Counts NVIDIA GPU entries in `/proc/driver/nvidia/gpus/`.
+///
+/// Returns `None` when the directory does not exist, is unreadable, or
+/// contains no entries (indicating no NVIDIA driver is loaded). Returns
+/// `Some(n)` with `n ≥ 1` when entries are found.
+#[cfg(target_os = "linux")]
+fn count_nvidia_gpus_from_proc() -> Option<usize> {
+    let count = std::fs::read_dir("/proc/driver/nvidia/gpus")
+        .ok()?
+        .filter_map(std::result::Result::ok)
+        .count();
+    if count > 0 {
+        Some(count)
+    } else {
+        None
+    }
+}
+
 /// Returns the current process's RSS (Resident Set Size) in bytes, or `None`
 /// if measurement is not supported on this platform.
 ///

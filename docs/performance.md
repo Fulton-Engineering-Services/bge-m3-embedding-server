@@ -24,19 +24,10 @@ Curated from three production databases via a `db-backup` sidecar. Stored at `be
 |----------|--------|-------|------------|-------------|
 | `document_chunks` | `knowledgebase.chunks` | 50 | 337–1,599 | Stratified sample: 10 short, 20 medium, 20 long. Hamlet PDF + Spring AI docs. |
 | `tool_descriptions` | `coordinator.vector_store` | 75 | 33–283 | Complete set. Tool/capability descriptions for semantic memory retrieval. |
-| `code_symbols` | `codekeeper.symbols` | 50 | 22–120 | Random sample from 185K symbols. Class/method/field name_paths. |
-
-**Database inventory:**
-
-| Database | Host container | Relevant tables | Row count | Notes |
-|----------|---------------|-----------------|-----------|-------|
-| `knowledgebase` | `coordinator-db` | `chunks`, `documents` | 386 chunks / 5 docs | `halfvec(1024)` dense + `sparsevec(250002)` sparse stored alongside content |
-| `coordinator` | `coordinator-db` | `vector_store`, `captures` | 75 vectors / 0 captures | Tool descriptions with `vector(1024)` embeddings |
-| `codekeeper` | `codekeeper-db` | `symbols`, `symbol_embeddings` | 185K symbols / 0 embeddings | Embeddings not yet generated; symbols have name_path + signature |
-| `langfuse` | `langfuse-db` | `observations`, `traces` | 0 / 0 | Not yet wired for tracing |
+| `code_symbols` | `symbols` table | 50 | 22–120 | Random sample from 185K symbols. Class/method/field name_paths. |
 
 **Extraction queries (for reproducibility):** the corpus is built by sampling rows from
-three Postgres databases used by downstream consumers. The exact `psql` commands are not
+Postgres databases used by downstream consumers. The exact `psql` commands are not
 portable — adapt the queries below to your own environment by pointing them at any
 Postgres instance with similar tables.
 
@@ -219,7 +210,7 @@ The batch regression (76–319% slower at `onnx_batch_size=8`) dominates the ben
 
 | Consumer | Operation | Texts/request | Latency-sensitive? |
 |----------|-----------|---------------|-------------------|
-| `dpos-coordinator` | Semantic memory lookup | 1 | **Yes** — user/agent waiting |
+| Your application | Semantic memory lookup | 1 | **Yes** — user/agent waiting |
 | `mcp-local-knowledge-base` | Search query embedding | 1 | **Yes** — user waiting |
 | `mcp-local-knowledge-base` | Document chunk indexing | 10–50 | No — background task |
 
@@ -303,7 +294,7 @@ Estimated savings are relative to the CoreML 2-worker projection of 25–44 GB. 
 |---|--------|-------------|-----------|
 | 1 | **`BGE_M3_WORKERS=1`** | ~12–22 GB (CoreML) | Requests queue behind a single worker. P99 ~120 ms queued still beats MLAS P50 for long texts. |
 | 2 | **Shorter idle timeout** | Full model memory when idle | `BGE_M3_IDLE_TIMEOUT_SECS` already implemented. With CoreML model cache, reload ~5–10 s from compiled cache vs ~15–30 s cold. |
-| 3 | **Lower `BGE_M3_MAX_SEQ_LENGTH`** | Reduces auto-budget workspace ceiling | Setting `BGE_M3_MAX_SEQ_LENGTH=512` restores historical behavior; setting `=2048` matches codekeeper `max-tokens`. The bin-packer will pack more texts per chunk at shorter lengths. |
+| 3 | **Lower `BGE_M3_MAX_SEQ_LENGTH`** | Reduces auto-budget workspace ceiling | Setting `BGE_M3_MAX_SEQ_LENGTH=512` restores historical behavior; setting `=2048` is appropriate for longer code or document workloads. The bin-packer will pack more texts per chunk at shorter lengths. |
 
 ### Tier 2 — Moderate code changes
 
@@ -516,8 +507,89 @@ Dense embeddings shown. Sparse values are within 5% of dense for all configurati
 
 | Constraint | Recommended config | Rationale |
 |------------|-------------------|-----------|
-| Best latency | FP32 + CoreML EP | 20–61% faster than MLAS; full GPU dispatch |
+| Best latency (macOS) | FP32 + CoreML EP | 20–61% faster than MLAS; full GPU dispatch |
+| Best latency (Linux GPU) | FP16 + CUDA EP or TensorRT EP | 5–15× faster than MLAS (projected); no production data yet |
 | Memory-constrained (≤ 2 GB/session) | INT8 + MLAS EP | 74% memory savings; near-FP32 latency |
 | Memory-critical (≤ 1 GB/session) | INT8 + MLAS EP with `BGE_M3_WORKERS=1` | One session (~0.54 GB) |
-| Avoid | FP16 (any EP) | 6–10× slower than FP32; no CoreML benefit |
+| Avoid | FP16 (any EP) on macOS | 6–10× slower than FP32; no CoreML benefit |
 | Avoid | INT8 + CoreML EP | 42–79% slower than INT8 + MLAS |
+
+---
+
+## GPU Execution Providers (CUDA / TensorRT)
+
+> **Note:** No production latency measurements are available yet for GPU EPs. The figures below
+> are projections based on ONNX Runtime CUDA EP benchmarks reported for comparable transformer
+> models. These numbers should be validated once a GPU deployment is instrumented.
+
+### Overview
+
+The server can be compiled with NVIDIA CUDA or TensorRT execution providers via opt-in Cargo
+features (`--features cuda` or `--features tensorrt`). Activated at runtime by `BGE_M3_EP=cuda`
+or `BGE_M3_EP=tensorrt`. The production Docker image for GPU deployments uses the `-cuda` tag
+(built from `Dockerfile.cuda`, based on `nvidia/cuda:12.6.0-cudnn-*-ubuntu24.04`, amd64 only).
+
+### Key Behavioral Differences from CPU/CoreML
+
+| Aspect | CPU (MLAS) | CoreML | CUDA EP | TensorRT EP |
+|--------|-----------|--------|---------|-------------|
+| Workers | 2–7 (configurable) | 1–2 | **clamped to `BGE_M3_GPU_COUNT`** | **clamped to `BGE_M3_GPU_COUNT`** |
+| Startup probe | Yes (Linux) | No (macOS) | **Bypassed** | **Bypassed** |
+| Workspace budget | Probe-derived (`max_workspace_bytes`) | macOS conservative defaults | `BGE_M3_GPU_VRAM_BUDGET_BYTES` (default 10 GiB) | Same |
+| Engine caching | Probe cache JSON | CoreML `.mlmodelc` | N/A | TRT engine files (`{cache_dir}/trt-engines/`) plus a TRT timing cache at `{cache_dir}/trt-timing` |
+| First-inference cold start | Normal | CoreML compilation (~15 s) | Normal | **~90–180 min first deploy on an L4 (default 16-shape `{1,4,16,32}×{128,512,2048,8192}` grid compile); seconds thereafter (engine cache hit, fsynced per shape). Multi-GPU init containers shard the warmup grid across workers via stride partition (~N× faster cold compile). Use `BGE_M3_WARMUP_ONLY=1` as an ECS init container to decouple compilation from service startup — see [README: ECS Init Container Pattern](../README.md#ecs-init-container-pattern-tensorrt).** |
+
+**Why workers = `BGE_M3_GPU_COUNT` for GPU EPs:** Each worker is pinned to a distinct CUDA device
+(`device_id = worker_index % gpu_count`). On a single-GPU instance the default `BGE_M3_GPU_COUNT=1`
+preserves the original "one worker per GPU" behavior. On a multi-GPU instance, setting
+`BGE_M3_WORKERS = BGE_M3_GPU_COUNT` runs an independent ORT session on each GPU for maximum
+parallel inference throughput. `BGE_M3_GPU_COUNT` is auto-detected on Linux from
+`/proc/driver/nvidia/gpus/`; override it explicitly on multi-GPU ECS tasks. Multi-stream
+concurrency on a single GPU remains a future enhancement.
+
+### Projected Throughput vs CPU
+
+For long-sequence workloads (the `O(seq²)` attention regime), CUDA EP is expected to deliver
+**5–15× throughput improvement** over MLAS on comparable hardware (e.g. A10G / L4 vs Fargate
+vCPU). Improvement is larger for long sequences because attention dominates, and smaller for
+short-text workloads where CUDA kernel launch overhead is non-trivial relative to compute.
+
+| Workload | MLAS (estimated) | CUDA EP (projected) | Notes |
+|----------|-----------------|---------------------|-------|
+| Short texts (code symbols, ~30 tokens) | ~35 ms/text (single-thread) | ~5–15 ms/text | Kernel launch overhead limits gain |
+| Long docs (document chunks, ~400 tokens) | ~150 ms/text | ~15–40 ms/text | `O(seq²)` attention benefits most |
+| Mixed batch (tool descriptions, ~100 tokens) | ~30 ms/text | ~5–10 ms/text | — |
+
+These are rough order-of-magnitude estimates. Actual numbers depend on GPU model, driver
+version, ORT build, and batch composition. **Instrument a GPU deployment and update this
+table with measured values before using these for capacity planning.**
+
+### VRAM Budget
+
+The startup probe (cgroup RSS measurement) does not apply to GPU deployments. Instead:
+
+- `BGE_M3_GPU_VRAM_BUDGET_BYTES` sets the workspace ceiling (default: **10 GiB** = `10_737_418_240`)
+- Suitable for GPUs with ≥ 16 GiB VRAM (A10G, L4, A100, H100)
+- For GPUs with less VRAM, lower the budget: e.g. `8589934592` (8 GiB) for an A10
+- The model weights occupy ~1.08 GB per session (FP16, recommended for GPU EP); the
+  remaining VRAM ceiling is workspace for intermediate tensors during inference
+
+| GPU | VRAM | Suggested `BGE_M3_GPU_VRAM_BUDGET_BYTES` |
+|-----|------|------------------------------------------|
+| A10G / L4 | 24 GiB | `10737418240` (10 GiB, default) |
+| A10 | 24 GiB | `10737418240` (10 GiB, default) |
+| T4 | 16 GiB | `8589934592` (8 GiB) |
+| A100 40 GB | 40 GiB | `21474836480` (20 GiB) — room for larger batches |
+| H100 80 GB | 80 GiB | `42949672960` (40 GiB) |
+
+### Model Variant Recommendation
+
+**FP16 is the recommended model variant for GPU EPs.** This matches the Linux fleet default
+and aligns with how the CUDA EP handles the model's weight precision:
+- FP16 reduces VRAM consumption by ~50% vs FP32 (~1.08 GB vs ~2.16 GB per session)
+- Unlike CoreML (which recompiles FP16 ONNX to an FP32 internal graph), CUDA EP can execute
+  FP16 ops natively on Tensor Core hardware
+
+INT8 is not yet validated with CUDA EP. The `DequantizeLinear` nodes in the Xenova INT8
+export may fragment the CUDA execution plan similarly to the CoreML fragmentation documented
+above — this is TBD and will be confirmed when GPU benchmarks are run.

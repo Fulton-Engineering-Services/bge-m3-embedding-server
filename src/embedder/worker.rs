@@ -32,9 +32,14 @@ use super::error::ort_err;
 use super::session::load_models;
 use super::sparse::embed_sparse;
 use super::tokenize::{build_chunk_arrays, tokenize_no_pad};
+use super::trt_cache;
+use super::trt_warmup::{
+    prewarm_persistence_postcondition_failed, prewarm_persistence_suspicious_undercount,
+    trt_prewarm,
+};
 use super::types::{EmbedRequest, ProbeResult};
 use crate::binpack::CostModel;
-use crate::config::ModelVariant;
+use crate::config::{EpSelection, ModelVariant};
 use crate::sysinfo;
 
 pub(super) struct WorkerGuard(pub Arc<AtomicUsize>);
@@ -75,6 +80,36 @@ pub struct WorkerConfig {
     /// `session.run()` call. Plumbed through to `load_session` at model load
     /// time. See [`crate::config::Config::intra_threads`] for sizing guidance.
     pub intra_threads: usize,
+    /// ONNX Runtime execution provider selection.
+    ///
+    /// Forwarded to [`load_models`] at model load time so each ORT session
+    /// registers the correct EP. On macOS, `CoreML` is always used regardless
+    /// of this value. See [`crate::config::EpSelection`] for details.
+    pub ep: EpSelection,
+
+    /// `(batch_size, seq_len)` shapes to pre-compile as `TensorRT` engine files
+    /// during worker startup.
+    ///
+    /// Only applied when `ep == EpSelection::TensorRt`. Sourced from
+    /// `BGE_M3_TRT_WARMUP_SHAPES` via [`crate::config::Config::trt_warmup_shapes`].
+    /// With multiple workers, `EmbedPool::spawn` shards the full shape list
+    /// across workers (stride partition) so each GPU compiles a disjoint subset
+    /// in parallel. An empty list skips pre-warming entirely.
+    pub trt_warmup_shapes: Vec<(usize, usize)>,
+
+    /// CUDA/TRT device ID for this specific worker.
+    ///
+    /// Set by `EmbedPool::spawn` as `worker_index % gpu_count`. Forwarded to
+    /// [`super::session::execution_providers`] so the ORT session binds to the
+    /// correct GPU. Ignored on CPU EP and macOS (`CoreML` is single-device).
+    pub device_id: u32,
+
+    /// Total number of GPU devices on this instance.
+    ///
+    /// Propagated from [`crate::config::Config::gpu_count`]. Used by
+    /// `EmbedPool::spawn` to compute per-worker `device_id` values and to
+    /// clamp `BGE_M3_WORKERS` for GPU execution providers.
+    pub gpu_count: usize,
 }
 
 /// Runs a single `session.run()` for the probe, measuring RSS before and after.
@@ -106,6 +141,46 @@ pub(crate) fn probe_run_dense(
         rss_before,
         rss_after,
     })
+}
+
+/// Emits a `WARN` if the oneshot reply receiver has been dropped while the
+/// worker was busy with `embed_*` — meaning the client (often the router's
+/// hedged race) disconnected after dispatch and the inference work is now
+/// discarded. We can't interrupt ORT `session.run()` mid-call, so this is
+/// observability only: operators can correlate `inference_ms` and `chunks`
+/// across requests to size the router's cancellation budget.
+///
+/// The reply is sent unconditionally by the caller after this returns; the
+/// channel layer will silently drop the value if the receiver is gone.
+fn log_if_abandoned_mid_flight<T>(
+    reply: &tokio::sync::oneshot::Sender<Result<(T, super::types::EmbedStats)>>,
+    route: &'static str,
+    worker_id: usize,
+    result: &Result<(T, super::types::EmbedStats)>,
+    inference_ms: u128,
+) {
+    if !reply.is_closed() {
+        return;
+    }
+    let (chunks, max_chunk_seq, total_token_positions) = match result {
+        Ok((_, stats)) => (
+            Some(stats.chunks),
+            Some(stats.max_chunk_seq),
+            Some(stats.total_token_positions),
+        ),
+        Err(_) => (None, None, None),
+    };
+    let inference_ms_u64 = u64::try_from(inference_ms).unwrap_or(u64::MAX);
+    tracing::warn!(
+        worker_id,
+        route,
+        inference_ms_so_far = inference_ms_u64,
+        chunks,
+        max_chunk_seq,
+        total_token_positions,
+        "request abandoned by client during inference (work discarded; \
+         ORT session.run() cannot be interrupted mid-call)"
+    );
 }
 
 /// Runs one probe batch: tokenize texts, build padded arrays, call `session.run()`,
@@ -141,6 +216,12 @@ pub(super) fn run_worker(
     let span = info_span!("worker", id = id);
     let _span_guard = span.enter();
 
+    tracing::debug!(
+        worker_id = id,
+        gpu_device = config.device_id,
+        ep = %config.ep,
+        "worker assigned to GPU device"
+    );
     info!("Loading models (worker {id})...");
     let load_start = std::time::Instant::now();
     let rt = Handle::current();
@@ -149,12 +230,14 @@ pub(super) fn run_worker(
     // worker's model-weight + arena-baseline contribution, not accumulated
     // OS noise.
     let pre_load_rss = sysinfo::read_process_rss_bytes().unwrap_or(0);
-    let initial_models = match load_models(
+    let mut initial_models = match load_models(
         &cache_dir,
         id == 0,
         config.model_variant,
         config.max_seq_length,
         config.intra_threads,
+        config.ep,
+        config.device_id,
     ) {
         Ok(mut models) => {
             // Prime the ORT session arena with a tiny session.run() BEFORE
@@ -201,6 +284,91 @@ pub(super) fn run_worker(
         }
     };
 
+    // TensorRT engine pre-warming: compile engine files for each configured
+    // shape before signaling readiness.  This runs BEFORE ready_tx.send() so
+    // the worker is not marked ready until all TRT engines are cached —
+    // `/health` correctly returns `503 loading` during the compile window.
+    //
+    // Each shape may take 30–120 s on first deploy; subsequent starts reuse
+    // the cached `.engine` files from `{cache_dir}/trt-engines/` (seconds).
+    if config.ep == EpSelection::TensorRt && !config.trt_warmup_shapes.is_empty() {
+        tracing::info!(
+            worker_id = id,
+            gpu_device = config.device_id,
+            shape_count = config.trt_warmup_shapes.len(),
+            shapes = ?config.trt_warmup_shapes,
+            "TensorRT pre-warm: worker compiling shard \
+             (first run per shape takes 30–170 s; subsequent starts reuse cache)"
+        );
+        trt_cache::log_engine_basenames_before_prewarm(&trt_cache::engine_cache_path(&cache_dir));
+        let stats = trt_prewarm(
+            &mut initial_models.0,
+            &config.trt_warmup_shapes,
+            id,
+            &cache_dir,
+        );
+        // Per-worker postcondition: if the shard reported one or more fresh
+        // (non-cache-hit) compiles but the on-disk engine count did not
+        // increase, surface an ERROR. This is the in-process counterpart to
+        // the postcondition check at the end of the warmup-only path in
+        // lib.rs, intended to catch the silent-persistence failure mode that
+        // produced the 2026-05 codekeeper outage.
+        if prewarm_persistence_postcondition_failed(stats.fresh_compiles, stats.engine_count_after)
+        {
+            tracing::error!(
+                worker_id = id,
+                gpu_device = config.device_id,
+                fresh_compiles = stats.fresh_compiles,
+                engine_count_before = stats.engine_count_before,
+                engine_count_after = stats.engine_count_after,
+                engine_count_delta = stats.engine_count_delta,
+                cache_path = %trt_cache::engine_cache_path(&cache_dir).display(),
+                "TensorRT pre-warm postcondition failed: \
+                 compile-success events present but no .engine files on disk; \
+                 TRT EP may be silently failing to persist engine plan files"
+            );
+        } else if prewarm_persistence_suspicious_undercount(
+            stats.fresh_compiles,
+            stats.engine_count_after,
+        ) {
+            // Non-fatal: TRT EP can legitimately reuse a single `.engine`
+            // file across many input shapes (engine plans are keyed by
+            // fused-subgraph identity + precision + GPU SM, not by
+            // `(batch, seq)`). A 1:2 ratio is tolerated silently; this
+            // WARN fires only when delta * 2 < fresh_compiles AND the
+            // postcondition above did not already trigger. Greppable
+            // tag: "engine_count_delta is suspiciously low".
+            tracing::warn!(
+                worker_id = id,
+                gpu_device = config.device_id,
+                fresh_compiles = stats.fresh_compiles,
+                engine_count_before = stats.engine_count_before,
+                engine_count_after = stats.engine_count_after,
+                engine_count_delta = stats.engine_count_delta,
+                cache_path = %trt_cache::engine_cache_path(&cache_dir).display(),
+                "TensorRT pre-warm: engine_count_delta is suspiciously low \
+                 relative to fresh_compiles (delta * 2 < fresh_compiles); \
+                 some engine plans may not have persisted to disk despite \
+                 session.run() reporting Ok — investigate cache path \
+                 resolution and EFS mount durability"
+            );
+        }
+        tracing::info!(
+            worker_id = id,
+            warmed = stats.warmed,
+            skipped = stats.skipped,
+            fully_cached = stats.fully_cached,
+            fresh_compiles = stats.fresh_compiles,
+            engine_count_before = stats.engine_count_before,
+            engine_count_after = stats.engine_count_after,
+            engine_count_delta = stats.engine_count_delta,
+            total = config.trt_warmup_shapes.len(),
+            total_compile_ms = stats.total_compile_ms,
+            total_fsync_ms = stats.total_fsync_ms,
+            "TensorRT pre-warm complete"
+        );
+    }
+
     // Report the RSS delta so EmbedPool can derive the true per-worker
     // model footprint for workspace-budget calculations.
     let post_load_rss = sysinfo::read_process_rss_bytes().unwrap_or(pre_load_rss);
@@ -246,6 +414,8 @@ pub(super) fn run_worker(
                         config.model_variant,
                         config.max_seq_length,
                         config.intra_threads,
+                        config.ep,
+                        config.device_id,
                     ) {
                         Ok(mut m) => {
                             // Prime the freshly-loaded session arena so the
@@ -295,9 +465,24 @@ pub(super) fn run_worker(
 
                 match request {
                     EmbedRequest::Dense { texts, reply } => {
-                        // Load the current cost model snapshot for this request.
-                        // ArcSwap::load() is lock-free; the guard keeps the Arc
-                        // alive for the duration of embed_dense.
+                        // Pre-dispatch abandonment check: the router's hedged
+                        // race or the original HTTP client may have already
+                        // disconnected while this request sat in the worker
+                        // queue. ORT `session.run()` is a blocking C call that
+                        // cannot be interrupted mid-MatMul (see CLAUDE.md
+                        // "client disconnect" gotcha), so the only opportunity
+                        // we have to save work is BEFORE inference starts. The
+                        // post-inference check below is observability only.
+                        if reply.is_closed() {
+                            tracing::warn!(
+                                worker_id = id,
+                                route = "dense",
+                                batch_size = texts.len(),
+                                "request abandoned by client before dispatch — skipping inference"
+                            );
+                            continue;
+                        }
+                        let t_inference = std::time::Instant::now();
                         let cm_guard = config.cost_model.load();
                         let result = embed_dense(
                             session,
@@ -307,6 +492,7 @@ pub(super) fn run_worker(
                             config.model_variant,
                         )
                         .map_err(|e| anyhow::anyhow!("Dense embed error: {e}"));
+                        let inference_ms = t_inference.elapsed().as_millis();
                         if let Ok((_, ref stats)) = result {
                             tracing::info!(
                                 worker_id = id,
@@ -318,9 +504,20 @@ pub(super) fn run_worker(
                                 "worker: dense embed complete"
                             );
                         }
+                        log_if_abandoned_mid_flight(&reply, "dense", id, &result, inference_ms);
                         let _ = reply.send(result);
                     }
                     EmbedRequest::Sparse { texts, reply } => {
+                        if reply.is_closed() {
+                            tracing::warn!(
+                                worker_id = id,
+                                route = "sparse",
+                                batch_size = texts.len(),
+                                "request abandoned by client before dispatch — skipping inference"
+                            );
+                            continue;
+                        }
+                        let t_inference = std::time::Instant::now();
                         let cm_guard = config.cost_model.load();
                         let result = embed_sparse(
                             session,
@@ -330,6 +527,7 @@ pub(super) fn run_worker(
                             config.model_variant,
                         )
                         .map_err(|e| anyhow::anyhow!("Sparse embed error: {e}"));
+                        let inference_ms = t_inference.elapsed().as_millis();
                         if let Ok((_, ref stats)) = result {
                             tracing::info!(
                                 worker_id = id,
@@ -341,13 +539,25 @@ pub(super) fn run_worker(
                                 "worker: sparse embed complete"
                             );
                         }
+                        log_if_abandoned_mid_flight(&reply, "sparse", id, &result, inference_ms);
                         let _ = reply.send(result);
                     }
                     EmbedRequest::Both { texts, reply } => {
+                        if reply.is_closed() {
+                            tracing::warn!(
+                                worker_id = id,
+                                route = "both",
+                                batch_size = texts.len(),
+                                "request abandoned by client before dispatch — skipping inference"
+                            );
+                            continue;
+                        }
+                        let t_inference = std::time::Instant::now();
                         let cm_guard = config.cost_model.load();
                         let result =
                             embed_both(session, tokenizer, &texts, &cm_guard, config.model_variant)
                                 .map_err(|e| anyhow::anyhow!("Dual embed error: {e}"));
+                        let inference_ms = t_inference.elapsed().as_millis();
                         if let Ok((_, ref stats)) = result {
                             tracing::info!(
                                 worker_id = id,
@@ -359,11 +569,13 @@ pub(super) fn run_worker(
                                 "worker: both embed complete"
                             );
                         }
+                        log_if_abandoned_mid_flight(&reply, "both", id, &result, inference_ms);
                         let _ = reply.send(result);
                     }
                     EmbedRequest::Probe { texts, reply } => {
                         // Probe: tokenize once without padding, run dense inference
                         // on a single flat batch at the chunk's natural max_seq.
+                        // Probes are internal — no client-disconnect path applies.
                         let result = run_probe_batch(session, tokenizer, &texts);
                         let _ = reply.send(result);
                     }

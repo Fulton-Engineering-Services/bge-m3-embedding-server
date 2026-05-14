@@ -18,6 +18,7 @@ use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use axum::extract::State;
+use axum::http::HeaderMap;
 use axum::Json;
 use tokio::sync::Semaphore;
 
@@ -52,7 +53,9 @@ async fn dense_embeddings_blocks_when_no_permits_available() {
     };
     // Fire the request in a background task.
     let state_clone = Arc::clone(&state);
-    let handle = tokio::spawn(async move { dense_embeddings(State(state_clone), Json(req)).await });
+    let handle = tokio::spawn(async move {
+        dense_embeddings(State(state_clone), HeaderMap::new(), Json(req)).await
+    });
     // Give the task time to start and attempt permit acquisition.
     tokio::time::sleep(Duration::from_millis(20)).await;
     assert!(

@@ -24,8 +24,56 @@ use tokio::task::JoinHandle;
 use tracing::{info, info_span, Instrument};
 
 use super::math::median_usize;
+use super::trt_warmup::shard_shapes;
 use super::types::{DualEmbedding, EmbedRequest, EmbedStats, ProbeResult, SparseEmbedding};
 use super::worker::{run_worker, WorkerConfig};
+use crate::config::EpSelection;
+
+/// Awaits worker `id`'s readiness signal, but also resolves immediately if the
+/// worker's `JoinHandle` finishes before signaling readiness.
+///
+/// This is the defensive half of the leader-failure fix: `EmbedPool::spawn`
+/// itself owns the original `ready_tx`, which it cannot drop until after every
+/// follower has been spawned. If the worker panics — or for any future reason
+/// drops its `ready_tx` clone before sending — `ready_rx.recv()` would never
+/// see `None` (the init task's own clone is still alive) and the init future
+/// would park forever. Selecting on the `JoinHandle` guarantees we always make
+/// progress when the worker exits, regardless of whether the worker had a
+/// chance to send its outcome.
+///
+/// Returns the worker's `rss_delta` on success. Both branches are propagated
+/// as a typed `Result<usize>` so callers can short-circuit with `?` and avoid
+/// duplicating error-construction logic at every spawn site.
+async fn await_worker_signal(
+    id: usize,
+    handle: &mut JoinHandle<Result<()>>,
+    ready_rx: &mut mpsc::Receiver<Result<usize>>,
+) -> Result<usize> {
+    tokio::select! {
+        // Bias toward the explicit ready signal: if the worker both sent
+        // `Err(...)` and then returned `Err(...)`, both branches are ready and
+        // the in-band failure message is more actionable than the join error.
+        biased;
+        msg = ready_rx.recv() => match msg {
+            Some(Ok(delta)) => Ok(delta),
+            Some(Err(e)) => Err(anyhow::anyhow!("Worker {id} failed to load models: {e}")),
+            None => Err(anyhow::anyhow!(
+                "Worker {id} exited before signaling readiness"
+            )),
+        },
+        join_res = handle => match join_res {
+            Ok(Ok(())) => Err(anyhow::anyhow!(
+                "Worker {id} exited cleanly without signaling readiness"
+            )),
+            Ok(Err(e)) => Err(anyhow::anyhow!(
+                "Worker {id} exited with error before signaling ready: {e}"
+            )),
+            Err(panic_err) => Err(anyhow::anyhow!(
+                "Worker {id} panicked before signaling ready: {panic_err}"
+            )),
+        },
+    }
+}
 
 /// Async handle to the embedding worker thread pool.
 ///
@@ -59,11 +107,33 @@ pub struct EmbedPool {
 impl EmbedPool {
     /// Spawns `n` embedding worker threads and returns the pool plus an init
     /// handle that resolves once all workers have finished loading their models.
+    ///
+    /// When a GPU execution provider (`cuda` or `tensorrt`) is selected, `n` is
+    /// clamped to `config.gpu_count`: each worker is pinned to a distinct CUDA
+    /// device (`device_id = worker_index % gpu_count`). For TRT, the full
+    /// warmup shape list is sharded across workers via a stride partition so
+    /// each GPU compiles a disjoint subset in parallel, then shares the results
+    /// via the EFS engine cache.
+    #[allow(clippy::too_many_lines)]
     pub fn spawn(
         n: usize,
         cache_dir: PathBuf,
         config: WorkerConfig,
     ) -> (Self, JoinHandle<Result<()>>) {
+        let gpu_count = config.gpu_count.max(1);
+        let n = if config.ep != EpSelection::Cpu && n > gpu_count {
+            tracing::warn!(
+                requested = n,
+                clamped = gpu_count,
+                ep = %config.ep,
+                gpu_count,
+                "BGE_M3_WORKERS exceeds BGE_M3_GPU_COUNT for GPU EP — clamping. \
+                 Set BGE_M3_GPU_COUNT to match the number of GPU devices on this instance."
+            );
+            gpu_count
+        } else {
+            n
+        };
         let capacity = n * 4;
         let (tx, rx) = mpsc::channel::<EmbedRequest>(capacity);
         let rx = Arc::new(Mutex::new(rx));
@@ -104,6 +174,33 @@ impl EmbedPool {
                     })
                 };
 
+                // Build a per-worker config: assign CUDA device ID and, for TRT
+                // EP with multiple workers, shard the warmup shapes across GPUs.
+                // The device_id is computed as `worker_index % gpu_count` so
+                // workers round-robin across available GPUs. Shard partition is
+                // stride-based so the most expensive shapes land on different
+                // workers — see `trt_warmup::shard_shapes` for the rationale.
+                let make_worker_config = |id: usize| -> WorkerConfig {
+                    let mut wc = config.clone();
+                    wc.device_id =
+                        u32::try_from(id).unwrap_or(0) % u32::try_from(gpu_count).unwrap_or(1);
+                    if config.ep == EpSelection::TensorRt
+                        && n > 1
+                        && !config.trt_warmup_shapes.is_empty()
+                    {
+                        wc.trt_warmup_shapes = shard_shapes(&config.trt_warmup_shapes, id, n);
+                        info!(
+                            worker_id = id,
+                            gpu_device = wc.device_id,
+                            shard_shapes = wc.trt_warmup_shapes.len(),
+                            total_shapes = config.trt_warmup_shapes.len(),
+                            total_workers = n,
+                            "TRT multi-GPU: worker assigned GPU device with warmup shard"
+                        );
+                    }
+                    wc
+                };
+
                 // Collect per-worker RSS deltas for median aggregation.
                 // Median is robust to one outlier from transient kernel snapshot
                 // quirk (page-cache settling, ORT arena init jitter) while still
@@ -111,26 +208,15 @@ impl EmbedPool {
                 let mut rss_deltas: Vec<usize> = Vec::with_capacity(n);
 
                 // --- Phase 1: spawn leader worker (may download models) ---
-                worker_handles.push(spawn_worker(0, ready_tx.clone(), config.clone()));
-
-                match ready_rx.recv().await {
-                    Some(Ok(delta)) => {
-                        loaded_workers_for_init.fetch_add(1, Ordering::AcqRel);
-                        rss_deltas.push(delta);
-                        info!(
-                            rss_delta_mb = delta / (1024 * 1024),
-                            "Leader worker ready, model cache warm (1/{n})"
-                        );
-                    }
-                    Some(Err(e)) => {
-                        return Err(anyhow::anyhow!("Leader worker failed to load models: {e}"));
-                    }
-                    None => {
-                        return Err(anyhow::anyhow!(
-                            "Leader worker exited before signaling readiness"
-                        ));
-                    }
-                }
+                let mut leader_handle = spawn_worker(0, ready_tx.clone(), make_worker_config(0));
+                let leader_msg = await_worker_signal(0, &mut leader_handle, &mut ready_rx).await?;
+                worker_handles.push(leader_handle);
+                loaded_workers_for_init.fetch_add(1, Ordering::AcqRel);
+                rss_deltas.push(leader_msg);
+                info!(
+                    rss_delta_mb = leader_msg / (1024 * 1024),
+                    "Leader worker ready, model cache warm (1/{n})"
+                );
 
                 // --- Phase 2: spawn follower workers one at a time.
                 //
@@ -146,27 +232,16 @@ impl EmbedPool {
                 // Startup cost: ~4-6s per worker × 6 followers ≈ 24-36s total,
                 // well within the configured startPeriod (300s).
                 for id in 1..n {
-                    worker_handles.push(spawn_worker(id, ready_tx.clone(), config.clone()));
-
-                    match ready_rx.recv().await {
-                        Some(Ok(delta)) => {
-                            loaded_workers_for_init.fetch_add(1, Ordering::AcqRel);
-                            rss_deltas.push(delta);
-                            info!(
-                                rss_delta_mb = delta / (1024 * 1024),
-                                "Follower worker signaled ready ({}/{n})",
-                                id + 1
-                            );
-                        }
-                        Some(Err(e)) => {
-                            return Err(anyhow::anyhow!("Worker {id} failed to load models: {e}"));
-                        }
-                        None => {
-                            return Err(anyhow::anyhow!(
-                                "Worker {id} exited before signaling readiness ({id}/{n})"
-                            ));
-                        }
-                    }
+                    let mut handle = spawn_worker(id, ready_tx.clone(), make_worker_config(id));
+                    let delta = await_worker_signal(id, &mut handle, &mut ready_rx).await?;
+                    worker_handles.push(handle);
+                    loaded_workers_for_init.fetch_add(1, Ordering::AcqRel);
+                    rss_deltas.push(delta);
+                    info!(
+                        rss_delta_mb = delta / (1024 * 1024),
+                        "Follower worker signaled ready ({}/{n})",
+                        id + 1
+                    );
                 }
 
                 drop(ready_tx);
@@ -312,6 +387,22 @@ impl EmbedPool {
     #[must_use]
     pub fn model_rss_per_worker_bytes(&self) -> usize {
         self.model_rss_per_worker_bytes.load(Ordering::Acquire)
+    }
+
+    /// Returns a clone of the `Arc<AtomicUsize>` backing `live_worker_count`.
+    ///
+    /// Used by the warmup-only path in `lib.rs` to poll worker exit progress
+    /// AFTER the [`EmbedPool`] itself has been dropped. Dropping the pool
+    /// closes the request channel, which signals workers to break out of
+    /// their receive loops and drop their ORT sessions; the live counter is
+    /// the only readable signal that those drop paths have completed.
+    ///
+    /// Returning a clone of the raw `Arc` (rather than a snapshot) lets the
+    /// caller hold a reference across the drop boundary without having to
+    /// keep the pool's other state alive.
+    #[must_use]
+    pub fn live_workers_for_shutdown(&self) -> Arc<AtomicUsize> {
+        Arc::clone(&self.live_workers)
     }
 }
 
