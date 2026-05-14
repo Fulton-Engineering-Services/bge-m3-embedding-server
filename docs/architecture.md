@@ -57,9 +57,11 @@ is the thin binary entry point. Each large module is a facade (`mod.rs`-free
 | `config` | `src/config.rs` | Env-var configuration (`Config::from_env`), cost-model override resolution |
 | `state` | `src/state.rs` | Shared `AppState` struct, `TuningInfo` for `/health`, `ProbeStatus` enum |
 | `handler` | `src/handler.rs` + `src/handler/` | HTTP handlers (`dense`, `sparse`, `both`, `health`, `models`) and shared input validation |
-| `embedder` | `src/embedder.rs` + `src/embedder/` | Worker pool, ORT session + tokenizer loading, tokenize-once + bin-pack inference; submodules include `pool`, `worker`, `dense`, `sparse`, `dual`, `session`, `tokenize`, `math`, `model_files`, `types`, `error` |
+| `embedder` | `src/embedder.rs` + `src/embedder/` | Worker pool, ORT session + tokenizer loading, tokenize-once + bin-pack inference; submodules include `pool`, `worker`, `dense`, `sparse`, `dual`, `session`, `tokenize`, `math`, `model_files`, `types`, `error`, `trt_cache` (TRT engine-cache snapshots, fsync durability), and `trt_warmup` (`runner` + `postcondition` — pre-compiles TensorRT engine files at worker startup, with the 4-extreme-shape warm-cache fast path) |
 | `binpack` | `src/binpack.rs` | `CostModel` + quadratic-aware bin-packer |
-| `sysinfo` | `src/sysinfo.rs` | Memory detection (cgroup v2/v1 → host RAM) and RSS reads |
+| `sysinfo` | `src/sysinfo.rs` | Memory detection (cgroup v2/v1 → host RAM), RSS reads, and Linux NVIDIA GPU count auto-detection (`/proc/driver/nvidia/gpus/`) |
+| `gpu_stats` | `src/gpu_stats.rs` | NVML-backed per-device GPU stats (VRAM used/total, GPU utilization, die temperature in °C and °F) used by the heartbeat logger on `cuda` / `tensorrt` builds; compiled as a zero-cost stub on CPU builds |
+| `logging` | `src/logging.rs` + `src/logging/` | Tracing-subscriber setup (`json` / `text` / `pretty`) and the build-variant tagger that prefixes every JSON log line with `bge_module:"server"` and `build:"cuda" \| "cpu"` |
 | `probe` | `src/probe.rs` + `src/probe/` | Startup workspace probe and least-squares coefficient fitting; submodules include `runner`, `fit`, `cache`, `corpus`, `validate` |
 | `weights` | `src/weights.rs` | Bundled sparse-linear projection weights (`sparse_linear.safetensors`) |
 | `models` | `src/models.rs` | Request/response serde types |

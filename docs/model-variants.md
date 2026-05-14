@@ -144,10 +144,10 @@ See [coreml-ep.md](coreml-ep.md) for the full CoreML dispatch analysis.
 | INT8 + Linux (MLAS) | 7 | ~568 MB | ~5–6 GB |
 | FP32 + CoreML | 2 | ~2.16 GB | ~25–44 GB |
 | FP16 + CoreML | 1 | ~1.08 GB | ~10–18 GB |
-| FP16 + CUDA EP | 1 (clamped) | ~1.08 GB weights + VRAM | VRAM budget 10 GiB (default); set `BGE_M3_GPU_VRAM_BUDGET_BYTES` to adjust |
-| FP16 + TensorRT EP | 1 (clamped) | ~1.08 GB weights + VRAM | Same as CUDA EP; TRT engines cached to `{cache_dir}/trt-engines/` |
+| FP16 + CUDA EP | clamped to `BGE_M3_GPU_COUNT` | ~1.08 GB weights + VRAM per GPU | VRAM budget 10 GiB (default); set `BGE_M3_GPU_VRAM_BUDGET_BYTES` to adjust |
+| FP16 + TensorRT EP | clamped to `BGE_M3_GPU_COUNT` | ~1.08 GB weights + VRAM per GPU | Same as CUDA EP; TRT engines cached to `{cache_dir}/trt-engines/`; TRT timing cache at `{cache_dir}/trt-timing` |
 
-GPU EP workers are always clamped to 1 — see [GPU Execution Providers](../README.md#gpu-execution-providers-cuda--tensorrt) in the README.
+GPU EP workers are clamped to `BGE_M3_GPU_COUNT` (auto-detected on Linux from `/proc/driver/nvidia/gpus/`, default `1` elsewhere); each worker is pinned to a distinct CUDA device (`device_id = worker_index % gpu_count`). Set `BGE_M3_WORKERS = BGE_M3_GPU_COUNT` on multi-GPU instances for maximum parallel inference throughput. See [GPU Execution Providers](../README.md#gpu-execution-providers-cuda--tensorrt) in the README.
 
 At `BGE_M3_MAX_SEQ_LENGTH=8192`, each individual `session.run()` call at a single text
 uses ~671 MB of intermediate workspace (conservative estimate). The bin-packer ensures

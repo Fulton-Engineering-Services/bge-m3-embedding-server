@@ -533,15 +533,19 @@ or `BGE_M3_EP=tensorrt`. The production Docker image for GPU deployments uses th
 
 | Aspect | CPU (MLAS) | CoreML | CUDA EP | TensorRT EP |
 |--------|-----------|--------|---------|-------------|
-| Workers | 2–7 (configurable) | 1–2 | **1 (clamped)** | **1 (clamped)** |
+| Workers | 2–7 (configurable) | 1–2 | **clamped to `BGE_M3_GPU_COUNT`** | **clamped to `BGE_M3_GPU_COUNT`** |
 | Startup probe | Yes (Linux) | No (macOS) | **Bypassed** | **Bypassed** |
 | Workspace budget | Probe-derived (`max_workspace_bytes`) | macOS conservative defaults | `BGE_M3_GPU_VRAM_BUDGET_BYTES` (default 10 GiB) | Same |
-| Engine caching | Probe cache JSON | CoreML `.mlmodelc` | N/A | TRT engine files (`{cache_dir}/trt-engines/`) |
-| First-inference cold start | Normal | CoreML compilation (~15 s) | Normal | **~90–180 min first deploy on an L4 (16-shape grid compile); seconds thereafter (engine cache hit, fsynced per shape). Use `BGE_M3_WARMUP_ONLY=1` as an ECS init container to decouple compilation from service startup — see [README: ECS Init Container Pattern](../README.md#ecs-init-container-pattern-tensorrt).** |
+| Engine caching | Probe cache JSON | CoreML `.mlmodelc` | N/A | TRT engine files (`{cache_dir}/trt-engines/`) plus a TRT timing cache at `{cache_dir}/trt-timing` |
+| First-inference cold start | Normal | CoreML compilation (~15 s) | Normal | **~90–180 min first deploy on an L4 (default 16-shape `{1,4,16,32}×{128,512,2048,8192}` grid compile); seconds thereafter (engine cache hit, fsynced per shape). Multi-GPU init containers shard the warmup grid across workers via stride partition (~N× faster cold compile). Use `BGE_M3_WARMUP_ONLY=1` as an ECS init container to decouple compilation from service startup — see [README: ECS Init Container Pattern](../README.md#ecs-init-container-pattern-tensorrt).** |
 
-**Why workers = 1 for GPU EPs:** The GPU is a serial inference resource. Multiple ORT sessions
-on the same GPU would each hold VRAM but share the same compute units without throughput gain.
-Multi-stream GPU concurrency is a future enhancement.
+**Why workers = `BGE_M3_GPU_COUNT` for GPU EPs:** Each worker is pinned to a distinct CUDA device
+(`device_id = worker_index % gpu_count`). On a single-GPU instance the default `BGE_M3_GPU_COUNT=1`
+preserves the original "one worker per GPU" behavior. On a multi-GPU instance, setting
+`BGE_M3_WORKERS = BGE_M3_GPU_COUNT` runs an independent ORT session on each GPU for maximum
+parallel inference throughput. `BGE_M3_GPU_COUNT` is auto-detected on Linux from
+`/proc/driver/nvidia/gpus/`; override it explicitly on multi-GPU ECS tasks. Multi-stream
+concurrency on a single GPU remains a future enhancement.
 
 ### Projected Throughput vs CPU
 
