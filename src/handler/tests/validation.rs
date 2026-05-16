@@ -14,9 +14,7 @@
 
 use axum::http::{header, HeaderValue};
 
-use super::super::common::{
-    check_ready, codekeeper_project, collect_x_headers, validate_input, MAX_STRING_CHARS,
-};
+use super::super::common::{check_ready, collect_x_headers, validate_input, MAX_STRING_CHARS};
 use super::helpers::make_state;
 use crate::error::AppError;
 
@@ -91,6 +89,8 @@ fn check_ready_returns_err_when_pool_dead() {
 
 // ── collect_x_headers ─────────────────────────────────────────────────────
 
+// ── collect_x_headers ─────────────────────────────────────────────────────
+
 #[test]
 fn collect_x_headers_collects_x_prefix_and_skips_standard() {
     let mut headers = axum::http::HeaderMap::new();
@@ -105,7 +105,8 @@ fn collect_x_headers_collects_x_prefix_and_skips_standard() {
 
     let result = collect_x_headers(&headers);
     assert!(!result.is_empty());
-    assert_eq!(result.0.get("x-foo").map(String::as_str), Some("bar"));
+    // Key is normalized: hyphen → underscore
+    assert_eq!(result.0.get("x_foo").map(String::as_str), Some("bar"));
     assert_eq!(result.0.len(), 1, "content-type must be excluded");
 }
 
@@ -128,6 +129,31 @@ fn collect_x_headers_no_x_prefix_produces_empty() {
 }
 
 #[test]
+fn collect_x_headers_normalizes_hyphens_to_underscores() {
+    let mut headers = axum::http::HeaderMap::new();
+    headers.insert(
+        axum::http::HeaderName::from_static("x-codekeeper-project"),
+        HeaderValue::from_static("my-project"),
+    );
+    headers.insert(
+        axum::http::HeaderName::from_static("x-request-id"),
+        HeaderValue::from_static("abc123"),
+    );
+    let result = collect_x_headers(&headers);
+    // Normalized keys — safe as JSON identifiers and log-path components
+    assert_eq!(
+        result.0.get("x_codekeeper_project").map(String::as_str),
+        Some("my-project")
+    );
+    assert_eq!(
+        result.0.get("x_request_id").map(String::as_str),
+        Some("abc123")
+    );
+    // Original hyphenated keys must NOT be present
+    assert!(!result.0.contains_key("x-codekeeper-project"));
+}
+
+#[test]
 fn collect_x_headers_multiple_x_headers_sorted() {
     let mut headers = axum::http::HeaderMap::new();
     headers.insert(
@@ -140,37 +166,19 @@ fn collect_x_headers_multiple_x_headers_sorted() {
     );
     let result = collect_x_headers(&headers);
     let keys: Vec<&str> = result.0.keys().map(String::as_str).collect();
-    // BTreeMap guarantees alphabetical order
-    assert_eq!(keys, vec!["x-project", "x-request-id"]);
-}
-
-// ── codekeeper_project ─────────────────────────────────────────────────────
-
-#[test]
-fn codekeeper_project_returns_header_when_present() {
-    let mut headers = axum::http::HeaderMap::new();
-    headers.insert(
-        axum::http::HeaderName::from_static("x-codekeeper-project"),
-        HeaderValue::from_static("my-project"),
-    );
-
-    assert_eq!(codekeeper_project(&headers).as_deref(), Some("my-project"));
+    // BTreeMap guarantees alphabetical order; keys are underscore-normalized
+    assert_eq!(keys, vec!["x_project", "x_request_id"]);
 }
 
 #[test]
-fn codekeeper_project_returns_none_when_missing() {
-    let headers = axum::http::HeaderMap::new();
-    assert_eq!(codekeeper_project(&headers), None);
-}
-
-#[test]
-fn codekeeper_project_returns_none_for_non_utf8_header() {
+fn collect_x_headers_skips_non_utf8_values() {
     let mut headers = axum::http::HeaderMap::new();
     let non_utf8 = HeaderValue::from_bytes(&[0x66, 0x6f, 0x80, 0x6f]).expect("valid header bytes");
     headers.insert(
-        axum::http::HeaderName::from_static("x-codekeeper-project"),
+        axum::http::HeaderName::from_static("x-bad-encoding"),
         non_utf8,
     );
-
-    assert_eq!(codekeeper_project(&headers), None);
+    // Non-UTF-8 header silently skipped — map is empty
+    let result = collect_x_headers(&headers);
+    assert!(result.is_empty());
 }

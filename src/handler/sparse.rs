@@ -19,7 +19,7 @@ use std::time::Instant;
 
 use axum::{extract::State, http::HeaderMap, Json};
 
-use super::common::{check_ready, codekeeper_project, collect_x_headers, validate_input};
+use super::common::{check_ready, collect_x_headers, validate_input};
 use crate::error::AppError;
 use crate::models::{SparseEmbeddingData, SparseRequest, SparseResponse, SparseValues};
 use crate::state::AppState;
@@ -46,8 +46,6 @@ use crate::state::AppState;
         tokenize_ms,
         inference_ms,
         total_ms,
-        codekeeper_project = tracing::field::Empty,
-        x_headers = tracing::field::Empty
     )
 )]
 pub async fn sparse_embeddings(
@@ -56,16 +54,7 @@ pub async fn sparse_embeddings(
     Json(req): Json<SparseRequest>,
 ) -> Result<Json<SparseResponse>, AppError> {
     check_ready(&state)?;
-    if let Some(project) = codekeeper_project(&headers) {
-        tracing::Span::current().record("codekeeper_project", tracing::field::display(project));
-    }
     let x_headers = collect_x_headers(&headers);
-    if !x_headers.is_empty() {
-        tracing::Span::current().record(
-            "x_headers",
-            tracing::field::display(serde_json::to_string(&x_headers).unwrap_or_default()),
-        );
-    }
     let texts = req.input.0;
     validate_input(&texts, state.max_batch)?;
     let batch_size = texts.len();
@@ -87,6 +76,8 @@ pub async fn sparse_embeddings(
         .record("tokenize_ms", embed_stats.tokenize_ms)
         .record("inference_ms", embed_stats.inference_ms)
         .record("total_ms", total_ms);
+    let x_headers_val = (!x_headers.is_empty())
+        .then(|| serde_json::to_string(&x_headers).unwrap_or_default());
     tracing::info!(
         route = "sparse",
         batch_size,
@@ -96,6 +87,7 @@ pub async fn sparse_embeddings(
         tokenize_ms = embed_stats.tokenize_ms,
         inference_ms = embed_stats.inference_ms,
         total_ms,
+        x_headers = x_headers_val,
         "embedding request complete"
     );
 

@@ -57,28 +57,22 @@ impl fmt::Display for XHeaders {
 /// Collects all headers whose name starts with `x-` (case-insensitive) into
 /// an [`XHeaders`] map.
 ///
-/// Header names are stored in their lowercase-normalized form (axum's
-/// [`HeaderMap`] already lowercases all names). Headers whose values are
-/// not valid UTF-8 are silently skipped.
+/// Header names are normalized: lowercase (axum guarantees this) and hyphens
+/// replaced with underscores so each key is a valid JSON identifier and can
+/// be referenced by log-processing tools that use JSON path notation
+/// (e.g. `x-codekeeper-project` → key `x_codekeeper_project`).
+/// Headers with non-UTF-8 values are silently skipped.
 pub(super) fn collect_x_headers(headers: &HeaderMap) -> XHeaders {
     let mut map = BTreeMap::new();
     for (name, value) in headers {
         let name_str = name.as_str();
         if name_str.starts_with("x-") {
             if let Ok(val) = value.to_str() {
-                map.insert(name_str.to_owned(), val.to_owned());
+                map.insert(name_str.replace('-', "_"), val.to_owned());
             }
         }
     }
     XHeaders(map)
-}
-
-/// Extracts the `x-codekeeper-project` header value if present and UTF-8.
-pub(super) fn codekeeper_project(headers: &HeaderMap) -> Option<String> {
-    headers
-        .get("x-codekeeper-project")
-        .and_then(|value| value.to_str().ok())
-        .map(ToOwned::to_owned)
 }
 
 /// Maximum characters allowed per individual input string (SEC-3).
