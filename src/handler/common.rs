@@ -73,6 +73,14 @@ pub(super) fn collect_x_headers(headers: &HeaderMap) -> XHeaders {
     XHeaders(map)
 }
 
+/// Extracts the `x-codekeeper-project` header value if present and UTF-8.
+pub(super) fn codekeeper_project(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get("x-codekeeper-project")
+        .and_then(|value| value.to_str().ok())
+        .map(ToOwned::to_owned)
+}
+
 /// Maximum characters allowed per individual input string (SEC-3).
 pub(super) const MAX_STRING_CHARS: usize = 32_768;
 
