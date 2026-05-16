@@ -2,6 +2,12 @@
 # This image is linux/amd64 only — no ARM GPU instance types exist.
 # Requires NVIDIA Container Toolkit on the host / ECS GPU AMI.
 
+# CACHE_GC_FEATURES: set to "cache-gc" to build the maintenance binary that
+# can delete stale-SM engine plans from the shared EFS cache.
+# WARNING: do NOT deploy this image against a production EFS cache shared
+# by a multi-SM ASG. See src/embedder/trt_cache_gc.rs for hazard details.
+ARG CACHE_GC_FEATURES=""
+
 # ── Builder stage ─────────────────────────────────────────────────────────────
 # Use the CUDA devel image so nvcc and CUDA headers are present at build time.
 FROM nvidia/cuda:12.6.0-cudnn-devel-ubuntu24.04 AS builder
@@ -61,15 +67,16 @@ WORKDIR /app
 # benches/ stubs are required for all [[bench]] targets because Cargo validates
 # source paths at manifest parse time, even though cargo build --release skips
 # bench compilation.
+ARG CACHE_GC_FEATURES
 COPY Cargo.toml Cargo.lock build.rs ./
 RUN mkdir src && echo "fn main(){}" > src/main.rs && touch src/lib.rs \
     && mkdir -p benches/coreml && touch benches/embeddings.rs benches/coreml/main.rs \
-    && cargo build --release --features cuda,tensorrt \
+    && cargo build --release --features "cuda,tensorrt ${CACHE_GC_FEATURES}" \
     && rm -rf src benches
 
 COPY src ./src
 COPY benches ./benches
-RUN touch src/main.rs && cargo build --release --features cuda,tensorrt
+RUN touch src/main.rs && cargo build --release --features "cuda,tensorrt ${CACHE_GC_FEATURES}"
 
 # ── Runtime stage ──────────────────────────────────────────────────────────────
 # Only the CUDA runtime libs are needed at inference time — not the full devel
