@@ -160,6 +160,7 @@ pub(crate) fn bin_pack(seq_lengths: &[usize], cost_model: &CostModel) -> Vec<Vec
         } else {
             // Flush the current chunk and start a new one.
             tracing::info!(
+                target: "bge_m3_embedding_server::binpack",
                 chunk_idx = chunks.len(),
                 chunk_batch = current.len(),
                 chunk_max_seq = current_max_seq,
@@ -175,6 +176,7 @@ pub(crate) fn bin_pack(seq_lengths: &[usize], cost_model: &CostModel) -> Vec<Vec
 
     if !current.is_empty() {
         tracing::info!(
+            target: "bge_m3_embedding_server::binpack",
             chunk_idx = chunks.len(),
             chunk_batch = current.len(),
             chunk_max_seq = current_max_seq,
