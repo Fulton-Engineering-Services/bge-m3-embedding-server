@@ -54,8 +54,24 @@ pub(super) struct ShapeRunResult {
 /// 2026-05 codekeeper outage (TRT EP silently failing to write engine plan
 /// files even though `session.run()` returned `Ok(_)`).
 ///
+/// `sm` selects which engine plans count toward the before/after snapshots:
+/// `Some("smXY")` filters to plans matching this worker's GPU compute
+/// capability so a heterogeneous cache (e.g. stale `sm89` plans next to
+/// fresh `sm120` plans) is never miscounted; `None` is a passthrough that
+/// counts every `.engine` file (legacy behaviour, used when detection failed).
+/// See [`super::super::trt_cache::engine_files_for_sm`] for the filter
+/// semantics.
+///
 /// The `shape_index` / `shape_total` parameters are purely for the
 /// operator-visible log message and do not affect logic.
+///
+/// `#[allow(clippy::too_many_arguments)]` is acceptable here because every
+/// argument is logically distinct — `(batch, seq)` already has its own
+/// pair-of-`usize` shape, and bundling the remaining diagnostic positional
+/// fields (`worker_id`, `shape_index`, `shape_total`, `sm`) into an
+/// auxiliary struct would obscure the per-shape ergonomics for the only
+/// caller, `trt_prewarm`.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn run_warmup_shape(
     session: &mut ort::session::Session,
     batch: usize,
@@ -64,11 +80,12 @@ pub(super) fn run_warmup_shape(
     shape_index: usize,
     shape_total: usize,
     engine_cache_dir: &Path,
+    sm: Option<&str>,
 ) -> ShapeRunResult {
     let ids = ndarray::Array2::<i64>::zeros((batch, seq));
     let mask = ndarray::Array2::<i64>::ones((batch, seq));
 
-    let engine_count_before = trt_cache::count_engine_files(engine_cache_dir);
+    let engine_count_before = trt_cache::count_engine_files_for_sm(engine_cache_dir, sm);
 
     tracing::info!(
         worker_id,
@@ -77,6 +94,7 @@ pub(super) fn run_warmup_shape(
         shape_index,
         shape_total,
         engine_count_before,
+        detected_sm = sm.unwrap_or("unfiltered"),
         "TensorRT pre-warm: running shape (cold compile may take 30–170 s)"
     );
 
@@ -95,7 +113,7 @@ pub(super) fn run_warmup_shape(
             trt_cache::fsync_cache_dir(engine_cache_dir);
             let fsync_ms = u64::try_from(fsync_start.elapsed().as_millis()).unwrap_or(u64::MAX);
 
-            let engine_count_after = trt_cache::count_engine_files(engine_cache_dir);
+            let engine_count_after = trt_cache::count_engine_files_for_sm(engine_cache_dir, sm);
             let engine_count_increased = engine_count_after > engine_count_before;
 
             // A non-cache-hit run that reports `Ok(_)` from session.run() but
@@ -121,6 +139,7 @@ pub(super) fn run_warmup_shape(
                     fsync_ms,
                     engine_count_before,
                     engine_count_after,
+                    detected_sm = sm.unwrap_or("unfiltered"),
                     cache_path = %engine_cache_dir.display(),
                     "TensorRT pre-warm: compile-success log fired but engine_count is still \
                      zero — TRT EP may not be persisting engine plan files"
@@ -139,6 +158,7 @@ pub(super) fn run_warmup_shape(
                 engine_count_before,
                 engine_count_after,
                 engine_count_increased,
+                detected_sm = sm.unwrap_or("unfiltered"),
                 "TensorRT pre-warm: engine compiled, cached, and fsynced"
             );
             ShapeRunResult {
@@ -149,7 +169,7 @@ pub(super) fn run_warmup_shape(
             }
         }
         Err(e) => {
-            let engine_count_after = trt_cache::count_engine_files(engine_cache_dir);
+            let engine_count_after = trt_cache::count_engine_files_for_sm(engine_cache_dir, sm);
             tracing::warn!(
                 worker_id,
                 batch,
@@ -160,6 +180,7 @@ pub(super) fn run_warmup_shape(
                 cache_hit,
                 engine_count_before,
                 engine_count_after,
+                detected_sm = sm.unwrap_or("unfiltered"),
                 error = %e,
                 "TensorRT pre-warm: engine compilation failed for shape; \
                  first real request for this shape will trigger an on-demand compile"

@@ -30,6 +30,7 @@ use super::dense::embed_dense;
 use super::dual::embed_both;
 use super::error::ort_err;
 use super::session::{load_models, GpuSessionConfig};
+use super::sm_detect::detect_sm_for_device;
 use super::sparse::embed_sparse;
 use super::tokenize::{build_chunk_arrays, tokenize_no_pad};
 use super::trt_cache;
@@ -53,6 +54,40 @@ const CHUNK_CACHE_HIT_THRESHOLD_MS: u64 = 5_000;
 ///
 /// Patterns verified against ORT 2.0.0-rc.12 `TensorRT` EP
 /// (`ort/src/ep/tensorrt.rs`). Re-verify on every ORT version bump.
+///
+/// # Patterns matched
+///
+/// 1. **`user allocator error`** — direct CUDA allocation failure surfaced
+///    by ORT's user-allocator shim during TRT kernel autotuning.
+/// 2. **`could not find any implementation` + (`workspace` | `alloc`)** —
+///    TRT kernel-autotuner declared no tactic fits, *and* the qualifier
+///    confirms the cause is allocation-driven (otherwise this string also
+///    matches genuine unsupported-op cases where retry is pointless).
+/// 3. **`failed to create engine` + (`workspace` | `alloc` | `memory` |
+///    `oom` | `tactic`)** — TRT EP build-time failure observed in
+///    production on 2026-05-16 (request id
+///    `fcc45087-2fcc-4539-9f76-f40dc0c0ec4a`, route
+///    `/v1/embeddings:both`, `batch_size` 256, `prompt_tokens` 12904).
+///    The qualifier is mandatory: without it, this same family also
+///    covers unsupported-op and corrupted-cache cases where retrying
+///    with a halved workspace is pointless and doubles caller-visible
+///    latency. `alloc` subsumes `cuMemAlloc`; `memory` subsumes
+///    `out of memory`.
+///
+/// # Known gap (`TODO(jpf)`)
+///
+/// The verbatim 2026-05-16 production error string did NOT include any
+/// qualifier — the TRT logger appears to emit workspace/alloc detail to a
+/// separate tracing target rather than propagating it into the outer
+/// `Status Message`. We chose **Option A** here (require a qualifier) over
+/// **Option B** (retry every `failed to create engine` unconditionally) so
+/// we don't regress `does_not_match_unsupported`-style cases. If a follow-up
+/// `CloudWatch` investigation confirms the TRT root-cause is reliably
+/// surfaced only in a sibling `target=ort` event and never in the embed
+/// error string, we may need to relax this to Option B (or pipe the TRT
+/// logger output into the embed error chain). Until then, this function
+/// will continue to return `false` for the verbatim production message and
+/// callers will see HTTP 500 on first build failure.
 fn is_trt_jit_oom(e: &anyhow::Error) -> bool {
     let s = format!("{e}");
     let lowercase = s.to_lowercase();
@@ -60,9 +95,17 @@ fn is_trt_jit_oom(e: &anyhow::Error) -> bool {
     // "Could not find any implementation" qualifies only when the underlying cause is an
     // allocation failure (workspace or alloc in the message); without this qualifier it also
     // matches genuine unsupported-layer errors where retry is pointless and doubles latency.
+    // "Failed to create engine" qualifies only when paired with a workspace/alloc/memory/oom/
+    // tactic keyword for the same reason — see the doc-comment above.
     lowercase.contains("user allocator error")
         || (lowercase.contains("could not find any implementation")
             && (lowercase.contains("workspace") || lowercase.contains("alloc")))
+        || (lowercase.contains("failed to create engine")
+            && (lowercase.contains("workspace")
+                || lowercase.contains("alloc")
+                || lowercase.contains("memory")
+                || lowercase.contains("oom")
+                || lowercase.contains("tactic")))
 }
 
 /// Wraps an embed call with the standard TRT JIT-OOM retry-once-with-halved-budget
@@ -475,6 +518,32 @@ pub(super) fn run_worker(
         }
     };
 
+    // Detect this worker's GPU compute capability (e.g. `sm89`, `sm120`) once,
+    // before TRT prewarm, so every subsequent cache enumeration restricts
+    // itself to plans matching this GPU. Without this, a worker on `sm120`
+    // would count a stale `_sm89.engine` plan toward `cache_hit` and report
+    // a misleading `engine_count_before:3` on a fresh Blackwell deploy with
+    // leftover L40S plans on the shared EFS cache — the exact 2026-05-16
+    // production failure mode. `None` (detection failed) keeps legacy
+    // unfiltered semantics so an operator missing `nvidia-smi` mid-deploy
+    // does not see a hard regression.
+    let detected_sm: Option<String> = if config.ep == EpSelection::TensorRt {
+        let sm = detect_sm_for_device(config.device_id);
+        if sm.is_none() {
+            tracing::warn!(
+                worker_id = id,
+                gpu_device = config.device_id,
+                "trt cache: nvidia-smi compute-capability detection failed; \
+                 falling back to unfiltered engine cache counts. This re-introduces \
+                 the heterogeneous-SM false-positive risk — install nvidia-smi on \
+                 the container or check that the GPU is accessible."
+            );
+        }
+        sm
+    } else {
+        None
+    };
+
     // TensorRT engine pre-warming: compile engine files for each configured
     // shape before signaling readiness.  This runs BEFORE ready_tx.send() so
     // the worker is not marked ready until all TRT engines are cached —
@@ -483,20 +552,44 @@ pub(super) fn run_worker(
     // Each shape may take 30–120 s on first deploy; subsequent starts reuse
     // the cached `.engine` files from `{cache_dir}/trt-engines/` (seconds).
     if config.ep == EpSelection::TensorRt && !config.trt_warmup_shapes.is_empty() {
+        let engine_cache_dir = trt_cache::engine_cache_path(&cache_dir);
+        let total_engine_count = trt_cache::count_engine_files(&engine_cache_dir);
+        let matching_engine_count =
+            trt_cache::count_engine_files_for_sm(&engine_cache_dir, detected_sm.as_deref());
+        // Greppable structured log line (target=bge_m3_embedding_server::trt_cache):
+        // operators searching CloudWatch for `detected_sm` / `matching_engine_count`
+        // get an immediate picture of the heterogeneous-cache situation. A line
+        // showing `matching_engine_count:0, total_engine_count:3` is the visual
+        // signature of the bug this commit fixes.
+        tracing::info!(
+            target: "bge_m3_embedding_server::trt_cache",
+            worker_id = id,
+            device_id = config.device_id,
+            detected_sm = detected_sm.as_deref().unwrap_or("unfiltered"),
+            cache_path = %engine_cache_dir.display(),
+            matching_engine_count,
+            total_engine_count,
+            "trt cache: SM-filtered engine plan enumeration"
+        );
         tracing::info!(
             worker_id = id,
             gpu_device = config.device_id,
+            detected_sm = detected_sm.as_deref().unwrap_or("unfiltered"),
             shape_count = config.trt_warmup_shapes.len(),
             shapes = ?config.trt_warmup_shapes,
             "TensorRT pre-warm: worker compiling shard \
              (first run per shape takes 30–170 s; subsequent starts reuse cache)"
         );
-        trt_cache::log_engine_basenames_before_prewarm(&trt_cache::engine_cache_path(&cache_dir));
+        trt_cache::log_engine_basenames_before_prewarm_for_sm(
+            &engine_cache_dir,
+            detected_sm.as_deref(),
+        );
         let stats = trt_prewarm(
             &mut initial_models.0,
             &config.trt_warmup_shapes,
             id,
             &cache_dir,
+            detected_sm.as_deref(),
         );
         // Per-worker postcondition: if the shard reported one or more fresh
         // (non-cache-hit) compiles but the on-disk engine count did not
@@ -509,14 +602,17 @@ pub(super) fn run_worker(
             tracing::error!(
                 worker_id = id,
                 gpu_device = config.device_id,
+                detected_sm = detected_sm.as_deref().unwrap_or("unfiltered"),
                 fresh_compiles = stats.fresh_compiles,
                 engine_count_before = stats.engine_count_before,
                 engine_count_after = stats.engine_count_after,
                 engine_count_delta = stats.engine_count_delta,
-                cache_path = %trt_cache::engine_cache_path(&cache_dir).display(),
+                cache_path = %engine_cache_dir.display(),
                 "TensorRT pre-warm postcondition failed: \
-                 compile-success events present but no .engine files on disk; \
-                 TRT EP may be silently failing to persist engine plan files"
+                 compile-success events present but no .engine files on disk \
+                 for this SM; TRT EP may be silently failing to persist engine \
+                 plan files (or building plans for a different SM than this \
+                 worker's device)"
             );
         } else if prewarm_persistence_suspicious_undercount(
             stats.fresh_compiles,
@@ -532,11 +628,12 @@ pub(super) fn run_worker(
             tracing::warn!(
                 worker_id = id,
                 gpu_device = config.device_id,
+                detected_sm = detected_sm.as_deref().unwrap_or("unfiltered"),
                 fresh_compiles = stats.fresh_compiles,
                 engine_count_before = stats.engine_count_before,
                 engine_count_after = stats.engine_count_after,
                 engine_count_delta = stats.engine_count_delta,
-                cache_path = %trt_cache::engine_cache_path(&cache_dir).display(),
+                cache_path = %engine_cache_dir.display(),
                 "TensorRT pre-warm: engine_count_delta is suspiciously low \
                  relative to fresh_compiles (delta * 2 < fresh_compiles); \
                  some engine plans may not have persisted to disk despite \
@@ -546,6 +643,7 @@ pub(super) fn run_worker(
         }
         tracing::info!(
             worker_id = id,
+            detected_sm = detected_sm.as_deref().unwrap_or("unfiltered"),
             warmed = stats.warmed,
             skipped = stats.skipped,
             fully_cached = stats.fully_cached,
@@ -595,9 +693,10 @@ pub(super) fn run_worker(
         if config.ep == EpSelection::TensorRt {
             if let Some(ref mut bcast_rx) = engine_propagation_rx {
                 if let Some((session, _)) = models.as_mut() {
+                    let sm = detected_sm.as_deref();
                     drain_engine_propagation(bcast_rx, &mut warmed_local, id, |shape| {
                         let started = std::time::Instant::now();
-                        let stats = trt_prewarm(session, &[shape], id, &cache_dir);
+                        let stats = trt_prewarm(session, &[shape], id, &cache_dir, sm);
                         let elapsed_ms =
                             u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
                         tracing::info!(
@@ -608,6 +707,7 @@ pub(super) fn run_worker(
                             elapsed_ms,
                             warmed = stats.warmed,
                             fully_cached = stats.fully_cached,
+                            detected_sm = sm.unwrap_or("unfiltered"),
                             "engine_propagation_complete"
                         );
                     });
@@ -856,7 +956,13 @@ pub(super) fn run_worker(
                         // On CPU/CUDA EP this is a cheap no-op (returns Ok(0)).
                         let result: anyhow::Result<u64> = if config.ep == EpSelection::TensorRt {
                             let shape = vec![(batch, seq)];
-                            let stats = trt_prewarm(session, &shape, id, &cache_dir);
+                            let stats = trt_prewarm(
+                                session,
+                                &shape,
+                                id,
+                                &cache_dir,
+                                detected_sm.as_deref(),
+                            );
                             if stats.warmed > 0 || stats.fully_cached {
                                 Ok(stats.total_compile_ms)
                             } else {

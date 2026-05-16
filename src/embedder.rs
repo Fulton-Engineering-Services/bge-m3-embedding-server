@@ -20,6 +20,8 @@
 //! - `model_files`: hf-hub download / cache layout for the ONNX model files.
 //! - `tokenize`: tokenizer load + no-pad tokenization + chunk-array build.
 //! - `session`: ORT execution-provider config and session loading.
+//! - `sm_detect`: per-device GPU compute-capability detection (`smXY`) used
+//!   to filter the TRT engine cache by the worker's own SM.
 //! - `math`: pure dense/sparse math helpers (testable without ORT).
 //! - `dense`: dense embedding pipeline.
 //! - `sparse`: BGE-M3 SPLADE-style sparse embedding pipeline.
@@ -40,6 +42,7 @@ mod math;
 mod model_files;
 mod pool;
 mod session;
+pub(crate) mod sm_detect;
 mod sparse;
 mod tokenize;
 pub(crate) mod trt_cache;

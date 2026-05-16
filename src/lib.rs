@@ -298,21 +298,57 @@ pub async fn run() -> anyhow::Result<()> {
 
         let trt_info = crate::embedder::trt_cache::ensure_and_inspect(&cache_dir_path);
 
-        if warmup_postcondition_failed(cfg.ep, trt_info.engine_count) {
+        // Detect SM for device 0 so the postcondition check counts only
+        // plans usable by this host's GPUs, not stale `_smXX.engine` plans
+        // left over on EFS from a previous instance family. Without this,
+        // a fresh sm120 (Blackwell) deploy with a leftover sm89 (L40S)
+        // plan would exit 0 even when zero usable plans were produced —
+        // hiding the persistence failure behind the stale total count.
+        //
+        // `gpu_count` is assumed homogeneous (per `CLAUDE.md`: ASGs must
+        // share an instance family when reusing an EFS cache), so device 0
+        // is a sound representative for the whole pool.
+        let detected_sm: Option<String> = if cfg.ep == EpSelection::TensorRt {
+            crate::embedder::sm_detect::detect_sm_for_device(0)
+        } else {
+            None
+        };
+        let matching_engine_count = crate::embedder::trt_cache::count_engine_files_for_sm(
+            &engine_cache_dir,
+            detected_sm.as_deref(),
+        );
+        info!(
+            target: "bge_m3_embedding_server::trt_cache",
+            ep = %cfg.ep,
+            device_id = 0,
+            detected_sm = detected_sm.as_deref().unwrap_or("unfiltered"),
+            cache_path = %engine_cache_dir.display(),
+            matching_engine_count,
+            total_engine_count = trt_info.engine_count,
+            "trt cache: SM-filtered engine plan enumeration (warmup-only mode)"
+        );
+
+        if warmup_postcondition_failed(cfg.ep, matching_engine_count) {
             tracing::error!(
-                engine_count = trt_info.engine_count,
+                matching_engine_count,
+                total_engine_count = trt_info.engine_count,
+                detected_sm = detected_sm.as_deref().unwrap_or("unfiltered"),
                 cache_path = %trt_info.path.display(),
                 ep = %cfg.ep,
                 "warmup-only postcondition failed: compile-success events \
-                 present but no .engine files on disk; check TRT EP \
-                 construction, EFS mount, and engine cache path resolution"
+                 present but no .engine files matching this host's SM on disk; \
+                 check TRT EP construction, EFS mount, engine cache path resolution, \
+                 and that the warmup container ran on the same GPU family as the \
+                 serving fleet"
             );
             std::process::exit(WARMUP_POSTCONDITION_FAILED_EXIT_CODE);
         }
 
         info!(
-            engine_count = trt_info.engine_count,
+            matching_engine_count,
+            total_engine_count = trt_info.engine_count,
             profile_count = trt_info.profile_count,
+            detected_sm = detected_sm.as_deref().unwrap_or("unfiltered"),
             cache_path = %trt_info.path.display(),
             ep = %cfg.ep,
             "warmup-only mode: all TRT engines compiled and cached, exiting"

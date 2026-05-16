@@ -118,14 +118,21 @@ pub(super) struct PrewarmStats {
     /// per-shape logs claimed.
     pub fresh_compiles: usize,
     /// Net `.engine` file count change across this worker's prewarm sweep
-    /// (`count_after_last_shape - count_before_first_shape`).  Compared
-    /// against `fresh_compiles` to detect compile-success-without-persistence.
+    /// (`count_after_last_shape - count_before_first_shape`). SM-filtered:
+    /// reflects only plans matching the worker's GPU compute capability,
+    /// so a stale `_sm89.engine` next to a fresh `_sm120.engine` does not
+    /// silently zero out the delta on a Blackwell worker. Compared against
+    /// `fresh_compiles` to detect compile-success-without-persistence.
     pub engine_count_delta: i64,
     /// `.engine` file count observed in `engine_cache_dir` before the worker
-    /// ran any of its shard's shapes.
+    /// ran any of its shard's shapes. SM-filtered: counts only plans matching
+    /// the worker's GPU compute capability (see the `sm` parameter on
+    /// [`trt_prewarm`]). When SM detection failed and `sm == None`, falls
+    /// back to the legacy unfiltered count.
     pub engine_count_before: usize,
     /// `.engine` file count observed in `engine_cache_dir` after the worker
-    /// finished its shard (post final fsync).
+    /// finished its shard (post final fsync). SM-filtered with the same
+    /// semantics as `engine_count_before`.
     pub engine_count_after: usize,
 }
 
@@ -220,22 +227,35 @@ pub(super) fn shard_shapes(
 /// `warmup_shapes` so the `TensorRT` EP compiles and caches engine files
 /// before the first real request arrives.
 ///
+/// ## SM-aware cache accounting
+///
+/// `sm` selects which engine plans count toward `engine_count_before`,
+/// `engine_count_after`, the coverage-check fast-path trigger, and the
+/// per-shape persistence WARN. Pass `Some("smXY")` (e.g. `Some("sm120")`
+/// for Blackwell) so a heterogeneous cache containing plans for other GPU
+/// compute capabilities — typical when a fleet is mid-deploy or an EFS
+/// volume was previously used by a different instance family — never
+/// produces a false `cache_hit:true` signal. Pass `None` for the legacy
+/// unfiltered behaviour (only when SM detection failed; see the WARN
+/// emitted in `run_worker`).
+///
 /// ## Warm-cache fast path
 ///
-/// When `.engine` files already exist in the cache directory, the function
-/// first runs only the dimensional-extreme shapes (≤ 4) to probe whether
-/// the cached profile covers the full shard.  If all extreme shapes complete
-/// in under [`CACHE_HIT_THRESHOLD_MS`] the remaining shapes are **skipped**
-/// — they are guaranteed to be cache hits by the range-based ORT TRT EP
-/// profile logic (see module-level documentation for the proof).  If any
-/// extreme shape is slow the fast path is suppressed and all remaining
-/// shapes are compiled normally.
+/// When `.engine` files **matching `sm`** already exist in the cache
+/// directory, the function first runs only the dimensional-extreme shapes
+/// (≤ 4) to probe whether the cached profile covers the full shard. If all
+/// extreme shapes complete in under [`CACHE_HIT_THRESHOLD_MS`] the
+/// remaining shapes are **skipped** — they are guaranteed to be cache hits
+/// by the range-based ORT TRT EP profile logic (see module-level
+/// documentation for the proof). If any extreme shape is slow the fast path
+/// is suppressed and all remaining shapes are compiled normally.
 ///
 /// ## Cold cache
 ///
-/// When no `.engine` files exist the coverage-check phase is bypassed and
-/// every shape is compiled in sequence.  Each may take 30–170 s on the
-/// very first deploy; subsequent starts reuse the cached `.engine` files.
+/// When no `.engine` files matching `sm` exist the coverage-check phase is
+/// bypassed and every shape is compiled in sequence.  Each may take
+/// 30–170 s on the very first deploy; subsequent starts reuse the cached
+/// `.engine` files for this SM.
 ///
 /// Progress is logged at `INFO` with `compile_ms`, `fsync_ms`, and
 /// `cache_hit` (whether the run was under `CACHE_HIT_THRESHOLD_MS`) for
@@ -244,13 +264,15 @@ pub(super) fn shard_shapes(
 /// `trt_cache::fsync_cache_dir`.
 ///
 /// Returns aggregate statistics including `fully_cached` (whether the
-/// shard was served entirely from cache) and `skipped` (shapes not run).
+/// shard was served entirely from cache **for this SM**) and `skipped`
+/// (shapes not run).
 #[allow(clippy::too_many_lines)]
 pub(super) fn trt_prewarm(
     session: &mut ort::session::Session,
     warmup_shapes: &[(usize, usize)],
     worker_id: usize,
     cache_dir: &Path,
+    sm: Option<&str>,
 ) -> PrewarmStats {
     let engine_cache_dir = trt_cache::engine_cache_path(cache_dir);
 
@@ -259,7 +281,7 @@ pub(super) fn trt_prewarm(
     let mut total_compile_ms: u64 = 0;
     let mut total_fsync_ms: u64 = 0;
     let shape_total = warmup_shapes.len();
-    let engine_count_before = trt_cache::count_engine_files(&engine_cache_dir);
+    let engine_count_before = trt_cache::count_engine_files_for_sm(&engine_cache_dir, sm);
 
     if warmup_shapes.is_empty() {
         return PrewarmStats {
@@ -297,6 +319,7 @@ pub(super) fn trt_prewarm(
             shape_idx,
             shape_total,
             &engine_cache_dir,
+            sm,
         );
         if r.succeeded {
             warmed += 1;
@@ -320,6 +343,7 @@ pub(super) fn trt_prewarm(
             checked = check_shapes.len(),
             skipped,
             total = shape_total,
+            detected_sm = sm.unwrap_or("unfiltered"),
             cache_hit_threshold_ms = CACHE_HIT_THRESHOLD_MS,
             "TensorRT pre-warm: shard fully cached \
              (all dimensional-extreme checks fast), skipping remaining shapes"
@@ -327,7 +351,7 @@ pub(super) fn trt_prewarm(
         // One final fsync covers sidecar files (timing cache, `.profile`)
         // that may have been touched during the check phase.
         trt_cache::fsync_cache_dir(&engine_cache_dir);
-        let engine_count_after = trt_cache::count_engine_files(&engine_cache_dir);
+        let engine_count_after = trt_cache::count_engine_files_for_sm(&engine_cache_dir, sm);
         return PrewarmStats {
             warmed,
             total_compile_ms,
@@ -359,6 +383,7 @@ pub(super) fn trt_prewarm(
             shape_idx,
             shape_total,
             &engine_cache_dir,
+            sm,
         );
         if r.succeeded {
             warmed += 1;
@@ -374,7 +399,7 @@ pub(super) fn trt_prewarm(
     // were touched during the warmup but not associated with a single shape.
     trt_cache::fsync_cache_dir(&engine_cache_dir);
 
-    let engine_count_after = trt_cache::count_engine_files(&engine_cache_dir);
+    let engine_count_after = trt_cache::count_engine_files_for_sm(&engine_cache_dir, sm);
     PrewarmStats {
         warmed,
         total_compile_ms,
