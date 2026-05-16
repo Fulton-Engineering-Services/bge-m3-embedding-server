@@ -81,8 +81,8 @@ pub async fn both_embeddings(
         .record("tokenize_ms", embed_stats.tokenize_ms)
         .record("inference_ms", embed_stats.inference_ms)
         .record("total_ms", total_ms);
-    let x_headers_val = (!x_headers.is_empty())
-        .then(|| serde_json::to_string(&x_headers).unwrap_or_default());
+    let x_headers_val =
+        (!x_headers.is_empty()).then(|| serde_json::to_string(&x_headers).unwrap_or_default());
     tracing::info!(
         route = "both",
         batch_size,

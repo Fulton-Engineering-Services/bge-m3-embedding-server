@@ -86,8 +86,8 @@ pub async fn dense_embeddings(
     // they appear under $.fields.x_headers in JSON logs and are accessible to
     // downstream log processors. Each caller-supplied X-* header is included
     // generically; no header name is special-cased here.
-    let x_headers_val = (!x_headers.is_empty())
-        .then(|| serde_json::to_string(&x_headers).unwrap_or_default());
+    let x_headers_val =
+        (!x_headers.is_empty()).then(|| serde_json::to_string(&x_headers).unwrap_or_default());
     tracing::info!(
         route = "dense",
         batch_size,
