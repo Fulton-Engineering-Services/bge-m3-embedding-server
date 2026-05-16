@@ -517,3 +517,23 @@ impl EmbedPool {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod adaptive_warmup_tests {
+    use super::*;
+
+    /// `send_adaptive_warmup` must return `Err(())` when the channel receiver
+    /// has been dropped (pool shut down).  `closed_for_test()` drops the
+    /// receiver immediately after channel creation, so the very first send
+    /// observes a closed channel.
+    #[tokio::test]
+    async fn send_adaptive_warmup_returns_err_when_channel_closed() {
+        let pool = EmbedPool::closed_for_test();
+        let (ack_tx, _ack_rx) = oneshot::channel();
+        let result = pool.send_adaptive_warmup(1, 128, ack_tx).await;
+        assert!(
+            result.is_err(),
+            "send_adaptive_warmup must return Err(()) when channel is closed"
+        );
+    }
+}

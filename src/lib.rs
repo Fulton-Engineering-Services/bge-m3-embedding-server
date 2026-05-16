@@ -184,6 +184,14 @@ pub async fn run() -> anyhow::Result<()> {
         let (tx, rx) = tokio::sync::mpsc::channel::<(usize, usize)>(64);
         (Some(tx), Some(rx))
     } else {
+        if cfg.adaptive_warmup_enabled {
+            tracing::warn!(
+                ep = %cfg.ep,
+                "BGE_M3_ADAPTIVE_WARMUP_ENABLED=1 has no effect when the execution \
+                 provider is not TensorRT — adaptive warmup only compiles TRT engine \
+                 files. Set BGE_M3_EP=tensorrt or unset BGE_M3_ADAPTIVE_WARMUP_ENABLED."
+            );
+        }
         (None, None)
     };
 
