@@ -384,6 +384,15 @@ fn gpu_mem_limit_bytes_unset_yields_none() {
     assert_eq!(cfg.gpu_mem_limit_bytes, None);
 }
 
+// --- BGE_M3_GPU_MEM_LIMIT_BYTES (invalid) ---
+
+#[test]
+fn gpu_mem_limit_bytes_invalid_yields_none() {
+    let map = HashMap::from([("BGE_M3_GPU_MEM_LIMIT_BYTES", "not_a_number")]);
+    let cfg = Config::from_lookup(lookup_from(&map));
+    assert_eq!(cfg.gpu_mem_limit_bytes, None);
+}
+
 // --- BGE_M3_ADAPTIVE_WARMUP_ENABLED ---
 
 #[test]
@@ -396,6 +405,20 @@ fn adaptive_warmup_enabled_default_is_false() {
 #[test]
 fn adaptive_warmup_enabled_set_to_1() {
     let map = HashMap::from([("BGE_M3_ADAPTIVE_WARMUP_ENABLED", "1")]);
+    let cfg = Config::from_lookup(lookup_from(&map));
+    assert!(cfg.adaptive_warmup_enabled);
+}
+
+#[test]
+fn adaptive_warmup_enabled_set_to_true_string() {
+    let map = HashMap::from([("BGE_M3_ADAPTIVE_WARMUP_ENABLED", "true")]);
+    let cfg = Config::from_lookup(lookup_from(&map));
+    assert!(cfg.adaptive_warmup_enabled);
+}
+
+#[test]
+fn adaptive_warmup_enabled_set_to_yes_string() {
+    let map = HashMap::from([("BGE_M3_ADAPTIVE_WARMUP_ENABLED", "yes")]);
     let cfg = Config::from_lookup(lookup_from(&map));
     assert!(cfg.adaptive_warmup_enabled);
 }
@@ -416,6 +439,13 @@ fn adaptive_warmup_quiet_secs_set() {
     assert_eq!(cfg.adaptive_warmup_quiet_secs, 10);
 }
 
+#[test]
+fn adaptive_warmup_quiet_secs_invalid_yields_default_3() {
+    let map = HashMap::from([("BGE_M3_ADAPTIVE_WARMUP_QUIET_SECS", "not_a_number")]);
+    let cfg = Config::from_lookup(lookup_from(&map));
+    assert_eq!(cfg.adaptive_warmup_quiet_secs, 3);
+}
+
 // --- BGE_M3_ADAPTIVE_WARMUP_MAX_SHAPES_PER_HOUR ---
 
 #[test]
@@ -430,6 +460,13 @@ fn adaptive_warmup_max_shapes_per_hour_set() {
     let map = HashMap::from([("BGE_M3_ADAPTIVE_WARMUP_MAX_SHAPES_PER_HOUR", "24")]);
     let cfg = Config::from_lookup(lookup_from(&map));
     assert_eq!(cfg.adaptive_warmup_max_shapes_per_hour, 24);
+}
+
+#[test]
+fn adaptive_warmup_max_shapes_per_hour_invalid_yields_default_12() {
+    let map = HashMap::from([("BGE_M3_ADAPTIVE_WARMUP_MAX_SHAPES_PER_HOUR", "not_a_number")]);
+    let cfg = Config::from_lookup(lookup_from(&map));
+    assert_eq!(cfg.adaptive_warmup_max_shapes_per_hour, 12);
 }
 
 // --- BGE_M3_GPU_COUNT ---

@@ -433,11 +433,29 @@ impl Config {
         let gpu_vram_budget_bytes =
             lookup("BGE_M3_GPU_VRAM_BUDGET_BYTES").and_then(|v| v.parse::<usize>().ok());
 
-        let trt_max_workspace_bytes =
-            lookup("BGE_M3_TRT_MAX_WORKSPACE_BYTES").and_then(|v| v.parse::<usize>().ok());
+        let trt_max_workspace_bytes = lookup("BGE_M3_TRT_MAX_WORKSPACE_BYTES").and_then(|v| {
+            v.parse::<usize>()
+                .inspect_err(|e| {
+                    tracing::warn!(
+                        raw = %v,
+                        error = %e,
+                        "BGE_M3_TRT_MAX_WORKSPACE_BYTES parse failed — TRT workspace cap disabled"
+                    );
+                })
+                .ok()
+        });
 
-        let gpu_mem_limit_bytes =
-            lookup("BGE_M3_GPU_MEM_LIMIT_BYTES").and_then(|v| v.parse::<usize>().ok());
+        let gpu_mem_limit_bytes = lookup("BGE_M3_GPU_MEM_LIMIT_BYTES").and_then(|v| {
+            v.parse::<usize>()
+                .inspect_err(|e| {
+                    tracing::warn!(
+                        raw = %v,
+                        error = %e,
+                        "BGE_M3_GPU_MEM_LIMIT_BYTES parse failed — CUDA memory limit disabled"
+                    );
+                })
+                .ok()
+        });
 
         let adaptive_warmup_enabled = lookup("BGE_M3_ADAPTIVE_WARMUP_ENABLED")
             .is_some_and(|v| matches!(v.as_str(), "1" | "true" | "yes"));
