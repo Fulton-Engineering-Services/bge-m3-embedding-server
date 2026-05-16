@@ -389,7 +389,7 @@ pub async fn run() -> anyhow::Result<()> {
         request_permits,
     });
 
-    let app = build_router(Arc::clone(&state));
+    let app = build_router(Arc::clone(&state), cfg.max_body_bytes);
 
     let listener = tokio::net::TcpListener::bind(&cfg.bind_addr).await?;
     info!(bind = %cfg.bind_addr, "Listening");

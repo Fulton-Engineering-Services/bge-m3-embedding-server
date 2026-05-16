@@ -24,7 +24,7 @@ use super::helpers::make_test_state;
 
 #[tokio::test]
 async fn router_dense_returns_503_when_not_ready() {
-    let app = build_router(make_test_state(false, 256));
+    let app = build_router(make_test_state(false, 256), 33_554_432);
     let body = serde_json::to_vec(&serde_json::json!({"input": ["test"]}))
         .expect("request body should serialize");
     let req = Request::builder()
@@ -39,7 +39,7 @@ async fn router_dense_returns_503_when_not_ready() {
 
 #[tokio::test]
 async fn router_dense_returns_503_when_pool_dead() {
-    let app = build_router(make_test_state(true, 256));
+    let app = build_router(make_test_state(true, 256), 33_554_432);
     let body = serde_json::to_vec(&serde_json::json!({"input": ["test"]}))
         .expect("request body should serialize");
     let req = Request::builder()
@@ -54,7 +54,7 @@ async fn router_dense_returns_503_when_pool_dead() {
 
 #[tokio::test]
 async fn router_dense_returns_422_for_wrong_input_type() {
-    let app = build_router(make_test_state(true, 256));
+    let app = build_router(make_test_state(true, 256), 33_554_432);
     let body = serde_json::to_vec(&serde_json::json!({"input": 42}))
         .expect("request body should serialize");
     let req = Request::builder()
@@ -69,7 +69,7 @@ async fn router_dense_returns_422_for_wrong_input_type() {
 
 #[tokio::test]
 async fn router_dense_returns_422_for_missing_input_field() {
-    let app = build_router(make_test_state(true, 256));
+    let app = build_router(make_test_state(true, 256), 33_554_432);
     let body = serde_json::to_vec(&serde_json::json!({"model": "bge-m3"}))
         .expect("request body should serialize");
     let req = Request::builder()
@@ -84,7 +84,7 @@ async fn router_dense_returns_422_for_missing_input_field() {
 
 #[tokio::test]
 async fn router_dense_returns_400_for_syntax_error() {
-    let app = build_router(make_test_state(true, 256));
+    let app = build_router(make_test_state(true, 256), 33_554_432);
     let req = Request::builder()
         .method("POST")
         .uri("/v1/embeddings")
@@ -97,7 +97,7 @@ async fn router_dense_returns_400_for_syntax_error() {
 
 #[tokio::test]
 async fn router_dense_returns_415_for_missing_content_type() {
-    let app = build_router(make_test_state(true, 256));
+    let app = build_router(make_test_state(true, 256), 33_554_432);
     let body = serde_json::to_vec(&serde_json::json!({"input": ["test"]}))
         .expect("request body should serialize");
     let req = Request::builder()
@@ -111,12 +111,13 @@ async fn router_dense_returns_415_for_missing_content_type() {
 
 #[tokio::test]
 async fn router_dense_returns_413_for_oversized_body() {
-    let app = build_router(make_test_state(true, 256));
+    // Use a 1 KiB limit so the test doesn't need to allocate 32+ MiB of body.
+    let app = build_router(make_test_state(true, 256), 1024);
     let req = Request::builder()
         .method("POST")
         .uri("/v1/embeddings")
         .header("content-type", "application/json")
-        .body(Body::from(vec![b'x'; 2_097_153]))
+        .body(Body::from(vec![b'x'; 1025]))
         .expect("request should build");
     let resp: Response = app.oneshot(req).await.expect("router should respond");
     assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
@@ -124,7 +125,7 @@ async fn router_dense_returns_413_for_oversized_body() {
 
 #[tokio::test]
 async fn router_returns_405_for_wrong_method_on_embeddings() {
-    let app = build_router(make_test_state(true, 256));
+    let app = build_router(make_test_state(true, 256), 33_554_432);
     let req = Request::builder()
         .method("GET")
         .uri("/v1/embeddings")

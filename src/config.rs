@@ -371,6 +371,13 @@ pub struct Config {
     /// than routing traffic to a known-broken pool.
     pub prewarm_strict: bool,
 
+    /// Maximum HTTP request body size in bytes.
+    ///
+    /// Set with `BGE_M3_MAX_BODY_BYTES`. Defaults to `33_554_432` (32 MiB).
+    /// Raise this value when embedding large batches with long function bodies
+    /// that exceed the default limit (HTTP 413 Content Too Large).
+    pub max_body_bytes: usize,
+
     /// When `true`, scan the TRT engine cache at worker startup and
     /// **destructively delete** plan files whose `_smXX` suffix does not
     /// match the current device. Sourced from `BGE_M3_TRT_CACHE_GC_ENABLED`,
@@ -593,6 +600,10 @@ impl Config {
 
         let trt_warmup_shapes = parse_trt_warmup_shapes(lookup("BGE_M3_TRT_WARMUP_SHAPES"));
 
+        let max_body_bytes = lookup("BGE_M3_MAX_BODY_BYTES")
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(33_554_432);
+
         let warmup_only = lookup("BGE_M3_WARMUP_ONLY")
             .is_some_and(|v| matches!(v.as_str(), "1" | "true" | "yes"));
 
@@ -645,6 +656,7 @@ impl Config {
             adaptive_warmup_max_shapes_per_hour,
             gpu_count,
             trt_warmup_shapes,
+            max_body_bytes,
             warmup_only,
             prewarm_strict,
             #[cfg(feature = "cache-gc")]

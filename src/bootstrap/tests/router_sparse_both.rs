@@ -33,7 +33,7 @@ use crate::state::{AppState, ProbeStatus};
 
 #[tokio::test]
 async fn router_sparse_returns_503_when_not_ready() {
-    let app = build_router(make_test_state(false, 256));
+    let app = build_router(make_test_state(false, 256), 33_554_432);
     let body = serde_json::to_vec(&serde_json::json!({"input": ["test"]}))
         .expect("request body should serialize");
     let req = Request::builder()
@@ -48,7 +48,7 @@ async fn router_sparse_returns_503_when_not_ready() {
 
 #[tokio::test]
 async fn router_both_returns_503_when_not_ready() {
-    let app = build_router(make_test_state(false, 256));
+    let app = build_router(make_test_state(false, 256), 33_554_432);
     let body = serde_json::to_vec(&serde_json::json!({"input": ["test"]}))
         .expect("request body should serialize");
     let req = Request::builder()
@@ -65,7 +65,7 @@ async fn router_both_returns_503_when_not_ready() {
 /// `%3A` form must also reach the handler.
 #[tokio::test]
 async fn router_both_accepts_percent_encoded_colon() {
-    let app = build_router(make_test_state(true, 256));
+    let app = build_router(make_test_state(true, 256), 33_554_432);
     let body = serde_json::to_vec(&serde_json::json!({"input": ["test"]}))
         .expect("request body should serialize");
     let req = Request::builder()
@@ -82,7 +82,7 @@ async fn router_both_accepts_percent_encoded_colon() {
 /// `%3a` form must also reach the handler.
 #[tokio::test]
 async fn router_both_accepts_lowercase_percent_encoded_colon() {
-    let app = build_router(make_test_state(true, 256));
+    let app = build_router(make_test_state(true, 256), 33_554_432);
     let body = serde_json::to_vec(&serde_json::json!({"input": ["test"]}))
         .expect("request body should serialize");
     let req = Request::builder()
@@ -102,19 +102,22 @@ async fn router_both_returns_200_with_paired_dense_and_sparse() {
         indices: vec![42usize],
         values: vec![0.5f32],
     }];
-    let app = build_router(Arc::new(AppState {
-        pool: EmbedPool::with_fixed_responses(dense_fixture, sparse_fixture),
-        ready: AtomicBool::new(true),
-        max_batch: 256,
-        total_workers: 1,
-        max_seq_length: 8192,
-        tuning: std::sync::OnceLock::new(),
-        cost_model: Arc::new(ArcSwap::from_pointee(CostModel::conservative(
-            CostModel::DEFAULT_MAX_WORKSPACE,
-        ))),
-        probe_status: AtomicU8::new(ProbeStatus::Disabled as u8),
-        request_permits: Arc::new(Semaphore::new(usize::MAX >> 3)),
-    }));
+    let app = build_router(
+        Arc::new(AppState {
+            pool: EmbedPool::with_fixed_responses(dense_fixture, sparse_fixture),
+            ready: AtomicBool::new(true),
+            max_batch: 256,
+            total_workers: 1,
+            max_seq_length: 8192,
+            tuning: std::sync::OnceLock::new(),
+            cost_model: Arc::new(ArcSwap::from_pointee(CostModel::conservative(
+                CostModel::DEFAULT_MAX_WORKSPACE,
+            ))),
+            probe_status: AtomicU8::new(ProbeStatus::Disabled as u8),
+            request_permits: Arc::new(Semaphore::new(usize::MAX >> 3)),
+        }),
+        33_554_432,
+    );
     let body = serde_json::to_vec(&serde_json::json!({"input": ["hello"]}))
         .expect("request body should serialize");
     let req = Request::builder()
@@ -144,7 +147,7 @@ async fn router_both_returns_200_with_paired_dense_and_sparse() {
 
 #[tokio::test]
 async fn router_models_returns_200_with_bge_m3() {
-    let app = build_router(make_test_state(true, 256));
+    let app = build_router(make_test_state(true, 256), 33_554_432);
     let req = Request::builder()
         .method("GET")
         .uri("/v1/models")
@@ -166,7 +169,7 @@ async fn router_models_returns_200_with_bge_m3() {
 
 #[tokio::test]
 async fn router_response_includes_x_request_id() {
-    let app = build_router(make_test_state(false, 256));
+    let app = build_router(make_test_state(false, 256), 33_554_432);
     let req = Request::builder()
         .method("GET")
         .uri("/health")
@@ -178,7 +181,7 @@ async fn router_response_includes_x_request_id() {
 
 #[tokio::test]
 async fn router_propagates_provided_x_request_id() {
-    let app = build_router(make_test_state(false, 256));
+    let app = build_router(make_test_state(false, 256), 33_554_432);
     let req = Request::builder()
         .method("GET")
         .uri("/health")

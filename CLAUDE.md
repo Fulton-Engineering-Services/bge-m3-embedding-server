@@ -49,6 +49,7 @@ Add `BGE_M3_DISABLE_AUTO_BUDGET=1` to skip the 2-minute Linux startup probe duri
 | `BGE_M3_WORKERS` | `2` | Worker threads (each with its own ORT session). For GPU EPs, set equal to `BGE_M3_GPU_COUNT`. |
 | `BGE_M3_INTRA_THREADS` | `1` | ORT intra-op threads per worker. Raise to `floor(num_cpus / workers)` on under-utilized hosts. |
 | `BGE_M3_MAX_BATCH` | `256` | Max texts per request |
+| `BGE_M3_MAX_BODY_BYTES` | `33554432` | Maximum HTTP request body size in bytes. Raise for large embedding batches with long function bodies. |
 | `BGE_M3_MAX_SEQ_LENGTH` | `8192` | Max tokenized sequence length `[1, 8192]` |
 | `BGE_M3_IDLE_TIMEOUT_SECS` | `300` | Seconds before models are unloaded; `0` disables |
 | `BGE_M3_MODEL` | `fp16` | Model variant: `fp32` (BAAI, ~2.16 GB/session), `fp16` (Xenova, ~1.08 GB), `int8` (Xenova quantized, ~568 MB) |
