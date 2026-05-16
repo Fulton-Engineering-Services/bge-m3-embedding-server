@@ -201,36 +201,53 @@ pub(super) fn load_session(
     Ok(session)
 }
 
+/// Configuration for loading an ORT session and tokenizer for a single GPU worker.
+///
+/// Bundles the parameters that were previously passed individually to [`load_models`],
+/// removing the 9-argument list and the associated `#[allow(clippy::too_many_arguments)]`
+/// suppression. All fields map 1:1 to the corresponding `WorkerConfig` fields.
+pub(super) struct GpuSessionConfig<'a> {
+    /// Path to the ONNX model cache directory.
+    pub cache_dir: &'a Path,
+    /// ONNX model variant (FP32, FP16, INT8).
+    pub model_variant: ModelVariant,
+    /// Maximum tokenized sequence length.
+    pub max_seq_length: usize,
+    /// Intra-op thread count for ORT sessions.
+    pub intra_threads: usize,
+    /// Execution provider selection.
+    pub ep: EpSelection,
+    /// GPU device ID for this worker.
+    pub device_id: u32,
+    /// Optional TRT EP workspace size cap in bytes.
+    pub trt_max_workspace_bytes: Option<usize>,
+    /// Optional CUDA EP device memory limit in bytes.
+    pub gpu_mem_limit_bytes: Option<usize>,
+}
+
 /// Downloads (if not already cached) and loads both the ORT session and the
 /// tokenizer for the given model variant, returning them as a pair.
 ///
-/// `device_id` selects the CUDA/TRT GPU device for this session. Computed by
-/// `EmbedPool::spawn` as `worker_index % gpu_count`. Ignored on CPU EP and
+/// `cfg.device_id` selects the CUDA/TRT GPU device for this session. Computed
+/// by `EmbedPool::spawn` as `worker_index % gpu_count`. Ignored on CPU EP and
 /// macOS.
 ///
-/// `trt_max_workspace_bytes` and `gpu_mem_limit_bytes` are forwarded verbatim
-/// to [`execution_providers`]; see that function's documentation for semantics.
-#[allow(clippy::too_many_arguments)]
+/// `cfg.trt_max_workspace_bytes` and `cfg.gpu_mem_limit_bytes` are forwarded
+/// verbatim to [`execution_providers`]; see that function's documentation for
+/// semantics.
 pub(super) fn load_models(
-    cache_dir: &Path,
+    cfg: &GpuSessionConfig<'_>,
     show_download_progress: bool,
-    model_variant: ModelVariant,
-    max_seq_length: usize,
-    intra_threads: usize,
-    ep: EpSelection,
-    device_id: u32,
-    trt_max_workspace_bytes: Option<usize>,
-    gpu_mem_limit_bytes: Option<usize>,
 ) -> Result<(ort::session::Session, tokenizers::Tokenizer)> {
-    let files = download_model_files(cache_dir, show_download_progress, model_variant)?;
-    let tokenizer = load_tokenizer(&files.tokenizer_path, max_seq_length)?;
+    let files = download_model_files(cfg.cache_dir, show_download_progress, cfg.model_variant)?;
+    let tokenizer = load_tokenizer(&files.tokenizer_path, cfg.max_seq_length)?;
     let eps = execution_providers(
-        cache_dir,
-        ep,
-        device_id,
-        trt_max_workspace_bytes,
-        gpu_mem_limit_bytes,
+        cfg.cache_dir,
+        cfg.ep,
+        cfg.device_id,
+        cfg.trt_max_workspace_bytes,
+        cfg.gpu_mem_limit_bytes,
     );
-    let session = load_session(&files.onnx_path, eps, intra_threads)?;
+    let session = load_session(&files.onnx_path, eps, cfg.intra_threads)?;
     Ok((session, tokenizer))
 }

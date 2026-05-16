@@ -30,7 +30,7 @@ use super::adaptive_warmup::JitSuspectSender;
 use super::dense::embed_dense;
 use super::dual::embed_both;
 use super::error::ort_err;
-use super::session::load_models;
+use super::session::{load_models, GpuSessionConfig};
 use super::sparse::embed_sparse;
 use super::tokenize::{build_chunk_arrays, tokenize_no_pad};
 use super::trt_cache;
@@ -344,15 +344,17 @@ pub(super) fn run_worker(
     // OS noise.
     let pre_load_rss = sysinfo::read_process_rss_bytes().unwrap_or(0);
     let mut initial_models = match load_models(
-        &cache_dir,
+        &GpuSessionConfig {
+            cache_dir: &cache_dir,
+            model_variant: config.model_variant,
+            max_seq_length: config.max_seq_length,
+            intra_threads: config.intra_threads,
+            ep: config.ep,
+            device_id: config.device_id,
+            trt_max_workspace_bytes: config.trt_max_workspace_bytes,
+            gpu_mem_limit_bytes: config.gpu_mem_limit_bytes,
+        },
         id == 0,
-        config.model_variant,
-        config.max_seq_length,
-        config.intra_threads,
-        config.ep,
-        config.device_id,
-        config.trt_max_workspace_bytes,
-        config.gpu_mem_limit_bytes,
     ) {
         Ok(mut models) => {
             // Prime the ORT session arena with a tiny session.run() BEFORE
@@ -524,15 +526,17 @@ pub(super) fn run_worker(
                     tracing::info!("Worker {id} reloading models after idle...");
                     let reload_start = std::time::Instant::now();
                     match load_models(
-                        &cache_dir,
+                        &GpuSessionConfig {
+                            cache_dir: &cache_dir,
+                            model_variant: config.model_variant,
+                            max_seq_length: config.max_seq_length,
+                            intra_threads: config.intra_threads,
+                            ep: config.ep,
+                            device_id: config.device_id,
+                            trt_max_workspace_bytes: config.trt_max_workspace_bytes,
+                            gpu_mem_limit_bytes: config.gpu_mem_limit_bytes,
+                        },
                         false,
-                        config.model_variant,
-                        config.max_seq_length,
-                        config.intra_threads,
-                        config.ep,
-                        config.device_id,
-                        config.trt_max_workspace_bytes,
-                        config.gpu_mem_limit_bytes,
                     ) {
                         Ok(mut m) => {
                             // Prime the freshly-loaded session arena so the
