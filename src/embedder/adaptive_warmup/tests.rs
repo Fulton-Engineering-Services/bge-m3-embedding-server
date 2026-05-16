@@ -57,7 +57,7 @@ async fn drain_rx_skips_already_warmed() {
 }
 
 /// Sending the same shape twice into an empty channel must produce exactly one
-/// entry in pending (the second send is deduplicated by drain_rx).
+/// entry in pending (the second send is deduplicated by `drain_rx`).
 #[tokio::test]
 async fn drain_rx_deduplicates_same_shape_received_twice() {
     let (tx, mut rx) = mpsc::channel::<(usize, usize)>(64);
@@ -119,7 +119,7 @@ async fn drain_rx_adds_multiple_distinct_shapes() {
 
 // ─── wait_for_quiet_window tests ─────────────────────────────────────────────
 
-/// quiet_secs=0 must return `true` immediately without sleeping.
+/// `quiet_secs=0` must return `true` immediately without sleeping.
 #[tokio::test]
 async fn wait_for_quiet_window_returns_immediately_when_quiet_secs_zero() {
     let pool = EmbedPool::idle_for_test();
@@ -134,8 +134,8 @@ async fn wait_for_quiet_window_returns_immediately_when_quiet_secs_zero() {
     );
 }
 
-/// With an idle pool and quiet_secs=1, wait_for_quiet_window returns true
-/// after one second has elapsed. Use tokio::time::pause/advance to avoid a
+/// With an idle pool and `quiet_secs=1`, `wait_for_quiet_window` returns true
+/// after one second has elapsed. Use `tokio::time::pause/advance` to avoid a
 /// real 1-second wall-clock delay in CI.
 #[tokio::test(start_paused = true)]
 async fn wait_for_quiet_window_returns_true_when_idle_long_enough() {
@@ -156,7 +156,7 @@ async fn wait_for_quiet_window_returns_true_when_idle_long_enough() {
 
 // ─── AdaptiveWarmupConfig field tests ────────────────────────────────────────
 
-/// spawn_adaptive_warmup must be a no-op when enabled=false.
+/// `spawn_adaptive_warmup` must be a no-op when enabled=false.
 #[tokio::test]
 async fn spawn_adaptive_warmup_is_noop_when_disabled() {
     let (_, rx) = mpsc::channel::<(usize, usize)>(8);
@@ -170,11 +170,10 @@ async fn spawn_adaptive_warmup_is_noop_when_disabled() {
     // Should return without spawning any task (no panic, no hang).
     spawn_adaptive_warmup(cfg, pool, rx);
     // If we reach here the early-return guard worked.
-    assert!(true);
 }
 
-/// A config with max_shapes_per_hour=0 is constructable and the field is zero.
-/// The WARN is emitted at runtime in spawn_adaptive_warmup; this test verifies
+/// A config with `max_shapes_per_hour=0` is constructable and the field is zero.
+/// The WARN is emitted at runtime in `spawn_adaptive_warmup`; this test verifies
 /// the config struct accepts the value so the guard has something to check.
 #[test]
 fn adaptive_warmup_config_max_shapes_zero_is_constructable() {
@@ -186,7 +185,7 @@ fn adaptive_warmup_config_max_shapes_zero_is_constructable() {
     assert_eq!(cfg.max_shapes_per_hour, 0);
 }
 
-/// spawn_adaptive_warmup with max_shapes_per_hour=0 and enabled=true must
+/// `spawn_adaptive_warmup` with `max_shapes_per_hour=0` and enabled=true must
 /// not panic — the warn path is exercised safely.
 #[tokio::test]
 async fn spawn_adaptive_warmup_does_not_panic_when_max_shapes_zero() {
@@ -209,7 +208,7 @@ async fn spawn_adaptive_warmup_does_not_panic_when_max_shapes_zero() {
 // ─── Hourly rate-limit reset ──────────────────────────────────────────────────
 
 /// Validates the hourly-reset arithmetic: after 3600 seconds the counter
-/// resets to 0. Uses tokio::time::pause to control time without sleeping.
+/// resets to 0. Uses `tokio::time::pause` to control time without sleeping.
 ///
 /// Note: the adaptive warmup loop uses `std::time::Instant` for the hour
 /// boundary, which is not controlled by `tokio::time::pause`. This test

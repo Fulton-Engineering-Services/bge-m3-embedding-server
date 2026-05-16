@@ -52,7 +52,7 @@ const CHUNK_CACHE_HIT_THRESHOLD_MS: u64 = 5_000;
 /// overflow — a condition that may resolve with a smaller batch or halved
 /// workspace budget.
 ///
-/// Patterns verified against ORT 2.0.0-rc.12 TensorRT EP
+/// Patterns verified against ORT 2.0.0-rc.12 `TensorRT` EP
 /// (`ort/src/ep/tensorrt.rs`). Re-verify on every ORT version bump.
 fn is_trt_jit_oom(e: &anyhow::Error) -> bool {
     let s = format!("{e}");
@@ -116,7 +116,7 @@ where
 fn log_inference_complete(
     stats: &super::types::EmbedStats,
     worker_id: usize,
-    route: &'static str,
+    _route: &'static str,
     jit_suspect_tx: Option<&JitSuspectSender>,
     batch_len: usize,
 ) {
