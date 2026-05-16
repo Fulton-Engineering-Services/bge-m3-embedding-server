@@ -23,7 +23,7 @@
 //!
 //! 1. **Before** spawning the worker pool, create a bounded channel with
 //!    [`mpsc::channel::<(usize, usize)>`] (capacity 64 is sufficient).
-//! 2. Store the sender half in [`WorkerConfig::jit_suspect_tx`].  Workers call
+//! 2. Store the sender half in [`crate::embedder::WorkerConfig::jit_suspect_tx`].  Workers call
 //!    `try_send((batch, seq))` after any inference whose `inference_ms` exceeds
 //!    the cache-hit threshold.
 //! 3. **After** spawning the pool, call [`spawn_adaptive_warmup`] with the
@@ -84,7 +84,7 @@ pub(crate) struct AdaptiveWarmupConfig {
 /// Must be called **after** [`EmbedPool::spawn`] so a pool clone is available.
 /// The caller creates the JIT suspect channel before spawning the pool and
 /// passes the receiver half here; the sender half is stored in
-/// [`WorkerConfig::jit_suspect_tx`].
+/// [`crate::embedder::WorkerConfig::jit_suspect_tx`].
 ///
 /// Does nothing if `config.enabled` is `false`.
 pub(crate) fn spawn_adaptive_warmup(
