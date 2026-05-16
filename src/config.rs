@@ -140,6 +140,7 @@ pub const MODEL_MAX_SEQ: usize = 8192;
 ///
 /// All fields are read once at startup via [`Config::from_env`]. Changes to
 /// environment variables after startup have no effect.
+#[allow(clippy::struct_excessive_bools)]
 pub struct Config {
     /// Path to the directory where ONNX model files are cached.
     ///
@@ -351,6 +352,51 @@ pub struct Config {
     /// `tensorrt` — warmup-only on CPU is a no-op (there is nothing to compile)
     /// but the server still exits 0 cleanly rather than erroring.
     pub warmup_only: bool,
+
+    /// When `true`, prewarm postcondition failures cause workers to refuse
+    /// to signal ready (the pool init handle errors out and the readiness
+    /// probe triggers a hard process exit). When `false`, postcondition
+    /// failures only log a WARN and workers still signal ready — preserving
+    /// pre-fix behaviour for debugging and operators who explicitly opt
+    /// out of fail-loud startup.
+    ///
+    /// Set with `BGE_M3_PREWARM_STRICT`. Defaults to `true`.
+    ///
+    /// The 2026-05 codekeeper outage motivated this default: every worker
+    /// on a 4× Blackwell task hit a TRT autotuner workspace OOM mid-build
+    /// (`IBuilder::buildSerializedNetwork: Error Code 10`), the postcondition
+    /// logged a WARN, `/health` returned `200 ok`, and the task served HTTP
+    /// 500 traffic on the same shape that failed prewarm. Strict-mode would
+    /// have forced an immediate task exit, which ECS retries — far better
+    /// than routing traffic to a known-broken pool.
+    pub prewarm_strict: bool,
+
+    /// When `true`, scan the TRT engine cache at worker startup and
+    /// **destructively delete** plan files whose `_smXX` suffix does not
+    /// match the current device. Sourced from `BGE_M3_TRT_CACHE_GC_ENABLED`,
+    /// defaults to `false`.
+    ///
+    /// # ⚠️ HAZARD — multi-SM ASG cache coexistence
+    ///
+    /// This field exists only when the `cache-gc` Cargo feature is
+    /// compiled in. Production binaries are built without the feature so
+    /// this field is physically absent and `BGE_M3_TRT_CACHE_GC_ENABLED`
+    /// is silently ignored.
+    ///
+    /// Even with the feature compiled in, defaulting to `false` is
+    /// deliberate: ORT's TRT EP namespaces engine plans by SM so plans
+    /// for different compute capabilities coexist safely; an ASG that
+    /// shares an EFS engine cache across instance families
+    /// (T4 / A10G / L4 / L40S / Blackwell) **relies on that coexistence**.
+    /// A binary that enables this flag against a shared multi-SM cache
+    /// will delete plans that are still in active use by peer tasks. Only
+    /// enable on a dedicated maintenance or dev binary whose cache
+    /// directory is not shared with production traffic.
+    ///
+    /// See `src/embedder/trt_cache_gc.rs` and the README section
+    /// "Stale-SM Cache GC" for the full hazard model.
+    #[cfg(feature = "cache-gc")]
+    pub trt_cache_gc_enabled: bool,
 }
 
 impl Config {
@@ -550,6 +596,24 @@ impl Config {
         let warmup_only = lookup("BGE_M3_WARMUP_ONLY")
             .is_some_and(|v| matches!(v.as_str(), "1" | "true" | "yes"));
 
+        // BGE_M3_PREWARM_STRICT: default ON. Anything that isn't an explicit
+        // disable token (`0`/`false`/`no`) leaves the safe default in place
+        // — fat-fingered values get the protective behaviour, not a silent
+        // disable.
+        let prewarm_strict = !matches!(
+            lookup("BGE_M3_PREWARM_STRICT").as_deref(),
+            Some("0" | "false" | "no")
+        );
+
+        // BGE_M3_TRT_CACHE_GC_ENABLED: strict opt-in, default OFF. Only
+        // parsed when the `cache-gc` Cargo feature is enabled — in normal
+        // production builds the env var has zero effect because the field
+        // it would populate does not exist. See the `Config::
+        // trt_cache_gc_enabled` field docs for the hazard model.
+        #[cfg(feature = "cache-gc")]
+        let trt_cache_gc_enabled = lookup("BGE_M3_TRT_CACHE_GC_ENABLED")
+            .is_some_and(|v| matches!(v.as_str(), "1" | "true" | "yes"));
+
         if warmup_only && ep != EpSelection::TensorRt {
             warn!(
                 ep = %ep,
@@ -582,6 +646,9 @@ impl Config {
             gpu_count,
             trt_warmup_shapes,
             warmup_only,
+            prewarm_strict,
+            #[cfg(feature = "cache-gc")]
+            trt_cache_gc_enabled,
         }
     }
 }

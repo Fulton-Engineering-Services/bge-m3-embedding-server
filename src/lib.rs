@@ -226,6 +226,9 @@ pub async fn run() -> anyhow::Result<()> {
             gpu_mem_limit_bytes: cfg.gpu_mem_limit_bytes,
             jit_suspect_tx,
             engine_propagation_tx,
+            prewarm_strict: cfg.prewarm_strict,
+            #[cfg(feature = "cache-gc")]
+            trt_cache_gc_enabled: cfg.trt_cache_gc_enabled,
         },
     );
 

@@ -37,6 +37,9 @@ async fn spawn_propagates_leader_load_failure() {
             gpu_mem_limit_bytes: None,
             jit_suspect_tx: None,
             engine_propagation_tx: None,
+            prewarm_strict: true,
+            #[cfg(feature = "cache-gc")]
+            trt_cache_gc_enabled: false,
         },
     );
 
@@ -86,6 +89,9 @@ async fn gpu_ep_clamps_workers_to_gpu_count() {
             gpu_mem_limit_bytes: None,
             jit_suspect_tx: None,
             engine_propagation_tx: None,
+            prewarm_strict: true,
+            #[cfg(feature = "cache-gc")]
+            trt_cache_gc_enabled: false,
         },
     );
 
@@ -142,6 +148,9 @@ async fn spawn_multi_worker_fails_fast_on_leader_failure() {
             gpu_mem_limit_bytes: None,
             jit_suspect_tx: None,
             engine_propagation_tx: None,
+            prewarm_strict: true,
+            #[cfg(feature = "cache-gc")]
+            trt_cache_gc_enabled: false,
         },
     );
 

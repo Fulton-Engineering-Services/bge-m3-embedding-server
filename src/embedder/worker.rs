@@ -34,6 +34,8 @@ use super::sm_detect::detect_sm_for_device;
 use super::sparse::embed_sparse;
 use super::tokenize::{build_chunk_arrays, tokenize_no_pad};
 use super::trt_cache;
+#[cfg(feature = "cache-gc")]
+use super::trt_cache_gc;
 use super::trt_warmup::{
     prewarm_persistence_postcondition_failed, prewarm_persistence_suspicious_undercount,
     trt_prewarm,
@@ -340,6 +342,29 @@ pub struct WorkerConfig {
     /// `Receiver` via `tx.subscribe()` at startup.  `None` when
     /// `BGE_M3_ENGINE_PROPAGATION_ENABLED=0` or when the EP is not TRT.
     pub engine_propagation_tx: Option<tokio::sync::broadcast::Sender<(usize, usize)>>,
+
+    /// When `true`, prewarm postcondition failures cause the worker to refuse
+    /// to signal ready: `run_worker` returns `Err(_)` before `ready_tx.send`,
+    /// the pool's init task propagates the error, and the readiness probe in
+    /// `bootstrap::readiness` triggers a hard process exit. Converts the
+    /// 2026-05 false-positive-readiness failure mode (every worker hits TRT
+    /// `Error Code 10` mid-build, postcondition logs WARN, `/health` still
+    /// returns `200 ok`, real requests then 500) into an explicit startup
+    /// failure that ECS retries instead of routing traffic to.
+    ///
+    /// Sourced from `BGE_M3_PREWARM_STRICT`; defaults to `true`. Set to
+    /// `false` to preserve pre-fix behaviour (WARN only).
+    pub prewarm_strict: bool,
+
+    /// **Destructive** stale-SM TRT engine cache GC flag.
+    ///
+    /// Only present when the `cache-gc` Cargo feature is compiled in.
+    /// Defaults to `false` even with the feature on; flipping the
+    /// runtime knob also requires `BGE_M3_TRT_CACHE_GC_ENABLED=1`. See
+    /// [`crate::config::Config::trt_cache_gc_enabled`] for the multi-SM
+    /// ASG hazard model.
+    #[cfg(feature = "cache-gc")]
+    pub trt_cache_gc_enabled: bool,
 }
 
 /// Runs a single `session.run()` for the probe, measuring RSS before and after.
@@ -518,6 +543,55 @@ pub(super) fn run_worker(
         }
     };
 
+    // Destructive stale-SM cache GC (feature-gated `cache-gc` + runtime
+    // `BGE_M3_TRT_CACHE_GC_ENABLED=1`). Both gates must be on for any
+    // deletion to occur. When the feature is OFF this entire block is
+    // physically absent from the binary. See `trt_cache_gc.rs` for the
+    // multi-SM ASG hazard model.
+    #[cfg(feature = "cache-gc")]
+    if config.trt_cache_gc_enabled && config.ep != EpSelection::Cpu {
+        let engine_cache_dir = trt_cache::engine_cache_path(&cache_dir);
+        match detect_current_sm(config.device_id) {
+            Some(current_sm) => {
+                tracing::warn!(
+                    target: "bge_m3_embedding_server::trt_cache_gc",
+                    worker_id = id,
+                    gpu_device = config.device_id,
+                    current_sm = %current_sm,
+                    cache_path = %engine_cache_dir.display(),
+                    sidecar_suffixes = ?trt_cache_gc::ENGINE_SIDE_SUFFIXES,
+                    "destructive cache GC about to run: will delete every \
+                     `_smXX.engine` whose XX != current SM, plus aligned \
+                     sidecars. DO NOT use this build against a shared EFS \
+                     engine cache in a multi-SM ASG"
+                );
+                let stats = trt_cache_gc::gc_stale_sm_plans(&engine_cache_dir, &current_sm);
+                tracing::warn!(
+                    target: "bge_m3_embedding_server::trt_cache_gc",
+                    worker_id = id,
+                    gpu_device = config.device_id,
+                    current_sm = %current_sm,
+                    plans_deleted = stats.plans_deleted,
+                    bytes_freed = stats.bytes_freed,
+                    other_sms_observed = ?stats.other_sms_observed,
+                    cache_path = %engine_cache_dir.display(),
+                    "destructive cache GC ran: deleted other-SM engine plans \
+                     from shared cache"
+                );
+            }
+            None => {
+                tracing::warn!(
+                    target: "bge_m3_embedding_server::trt_cache_gc",
+                    worker_id = id,
+                    gpu_device = config.device_id,
+                    "destructive cache GC requested but current GPU compute \
+                     capability could not be detected (no nvidia-smi or \
+                     unparseable output); skipping GC"
+                );
+            }
+        }
+    }
+
     // Detect this worker's GPU compute capability (e.g. `sm89`, `sm120`) once,
     // before TRT prewarm, so every subsequent cache enumeration restricts
     // itself to plans matching this GPU. Without this, a worker on `sm120`
@@ -656,6 +730,41 @@ pub(super) fn run_worker(
             total_fsync_ms = stats.total_fsync_ms,
             "TensorRT pre-warm complete"
         );
+
+        // Strict-mode escalation (BGE_M3_PREWARM_STRICT): when the prewarm
+        // postcondition signals that compile-success events occurred but no
+        // engine plan files persisted, refuse to signal ready. The pool's
+        // init task converts the worker error into an init-handle failure,
+        // and `bootstrap::readiness::run_readiness_probe` then triggers a
+        // hard process exit. ECS retries the task, which is the correct
+        // response to "every worker hit TRT autotuner OOM mid-build" rather
+        // than serving HTTP 500 traffic from a known-broken pool.
+        if should_fail_readiness(
+            stats.fresh_compiles,
+            stats.engine_count_after,
+            config.prewarm_strict,
+        ) {
+            tracing::error!(
+                target: "bge_m3_embedding_server::prewarm",
+                worker_id = id,
+                gpu_device = config.device_id,
+                fresh_compiles = stats.fresh_compiles,
+                engine_count_before = stats.engine_count_before,
+                engine_count_after = stats.engine_count_after,
+                cache_path = %trt_cache::engine_cache_path(&cache_dir).display(),
+                prewarm_strict = config.prewarm_strict,
+                "Prewarm postcondition failed and prewarm_strict=1: \
+                 refusing to signal ready"
+            );
+            let err = anyhow::anyhow!(
+                "Worker {id} prewarm postcondition failed \
+                 (fresh_compiles={}, engine_count_after={}); \
+                 prewarm_strict=1: refusing to signal ready",
+                stats.fresh_compiles,
+                stats.engine_count_after,
+            );
+            return Err(err);
+        }
     }
 
     // Report the RSS delta so EmbedPool can derive the true per-worker
@@ -982,6 +1091,102 @@ pub(super) fn run_worker(
     }
 
     Ok(())
+}
+
+/// Decides whether a worker should refuse to signal ready after its prewarm
+/// sweep based on the on-disk persistence postcondition.
+///
+/// Returns `true` iff `strict` is `true` AND at least one of the
+/// [`prewarm_persistence_postcondition_failed`] /
+/// [`prewarm_persistence_suspicious_undercount`] predicates fires for the
+/// given `(fresh_compiles, engine_count_after)` snapshot.
+///
+/// The signature deliberately accepts primitive `usize` values rather than
+/// `&PrewarmStats` so the unit tests in `worker/tests/prewarm_strict.rs`
+/// stay decoupled from the `trt_warmup::PrewarmStats` struct shape; this
+/// also lets the predicate be reused at future call sites (e.g. an admin
+/// endpoint that wants to surface the same decision) without dragging in
+/// the rest of the prewarm statistics.
+fn should_fail_readiness(fresh_compiles: usize, engine_count_after: usize, strict: bool) -> bool {
+    if !strict {
+        return false;
+    }
+    prewarm_persistence_postcondition_failed(fresh_compiles, engine_count_after)
+        || prewarm_persistence_suspicious_undercount(fresh_compiles, engine_count_after)
+}
+
+/// Detects the compute capability of CUDA device `device_id` by shelling
+/// out to `nvidia-smi --query-gpu=compute_cap --format=csv,noheader -i
+/// <device_id>` and parsing the returned `X.Y` string into `sm{X}{Y}`.
+///
+/// Returns `None` when the binary is missing, the device cannot be
+/// queried, or the output cannot be parsed. The destructive cache GC
+/// treats `None` as a soft skip (logs a WARN and does not delete).
+///
+/// **Only compiled when the `cache-gc` feature is enabled** — the
+/// production build is not allowed to invoke the GC, so there is no
+/// reason to carry this helper in the default binary.
+#[cfg(feature = "cache-gc")]
+fn detect_current_sm(device_id: u32) -> Option<String> {
+    let output = std::process::Command::new("nvidia-smi")
+        .arg("--query-gpu=compute_cap")
+        .arg("--format=csv,noheader")
+        .arg("-i")
+        .arg(device_id.to_string())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8(output.stdout).ok()?;
+    parse_compute_cap(stdout.trim())
+}
+
+/// Parses a `nvidia-smi --query-gpu=compute_cap` line (`"8.9"`, `"12.0"`)
+/// into the cache-tag form (`"sm89"`, `"sm120"`).
+///
+/// Returns `None` on any parse failure so the caller skips GC rather
+/// than constructing a malformed tag. Accepts only `X.Y` shapes with
+/// purely numeric components.
+#[cfg(feature = "cache-gc")]
+fn parse_compute_cap(s: &str) -> Option<String> {
+    let trimmed = s.trim();
+    let mut parts = trimmed.splitn(2, '.');
+    let major = parts.next()?.trim();
+    let minor = parts.next()?.trim();
+    if major.is_empty() || minor.is_empty() {
+        return None;
+    }
+    if !major.chars().all(|c| c.is_ascii_digit()) || !minor.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    Some(format!("sm{major}{minor}"))
+}
+
+#[cfg(all(test, feature = "cache-gc"))]
+mod parse_compute_cap_tests {
+    use super::parse_compute_cap;
+
+    #[test]
+    fn handles_typical_outputs() {
+        assert_eq!(parse_compute_cap("8.9"), Some("sm89".to_string()));
+        assert_eq!(parse_compute_cap("8.9\n"), Some("sm89".to_string()));
+        assert_eq!(parse_compute_cap("12.0"), Some("sm120".to_string()));
+        assert_eq!(parse_compute_cap("  7.5  "), Some("sm75".to_string()));
+    }
+
+    #[test]
+    fn rejects_garbage() {
+        assert_eq!(parse_compute_cap(""), None);
+        assert_eq!(parse_compute_cap("8"), None);
+        assert_eq!(parse_compute_cap("8.x"), None);
+        assert_eq!(parse_compute_cap("not a version"), None);
+        assert_eq!(parse_compute_cap("a.b"), None);
+        // Trailing components after the minor are rejected — only X.Y
+        // is accepted to prevent accidental tag widening on future
+        // nvidia-smi output changes.
+        assert_eq!(parse_compute_cap("8.9.0"), None);
+    }
 }
 
 #[cfg(test)]

@@ -28,6 +28,9 @@
 //! - `dual`: paired dense + sparse embedding pipeline (one forward pass).
 //! - `trt_cache`: `TensorRT` engine-cache path construction, inspection, and
 //!   durability (fsync after compile).
+//! - `trt_cache_gc` (feature `cache-gc`, off by default): destructive
+//!   stale-SM engine plan garbage collection — only present in dedicated
+//!   maintenance / dev binaries.
 //! - `trt_warmup`: `TensorRT` engine pre-warming during worker startup.
 //! - `worker`: blocking worker thread, request dispatch, probe wiring.
 //! - `pool`: `EmbedPool` async wrapper and test helpers.
@@ -46,6 +49,8 @@ pub(crate) mod sm_detect;
 mod sparse;
 mod tokenize;
 pub(crate) mod trt_cache;
+#[cfg(feature = "cache-gc")]
+pub(crate) mod trt_cache_gc;
 mod trt_warmup;
 mod types;
 mod worker;

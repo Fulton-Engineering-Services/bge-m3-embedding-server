@@ -18,6 +18,9 @@
 //!   `embed_with_trt_retry` retry/workspace-halving logic.
 //! - `propagation`: `drain_engine_propagation` deduplication, lagged-channel
 //!   handling, and idempotency for already-warmed shapes.
+//! - `prewarm_strict`: pure-function tests for the `BGE_M3_PREWARM_STRICT`
+//!   decision predicate (`should_fail_readiness`).
 
+mod prewarm_strict;
 mod propagation;
 mod trt_retry;
