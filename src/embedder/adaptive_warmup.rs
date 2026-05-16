@@ -32,9 +32,24 @@
 //! The background task accumulates suspected miss shapes, waits for an idle
 //! window, and compiles one shape at a time via [`EmbedPool::send_adaptive_warmup`].
 //! Successfully compiled shapes are not re-submitted in the current session.
+//!
+//! ## Accepted tradeoffs
+//!
+//! **Non-atomic idle detection (L-4):** The `queue_depth == 0` check and the subsequent
+//! `send_adaptive_warmup` call are not atomic. A traffic burst arriving between these two
+//! operations will queue behind the adaptive warmup compile. This is intentional — the
+//! compile runs inside a normal worker slot and the burst simply waits, same as any other
+//! request. Introducing atomic coordination across the pool boundary would add complexity
+//! without meaningful latency improvement.
+//!
+//! **Homogeneous-SM assumption (L-5):** The adaptive warmup dispatches to whichever worker
+//! accepts the message first. For this to benefit all workers the instance must have a
+//! homogeneous GPU SM version (e.g. all L40S `sm_89`) so the compiled engine plan on EFS
+//! is valid for every worker on restart. Mixed-SM deployments (e.g. mixing g6e and g5
+//! instances in the same ASG) will compile plans only for the SM of whichever worker runs
+//! first. See CLAUDE.md "TRT plans are compute-capability-specific" for the full constraint.
 
 use std::collections::HashSet;
-use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc;
@@ -55,13 +70,13 @@ pub(crate) struct AdaptiveWarmupConfig {
     pub enabled: bool,
     /// Seconds of continuous idle (zero queue depth) required before the task
     /// fires a warmup shape. Prevents warmup interference with live inference.
+    /// When `0`, the quiet-window check is skipped entirely.
     pub quiet_secs: u64,
     /// Maximum number of shapes the task will compile per rolling hour. Acts as
     /// a rate-limiter to prevent runaway warmup loops on high-traffic deployments.
+    /// When `0`, adaptive warmup is enabled but no shapes will be compiled — a
+    /// warning is emitted at startup.
     pub max_shapes_per_hour: u32,
-    /// Path to the model cache directory (passed to the worker for `trt_prewarm`).
-    #[allow(dead_code)]
-    pub cache_dir: PathBuf,
 }
 
 /// Spawns the adaptive background warmup task.
@@ -80,6 +95,13 @@ pub(crate) fn spawn_adaptive_warmup(
     if !config.enabled {
         return;
     }
+    if config.max_shapes_per_hour == 0 {
+        tracing::warn!(
+            "BGE_M3_ADAPTIVE_WARMUP_MAX_SHAPES_PER_HOUR=0 — adaptive warmup is enabled \
+             but the per-hour budget is zero; no shapes will be compiled. \
+             Set to a positive value or unset to use the default of 12."
+        );
+    }
     tokio::spawn(async move {
         run_adaptive_warmup_loop(config, pool, rx).await;
     });
@@ -90,7 +112,7 @@ async fn run_adaptive_warmup_loop(
     pool: EmbedPool,
     mut rx: mpsc::Receiver<(usize, usize)>,
 ) {
-    let mut pending: Vec<(usize, usize)> = Vec::new();
+    let mut pending: indexmap::IndexSet<(usize, usize)> = indexmap::IndexSet::new();
     let mut warmed: HashSet<(usize, usize)> = HashSet::new();
     let mut shapes_this_hour: u32 = 0;
     let mut hour_start = Instant::now();
@@ -111,7 +133,7 @@ async fn run_adaptive_warmup_loop(
                 maybe = rx.recv() => {
                     if let Some(shape) = maybe {
                         if !warmed.contains(&shape) && !pending.contains(&shape) {
-                            pending.push(shape);
+                            pending.insert(shape);
                         }
                     } else {
                         tracing::info!(
@@ -151,7 +173,7 @@ async fn run_adaptive_warmup_loop(
             }
             match ack_rx.await {
                 Ok(Ok(compile_ms)) => {
-                    pending.retain(|s| s != &shape);
+                    pending.shift_remove(&shape);
                     warmed.insert(shape);
                     shapes_this_hour += 1;
                     tracing::info!(
@@ -170,7 +192,7 @@ async fn run_adaptive_warmup_loop(
                         "adaptive_warmup_failed"
                     );
                     // Remove to avoid infinite retry in this session.
-                    pending.retain(|s| s != &shape);
+                    pending.shift_remove(&shape);
                 }
                 Err(_) => {
                     tracing::warn!(
@@ -178,7 +200,7 @@ async fn run_adaptive_warmup_loop(
                         seq = shape.1,
                         "adaptive_warmup_ack_dropped"
                     );
-                    pending.retain(|s| s != &shape);
+                    pending.shift_remove(&shape);
                 }
             }
         }
@@ -189,12 +211,12 @@ async fn run_adaptive_warmup_loop(
 /// and already-pending shapes. Non-blocking: returns as soon as `try_recv` fails.
 fn drain_rx(
     rx: &mut mpsc::Receiver<(usize, usize)>,
-    pending: &mut Vec<(usize, usize)>,
+    pending: &mut indexmap::IndexSet<(usize, usize)>,
     warmed: &HashSet<(usize, usize)>,
 ) {
     while let Ok(shape) = rx.try_recv() {
         if !warmed.contains(&shape) && !pending.contains(&shape) {
-            pending.push(shape);
+            pending.insert(shape);
         }
     }
 }
@@ -204,13 +226,20 @@ fn drain_rx(
 /// Continuously drains the JIT-suspect channel into `pending` while waiting.
 /// Returns `true` if the quiet window was reached, `false` if the queue became
 /// busy again and we should re-enter the outer idle-check loop.
+///
+/// When `quiet_secs` is `0`, returns `true` immediately without sleeping.
 async fn wait_for_quiet_window(
     quiet_secs: u64,
     pool: &EmbedPool,
     rx: &mut mpsc::Receiver<(usize, usize)>,
-    pending: &mut Vec<(usize, usize)>,
+    pending: &mut indexmap::IndexSet<(usize, usize)>,
     warmed: &HashSet<(usize, usize)>,
 ) -> bool {
+    // quiet_secs == 0: return ready immediately (no sleep required)
+    if quiet_secs == 0 {
+        return true;
+    }
+
     let mut consecutive_idle: u64 = 0;
     loop {
         tokio::time::sleep(Duration::from_secs(1)).await;
@@ -227,3 +256,6 @@ async fn wait_for_quiet_window(
         }
     }
 }
+
+#[cfg(test)]
+mod tests;

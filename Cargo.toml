@@ -20,6 +20,7 @@ path = "src/main.rs"
 
 [dependencies]
 axum = "0.8"
+indexmap = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "time"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -76,6 +77,7 @@ cuda = ["ort/cuda", "nvml"]
 tensorrt = ["ort/cuda", "ort/tensorrt", "nvml"]
 
 [dev-dependencies]
+tokio = { version = "1", features = ["test-util"] }
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 proptest = "1"

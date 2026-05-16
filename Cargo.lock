@@ -165,6 +165,7 @@ dependencies = [
  "criterion",
  "hf-hub",
  "http-body-util",
+ "indexmap",
  "ndarray",
  "nvml-wrapper",
  "ort",

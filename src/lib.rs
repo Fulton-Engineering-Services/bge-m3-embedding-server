@@ -308,7 +308,6 @@ pub async fn run() -> anyhow::Result<()> {
             enabled: cfg.adaptive_warmup_enabled,
             quiet_secs: cfg.adaptive_warmup_quiet_secs,
             max_shapes_per_hour: cfg.adaptive_warmup_max_shapes_per_hour,
-            cache_dir: PathBuf::from(&cfg.cache_dir),
         };
         crate::embedder::adaptive_warmup::spawn_adaptive_warmup(adaptive_cfg, pool.clone(), rx);
         info!(
