@@ -257,6 +257,39 @@ pub struct Config {
     /// Lower this on GPUs with less VRAM (e.g. `8589934592` for 8 GiB).
     pub gpu_vram_budget_bytes: Option<usize>,
 
+    /// TRT EP workspace size cap in bytes.
+    ///
+    /// Set with `BGE_M3_TRT_MAX_WORKSPACE_BYTES`. When `None`, TRT uses its
+    /// default "as large as possible" workspace — which can OOM on saturated
+    /// VRAM. Set to a value that leaves room for resident model weights and
+    /// cached engine plans (e.g. 4 GiB = `4294967296` on an L40S with 4 workers).
+    pub trt_max_workspace_bytes: Option<usize>,
+
+    /// CUDA EP device-level memory limit in bytes.
+    ///
+    /// Set with `BGE_M3_GPU_MEM_LIMIT_BYTES`. When `None`, CUDA EP uses all
+    /// available device memory. Symmetric to `trt_max_workspace_bytes`.
+    pub gpu_mem_limit_bytes: Option<usize>,
+
+    /// Enable the in-process adaptive background warmup loop.
+    ///
+    /// Set with `BGE_M3_ADAPTIVE_WARMUP_ENABLED=1`. When enabled, the server
+    /// detects unseen `(batch, seq)` shapes during live inference and compiles
+    /// TRT engines for them during idle windows.
+    pub adaptive_warmup_enabled: bool,
+
+    /// Seconds the server must be idle (queue_depth == 0, all workers free)
+    /// before the adaptive warmup loop fires a shape.
+    ///
+    /// Set with `BGE_M3_ADAPTIVE_WARMUP_QUIET_SECS`. Default: 3.
+    pub adaptive_warmup_quiet_secs: u64,
+
+    /// Maximum number of shapes the adaptive warmup loop may compile per hour.
+    ///
+    /// Set with `BGE_M3_ADAPTIVE_WARMUP_MAX_SHAPES_PER_HOUR`. Default: 12.
+    /// Prevents pathological traffic patterns from compiling indefinitely.
+    pub adaptive_warmup_max_shapes_per_hour: u32,
+
     /// List of `(batch_size, seq_len)` shapes to pre-compile as `TensorRT` engine
     /// files during worker startup.
     ///
@@ -400,6 +433,24 @@ impl Config {
         let gpu_vram_budget_bytes =
             lookup("BGE_M3_GPU_VRAM_BUDGET_BYTES").and_then(|v| v.parse::<usize>().ok());
 
+        let trt_max_workspace_bytes =
+            lookup("BGE_M3_TRT_MAX_WORKSPACE_BYTES").and_then(|v| v.parse::<usize>().ok());
+
+        let gpu_mem_limit_bytes =
+            lookup("BGE_M3_GPU_MEM_LIMIT_BYTES").and_then(|v| v.parse::<usize>().ok());
+
+        let adaptive_warmup_enabled = lookup("BGE_M3_ADAPTIVE_WARMUP_ENABLED")
+            .is_some_and(|v| matches!(v.as_str(), "1" | "true" | "yes"));
+
+        let adaptive_warmup_quiet_secs = lookup("BGE_M3_ADAPTIVE_WARMUP_QUIET_SECS")
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(3);
+
+        let adaptive_warmup_max_shapes_per_hour =
+            lookup("BGE_M3_ADAPTIVE_WARMUP_MAX_SHAPES_PER_HOUR")
+                .and_then(|v| v.parse::<u32>().ok())
+                .unwrap_or(12);
+
         // When a GPU EP is active, the host-RAM probe is meaningless — VRAM is
         // the constraint. Override the cost model unconditionally so the probe
         // is skipped and the VRAM budget drives bin-packing instead.
@@ -448,6 +499,11 @@ impl Config {
             heartbeat_secs,
             ep,
             gpu_vram_budget_bytes,
+            trt_max_workspace_bytes,
+            gpu_mem_limit_bytes,
+            adaptive_warmup_enabled,
+            adaptive_warmup_quiet_secs,
+            adaptive_warmup_max_shapes_per_hour,
             gpu_count,
             trt_warmup_shapes,
             warmup_only,

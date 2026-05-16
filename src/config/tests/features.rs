@@ -345,6 +345,93 @@ fn gpu_vram_budget_invalid_value_yields_none() {
     assert_eq!(cfg.gpu_vram_budget_bytes, None);
 }
 
+// --- BGE_M3_TRT_MAX_WORKSPACE_BYTES ---
+
+#[test]
+fn trt_max_workspace_bytes_set_to_valid_value() {
+    let map = HashMap::from([("BGE_M3_TRT_MAX_WORKSPACE_BYTES", "4294967296")]);
+    let cfg = Config::from_lookup(lookup_from(&map));
+    assert_eq!(cfg.trt_max_workspace_bytes, Some(4_294_967_296));
+}
+
+#[test]
+fn trt_max_workspace_bytes_unset_yields_none() {
+    let map = HashMap::new();
+    let cfg = Config::from_lookup(lookup_from(&map));
+    assert_eq!(cfg.trt_max_workspace_bytes, None);
+}
+
+#[test]
+fn trt_max_workspace_bytes_invalid_yields_none() {
+    let map = HashMap::from([("BGE_M3_TRT_MAX_WORKSPACE_BYTES", "not_a_number")]);
+    let cfg = Config::from_lookup(lookup_from(&map));
+    assert_eq!(cfg.trt_max_workspace_bytes, None);
+}
+
+// --- BGE_M3_GPU_MEM_LIMIT_BYTES ---
+
+#[test]
+fn gpu_mem_limit_bytes_set() {
+    let map = HashMap::from([("BGE_M3_GPU_MEM_LIMIT_BYTES", "8589934592")]);
+    let cfg = Config::from_lookup(lookup_from(&map));
+    assert_eq!(cfg.gpu_mem_limit_bytes, Some(8_589_934_592));
+}
+
+#[test]
+fn gpu_mem_limit_bytes_unset_yields_none() {
+    let map = HashMap::new();
+    let cfg = Config::from_lookup(lookup_from(&map));
+    assert_eq!(cfg.gpu_mem_limit_bytes, None);
+}
+
+// --- BGE_M3_ADAPTIVE_WARMUP_ENABLED ---
+
+#[test]
+fn adaptive_warmup_enabled_default_is_false() {
+    let map = HashMap::new();
+    let cfg = Config::from_lookup(lookup_from(&map));
+    assert!(!cfg.adaptive_warmup_enabled);
+}
+
+#[test]
+fn adaptive_warmup_enabled_set_to_1() {
+    let map = HashMap::from([("BGE_M3_ADAPTIVE_WARMUP_ENABLED", "1")]);
+    let cfg = Config::from_lookup(lookup_from(&map));
+    assert!(cfg.adaptive_warmup_enabled);
+}
+
+// --- BGE_M3_ADAPTIVE_WARMUP_QUIET_SECS ---
+
+#[test]
+fn adaptive_warmup_quiet_secs_default_is_3() {
+    let map = HashMap::new();
+    let cfg = Config::from_lookup(lookup_from(&map));
+    assert_eq!(cfg.adaptive_warmup_quiet_secs, 3);
+}
+
+#[test]
+fn adaptive_warmup_quiet_secs_set() {
+    let map = HashMap::from([("BGE_M3_ADAPTIVE_WARMUP_QUIET_SECS", "10")]);
+    let cfg = Config::from_lookup(lookup_from(&map));
+    assert_eq!(cfg.adaptive_warmup_quiet_secs, 10);
+}
+
+// --- BGE_M3_ADAPTIVE_WARMUP_MAX_SHAPES_PER_HOUR ---
+
+#[test]
+fn adaptive_warmup_max_shapes_per_hour_default_is_12() {
+    let map = HashMap::new();
+    let cfg = Config::from_lookup(lookup_from(&map));
+    assert_eq!(cfg.adaptive_warmup_max_shapes_per_hour, 12);
+}
+
+#[test]
+fn adaptive_warmup_max_shapes_per_hour_set() {
+    let map = HashMap::from([("BGE_M3_ADAPTIVE_WARMUP_MAX_SHAPES_PER_HOUR", "24")]);
+    let cfg = Config::from_lookup(lookup_from(&map));
+    assert_eq!(cfg.adaptive_warmup_max_shapes_per_hour, 24);
+}
+
 // --- BGE_M3_GPU_COUNT ---
 
 #[test]

@@ -51,12 +51,15 @@ pub(super) fn execution_providers(
     cache_dir: &Path,
     ep: EpSelection,
     device_id: u32,
+    trt_max_workspace_bytes: Option<usize>,
+    gpu_mem_limit_bytes: Option<usize>,
 ) -> Vec<ort::ep::ExecutionProviderDispatch> {
     // macOS: always CoreML regardless of BGE_M3_EP.
     // The cfg blocks are mutually exclusive so only one branch is compiled per target.
     #[cfg(target_os = "macos")]
     {
         let _ = device_id;
+        let _ = (trt_max_workspace_bytes, gpu_mem_limit_bytes);
         let coreml_cache = cache_dir.join("coreml");
         let strategy = match std::env::var("BGE_M3_COREML_STRATEGY").ok().as_deref() {
             Some("default") => ort::ep::coreml::SpecializationStrategy::Default,
@@ -121,15 +124,17 @@ pub(super) fn execution_providers(
             // instead of silently serving CPU inference. Greppable in
             // CloudWatch via the new field `error_on_failure: true` on the
             // "ORT execution providers configured" event.
-            return vec![ort::ep::TensorRT::default()
+            let mut trt_ep = ort::ep::TensorRT::default()
                 .with_device_id(device_id.cast_signed())
                 .with_engine_cache(true)
                 .with_engine_cache_path(cache_info.path.display().to_string())
                 .with_timing_cache(true)
                 .with_timing_cache_path(timing_cache.display().to_string())
-                .with_fp16(true)
-                .build()
-                .error_on_failure()];
+                .with_fp16(true);
+            if let Some(cap) = trt_max_workspace_bytes {
+                trt_ep = trt_ep.with_max_workspace_size(cap);
+            }
+            return vec![trt_ep.build().error_on_failure()];
         }
 
         // Linux CUDA (feature-gated).
@@ -143,14 +148,20 @@ pub(super) fn execution_providers(
                 error_on_failure = true,
                 "ORT execution providers configured"
             );
-            return vec![ort::ep::CUDA::default()
-                .with_device_id(device_id.cast_signed())
-                .build()
-                .error_on_failure()];
+            let mut cuda_ep = ort::ep::CUDA::default().with_device_id(device_id.cast_signed());
+            if let Some(limit) = gpu_mem_limit_bytes {
+                cuda_ep = cuda_ep.with_memory_limit(limit);
+            }
+            return vec![cuda_ep.build().error_on_failure()];
         }
 
         // CPU fallback (always available).
-        let _ = (cache_dir, device_id);
+        let _ = (
+            cache_dir,
+            device_id,
+            trt_max_workspace_bytes,
+            gpu_mem_limit_bytes,
+        );
         tracing::info!(
             ep_selection = %ep,
             ep_active = "CPU/MLAS",
@@ -200,10 +211,18 @@ pub(super) fn load_models(
     intra_threads: usize,
     ep: EpSelection,
     device_id: u32,
+    trt_max_workspace_bytes: Option<usize>,
+    gpu_mem_limit_bytes: Option<usize>,
 ) -> Result<(ort::session::Session, tokenizers::Tokenizer)> {
     let files = download_model_files(cache_dir, show_download_progress, model_variant)?;
     let tokenizer = load_tokenizer(&files.tokenizer_path, max_seq_length)?;
-    let eps = execution_providers(cache_dir, ep, device_id);
+    let eps = execution_providers(
+        cache_dir,
+        ep,
+        device_id,
+        trt_max_workspace_bytes,
+        gpu_mem_limit_bytes,
+    );
     let session = load_session(&files.onnx_path, eps, intra_threads)?;
     Ok((session, tokenizer))
 }

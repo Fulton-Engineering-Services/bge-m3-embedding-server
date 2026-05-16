@@ -55,6 +55,11 @@ Add `BGE_M3_DISABLE_AUTO_BUDGET=1` to skip the 2-minute Linux startup probe duri
 | `BGE_M3_EP` | `cpu` | Execution provider: `cpu`, `cuda`, or `tensorrt`. CoreML is always used on macOS. |
 | `BGE_M3_GPU_COUNT` | auto | GPU device count. Auto-detected from `/proc/driver/nvidia/gpus/`; set explicitly on multi-GPU ECS tasks. |
 | `BGE_M3_GPU_VRAM_BUDGET_BYTES` | 10 GiB | VRAM workspace ceiling for GPU EPs. |
+| `BGE_M3_TRT_MAX_WORKSPACE_BYTES` | unset (TRT default) | TRT EP kernel autotuner workspace cap (bytes). Set to `4294967296` (4 GiB) on L40S/H100 with 4 workers to prevent JIT allocation failures when VRAM is 87%+ saturated. |
+| `BGE_M3_GPU_MEM_LIMIT_BYTES` | unset (all available) | CUDA EP device memory limit (bytes). Symmetric cap for the CUDA execution provider. |
+| `BGE_M3_ADAPTIVE_WARMUP_ENABLED` | `0` | `1` to enable the in-process background JIT warmup loop. Detects unseen `(batch, seq)` shapes during inference and pre-compiles them when the GPU is idle. |
+| `BGE_M3_ADAPTIVE_WARMUP_QUIET_SECS` | `3` | Seconds of full idle (queue empty, all workers free) required before the adaptive loop fires a warmup compile. |
+| `BGE_M3_ADAPTIVE_WARMUP_MAX_SHAPES_PER_HOUR` | `12` | Per-process cap on adaptive warmup compiles per hour. Prevents pathological traffic from compiling indefinitely. |
 | `BGE_M3_TRT_WARMUP_SHAPES` | 16-shape grid | Comma-separated `BxL` shapes for TRT engine pre-compilation. Shrink to `1x128` on workstations. |
 | `BGE_M3_WARMUP_ONLY` | `0` | Exit after TRT engine compilation — use as an ECS init container to pre-populate the engine cache. |
 
