@@ -190,8 +190,7 @@ impl EmbedPool {
         // Workers ignore the rx if EP is not TRT via the run_worker drain guard.
         let (engine_propagation_tx, _seed_rx) =
             tokio::sync::broadcast::channel::<(usize, usize)>(32);
-        let engine_propagation_enabled =
-            config.ep == EpSelection::TensorRt && config.jit_suspect_tx.is_some();
+        let engine_propagation_enabled = config.engine_propagation_enabled;
         let engine_propagation_tx_for_pool = if engine_propagation_enabled {
             Some(engine_propagation_tx.clone())
         } else {

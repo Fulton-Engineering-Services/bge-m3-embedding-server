@@ -269,6 +269,18 @@ pub struct WorkerConfig {
     /// channel is full the message is silently dropped.  `None` when adaptive
     /// warmup is disabled.
     pub jit_suspect_tx: Option<JitSuspectSender>,
+
+    /// Controls cross-worker engine cache propagation.
+    ///
+    /// When `true`, `EmbedPool::spawn` creates a broadcast channel and
+    /// distributes per-worker tx/rx pairs so each worker fan-outs new
+    /// TRT engine plans to its peers.  Defaults to `adaptive_warmup_enabled`
+    /// via [`crate::config::Config::engine_propagation_enabled`].
+    ///
+    /// Setting `BGE_M3_ENGINE_PROPAGATION_ENABLED=0` in the environment
+    /// (which sets `Config::engine_propagation_enabled = false`) will disable
+    /// propagation while keeping adaptive warmup active.
+    pub engine_propagation_enabled: bool,
 }
 
 /// Runs a single `session.run()` for the probe, measuring RSS before and after.

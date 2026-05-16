@@ -213,6 +213,7 @@ pub async fn run() -> anyhow::Result<()> {
             trt_max_workspace_bytes: cfg.trt_max_workspace_bytes,
             gpu_mem_limit_bytes: cfg.gpu_mem_limit_bytes,
             jit_suspect_tx,
+            engine_propagation_enabled: cfg.engine_propagation_enabled,
         },
     );
 
