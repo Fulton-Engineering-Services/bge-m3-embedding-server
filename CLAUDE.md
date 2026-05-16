@@ -60,6 +60,7 @@ Add `BGE_M3_DISABLE_AUTO_BUDGET=1` to skip the 2-minute Linux startup probe duri
 | `BGE_M3_ADAPTIVE_WARMUP_ENABLED` | `0` | `1` to enable the in-process background JIT warmup loop. Detects unseen `(batch, seq)` shapes during inference and pre-compiles them when the GPU is idle. |
 | `BGE_M3_ADAPTIVE_WARMUP_QUIET_SECS` | `3` | Seconds of full idle (queue empty, all workers free) required before the adaptive loop fires a warmup compile. `0` returns immediately (no sleep before first idle check). |
 | `BGE_M3_ADAPTIVE_WARMUP_MAX_SHAPES_PER_HOUR` | `12` | Per-process cap on adaptive warmup compiles per hour. Prevents pathological traffic from compiling indefinitely. |
+| `BGE_M3_ENGINE_PROPAGATION_ENABLED` | matches `adaptive_warmup_enabled` | Broadcast `(batch, seq)` shape notifications to peer workers after a new TRT engine plan is written to EFS. Peers run `trt_prewarm` for a ~1-3s fast disk-load instead of full JIT. Disable for debugging (keeps adaptive warmup active). |
 | `BGE_M3_TRT_WARMUP_SHAPES` | 16-shape grid | Comma-separated `BxL` shapes for TRT engine pre-compilation. Shrink to `1x128` on workstations. |
 | `BGE_M3_WARMUP_ONLY` | `0` | Exit after TRT engine compilation — use as an ECS init container to pre-populate the engine cache. |
 
@@ -97,6 +98,7 @@ Every JSON log line begins with `"bge_module":"server"` and `"build":"cpu"` or `
 - **Tokenize-once, bin-pack:** texts tokenized in one pass, grouped into `session.run()` calls using the quadratic cost model `a·BS + b·BS²` to fit `max_workspace_bytes`.
 - **Startup probe (Linux):** sweeps 7 `(batch, seq)` shapes, fits OLS cost-model coefficients, caches to `{cache_dir}/probe-coefficients.json` (keyed by `version × model × max_seq × arch`).
 - **Sparse projection:** token hidden states → `sparse_linear.safetensors` (4 KB) → ReLU → max-pool.
+- **Cross-worker engine propagation:** After any worker writes a new TRT engine plan (adaptive_warmup or real-inference JIT), a `tokio::sync::broadcast` channel fans out the `(batch, seq)` shape to every peer. Each peer drains the channel between requests and runs `trt_prewarm` (~1-3s fast disk-load from EFS) against its own session. Per-worker `warmed_local: HashSet` ensures idempotency. See the homogeneous-SM constraint (L-5 in `adaptive_warmup.rs` docs): plans are SM-specific, so all GPUs in the pool must share the same compute capability.
 
 Verify tuning after deploy: `curl http://localhost:8081/health | jq '{status,max_seq_length,tuning}'`
 Healthy values: `a_bytes_per_token` ≈ 18000–20000 (fp16, amd64); `b_bytes_per_token_sq` ≈ 5–8; `model_rss_bytes_per_worker` ≈ 1.1 GB.

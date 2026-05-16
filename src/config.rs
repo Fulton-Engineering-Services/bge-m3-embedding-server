@@ -278,6 +278,17 @@ pub struct Config {
     /// TRT engines for them during idle windows.
     pub adaptive_warmup_enabled: bool,
 
+    /// Enable cross-worker engine cache propagation via broadcast channel.
+    ///
+    /// When true, after any worker writes a new TRT engine plan to EFS (via the
+    /// `adaptive_warmup` loop or a real-inference JIT compile), a `(batch, seq)`
+    /// shape notification is broadcast to every peer worker so they eagerly run
+    /// `trt_prewarm` against their own session (~1-3s fast disk-load).
+    ///
+    /// Defaults to `adaptive_warmup_enabled`. Set `BGE_M3_ENGINE_PROPAGATION_ENABLED=0`
+    /// to disable propagation while keeping adaptive warmup active (debugging).
+    pub engine_propagation_enabled: bool,
+
     /// Seconds the server must be idle (`queue_depth == 0`, all workers free)
     /// before the adaptive warmup loop fires a shape.
     ///
@@ -460,6 +471,14 @@ impl Config {
         let adaptive_warmup_enabled = lookup("BGE_M3_ADAPTIVE_WARMUP_ENABLED")
             .is_some_and(|v| matches!(v.as_str(), "1" | "true" | "yes"));
 
+        let engine_propagation_enabled = lookup("BGE_M3_ENGINE_PROPAGATION_ENABLED")
+            .and_then(|v| match v.as_str() {
+                "0" => Some(false),
+                "1" => Some(true),
+                _ => None,
+            })
+            .unwrap_or(adaptive_warmup_enabled);
+
         let adaptive_warmup_quiet_secs = lookup("BGE_M3_ADAPTIVE_WARMUP_QUIET_SECS")
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(3);
@@ -520,6 +539,7 @@ impl Config {
             trt_max_workspace_bytes,
             gpu_mem_limit_bytes,
             adaptive_warmup_enabled,
+            engine_propagation_enabled,
             adaptive_warmup_quiet_secs,
             adaptive_warmup_max_shapes_per_hour,
             gpu_count,

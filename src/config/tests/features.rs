@@ -469,6 +469,53 @@ fn adaptive_warmup_max_shapes_per_hour_invalid_yields_default_12() {
     assert_eq!(cfg.adaptive_warmup_max_shapes_per_hour, 12);
 }
 
+// --- BGE_M3_ENGINE_PROPAGATION_ENABLED ---
+
+#[test]
+fn engine_propagation_enabled_defaults_to_adaptive_warmup_when_unset_true() {
+    let map = HashMap::from([("BGE_M3_ADAPTIVE_WARMUP_ENABLED", "1")]);
+    let cfg = Config::from_lookup(lookup_from(&map));
+    assert!(
+        cfg.adaptive_warmup_enabled,
+        "adaptive_warmup_enabled must be true for this test to be meaningful"
+    );
+    assert!(
+        cfg.engine_propagation_enabled,
+        "engine_propagation_enabled must default to true when adaptive_warmup_enabled is true"
+    );
+}
+
+#[test]
+fn engine_propagation_enabled_defaults_to_false_when_adaptive_disabled() {
+    let map = HashMap::new();
+    let cfg = Config::from_lookup(lookup_from(&map));
+    assert!(
+        !cfg.adaptive_warmup_enabled,
+        "adaptive_warmup_enabled must be false for this test to be meaningful"
+    );
+    assert!(
+        !cfg.engine_propagation_enabled,
+        "engine_propagation_enabled must default to false when adaptive_warmup_enabled is false"
+    );
+}
+
+#[test]
+fn engine_propagation_enabled_can_be_explicitly_disabled() {
+    let map = HashMap::from([
+        ("BGE_M3_ADAPTIVE_WARMUP_ENABLED", "1"),
+        ("BGE_M3_ENGINE_PROPAGATION_ENABLED", "0"),
+    ]);
+    let cfg = Config::from_lookup(lookup_from(&map));
+    assert!(
+        cfg.adaptive_warmup_enabled,
+        "adaptive_warmup_enabled must be true for this test to be meaningful"
+    );
+    assert!(
+        !cfg.engine_propagation_enabled,
+        "engine_propagation_enabled=0 must override the adaptive_warmup_enabled default"
+    );
+}
+
 // --- BGE_M3_GPU_COUNT ---
 
 #[test]

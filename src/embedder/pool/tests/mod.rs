@@ -29,4 +29,5 @@ mod corpus;
 mod helpers;
 mod lifecycle;
 mod math_helpers;
+mod propagation;
 mod spawn;

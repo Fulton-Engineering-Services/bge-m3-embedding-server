@@ -29,6 +29,24 @@ use super::types::{DualEmbedding, EmbedRequest, EmbedStats, ProbeResult, SparseE
 use super::worker::{run_worker, WorkerConfig};
 use crate::config::EpSelection;
 
+/// Sender half of the engine propagation broadcast channel.
+type PropTx = tokio::sync::broadcast::Sender<(usize, usize)>;
+
+/// Receiver half of the engine propagation broadcast channel.
+type PropRx = tokio::sync::broadcast::Receiver<(usize, usize)>;
+
+/// Creates a `(Sender, Receiver)` pair for engine propagation when enabled.
+///
+/// Returns `(Some(tx_clone), Some(rx))` when `enabled` is true, and
+/// `(None, None)` otherwise.  Called once per worker in `EmbedPool::spawn`.
+fn make_propagation_pair(enabled: bool, tx: &PropTx) -> (Option<PropTx>, Option<PropRx>) {
+    if enabled {
+        (Some(tx.clone()), Some(tx.subscribe()))
+    } else {
+        (None, None)
+    }
+}
+
 /// Awaits worker `id`'s readiness signal, but also resolves immediately if the
 /// worker's `JoinHandle` finishes before signaling readiness.
 ///
@@ -102,9 +120,36 @@ pub struct EmbedPool {
     /// budget. Returns `0` on non-Linux targets where RSS measurement is
     /// unavailable, or before the init task has completed.
     model_rss_per_worker_bytes: Arc<AtomicUsize>,
+    /// Broadcast sender for cross-worker TRT engine cache propagation.
+    ///
+    /// When `Some`, after any worker writes a new engine plan to EFS, a
+    /// `(batch, seq)` shape notification is broadcast to every subscribed
+    /// worker so they eagerly run `trt_prewarm` (~1-3s fast disk-load) instead
+    /// of paying full JIT cost on the next real request. `None` when
+    /// `BGE_M3_ENGINE_PROPAGATION_ENABLED=0`.
+    engine_propagation_tx: Option<PropTx>,
 }
 
 impl EmbedPool {
+    /// Broadcasts a `(batch, seq)` shape notification to all subscribed peer
+    /// workers, signaling that the TRT engine plan for this shape is now on EFS.
+    ///
+    /// Workers receive the notification in their main loop drain and run
+    /// Broadcasts a `(batch, seq)` shape notification to all subscribed peer
+    /// workers, signaling that the TRT engine plan for this shape is now on EFS.
+    ///
+    /// Workers receive the notification in their main loop drain and run
+    /// `trt_prewarm` against their own session for a ~1-3s fast disk-load
+    /// rather than paying full JIT cost on the next real request for this shape.
+    ///
+    /// `send` returns `Err` only when there are zero subscribers (all workers
+    /// gone). This is non-fatal; the engine plan is still on EFS.
+    pub fn broadcast_engine_ready(&self, shape: (usize, usize)) {
+        if let Some(tx) = &self.engine_propagation_tx {
+            let _ = tx.send(shape);
+        }
+    }
+
     /// Spawns `n` embedding worker threads and returns the pool plus an init
     /// handle that resolves once all workers have finished loading their models.
     ///
@@ -138,6 +183,23 @@ impl EmbedPool {
         let (tx, rx) = mpsc::channel::<EmbedRequest>(capacity);
         let rx = Arc::new(Mutex::new(rx));
 
+        // Broadcast channel for cross-worker engine cache propagation.
+        // Enabled when: TRT EP is active AND the jit_suspect_tx channel exists
+        // (adaptive warmup enabled). This matches the default coupling of
+        // engine_propagation_enabled to adaptive_warmup_enabled in Config.
+        // Workers ignore the rx if EP is not TRT via the run_worker drain guard.
+        let (engine_propagation_tx, _seed_rx) =
+            tokio::sync::broadcast::channel::<(usize, usize)>(32);
+        let engine_propagation_enabled =
+            config.ep == EpSelection::TensorRt && config.jit_suspect_tx.is_some();
+        let engine_propagation_tx_for_pool = if engine_propagation_enabled {
+            Some(engine_propagation_tx.clone())
+        } else {
+            None
+        };
+        // Clone for capture into the async init task.
+        let engine_propagation_tx_for_init = engine_propagation_tx.clone();
+
         // Channel carries Result<usize> where the Ok variant is the RSS delta
         // (bytes) measured by each worker around load_models().
         let (ready_tx, mut ready_rx) = mpsc::channel::<Result<usize>>(n);
@@ -155,7 +217,9 @@ impl EmbedPool {
 
                 let spawn_worker = |id: usize,
                                     ready_tx_clone: mpsc::Sender<Result<usize>>,
-                                    worker_config: WorkerConfig|
+                                    worker_config: WorkerConfig,
+                                    prop_tx: Option<PropTx>,
+                                    prop_rx: Option<PropRx>|
                  -> JoinHandle<Result<()>> {
                     let rx_clone = Arc::clone(&rx);
                     let cache_dir_clone = cache_dir.clone();
@@ -170,6 +234,8 @@ impl EmbedPool {
                             live_for_worker,
                             loaded_for_worker,
                             worker_config,
+                            prop_tx,
+                            prop_rx,
                         )
                     })
                 };
@@ -208,7 +274,17 @@ impl EmbedPool {
                 let mut rss_deltas: Vec<usize> = Vec::with_capacity(n);
 
                 // --- Phase 1: spawn leader worker (may download models) ---
-                let mut leader_handle = spawn_worker(0, ready_tx.clone(), make_worker_config(0));
+                let (leader_prop_tx, leader_prop_rx) = make_propagation_pair(
+                    engine_propagation_enabled,
+                    &engine_propagation_tx_for_init,
+                );
+                let mut leader_handle = spawn_worker(
+                    0,
+                    ready_tx.clone(),
+                    make_worker_config(0),
+                    leader_prop_tx,
+                    leader_prop_rx,
+                );
                 let leader_msg = await_worker_signal(0, &mut leader_handle, &mut ready_rx).await?;
                 worker_handles.push(leader_handle);
                 loaded_workers_for_init.fetch_add(1, Ordering::AcqRel);
@@ -232,7 +308,17 @@ impl EmbedPool {
                 // Startup cost: ~4-6s per worker × 6 followers ≈ 24-36s total,
                 // well within the configured startPeriod (300s).
                 for id in 1..n {
-                    let mut handle = spawn_worker(id, ready_tx.clone(), make_worker_config(id));
+                    let (prop_tx, prop_rx) = make_propagation_pair(
+                        engine_propagation_enabled,
+                        &engine_propagation_tx_for_init,
+                    );
+                    let mut handle = spawn_worker(
+                        id,
+                        ready_tx.clone(),
+                        make_worker_config(id),
+                        prop_tx,
+                        prop_rx,
+                    );
                     let delta = await_worker_signal(id, &mut handle, &mut ready_rx).await?;
                     worker_handles.push(handle);
                     loaded_workers_for_init.fetch_add(1, Ordering::AcqRel);
@@ -267,6 +353,7 @@ impl EmbedPool {
                 live_workers,
                 loaded_workers,
                 model_rss_per_worker_bytes,
+                engine_propagation_tx: engine_propagation_tx_for_pool,
             },
             init_handle,
         )
@@ -441,6 +528,7 @@ impl EmbedPool {
             live_workers: Arc::new(AtomicUsize::new(0)),
             loaded_workers: Arc::new(AtomicUsize::new(0)),
             model_rss_per_worker_bytes: Arc::new(AtomicUsize::new(0)),
+            engine_propagation_tx: None,
         }
     }
 
@@ -493,6 +581,7 @@ impl EmbedPool {
             live_workers: Arc::new(AtomicUsize::new(1)),
             loaded_workers: Arc::new(AtomicUsize::new(1)),
             model_rss_per_worker_bytes: Arc::new(AtomicUsize::new(0)),
+            engine_propagation_tx: None,
         }
     }
 
@@ -503,6 +592,27 @@ impl EmbedPool {
             live_workers: Arc::new(AtomicUsize::new(1)),
             loaded_workers: Arc::new(AtomicUsize::new(0)),
             model_rss_per_worker_bytes: Arc::new(AtomicUsize::new(0)),
+            engine_propagation_tx: None,
+        }
+    }
+
+    /// Creates an [`EmbedPool`] backed by `with_fixed_responses` with the
+    /// provided broadcast sender wired in.
+    ///
+    /// Used by propagation tests that need to verify `broadcast_engine_ready`
+    /// without spawning real workers.
+    pub(crate) fn for_propagation_test(
+        dense_fixture: Vec<Vec<f32>>,
+        sparse_fixture: Vec<SparseEmbedding>,
+        engine_tx: PropTx,
+    ) -> Self {
+        let pool = Self::with_fixed_responses(dense_fixture, sparse_fixture);
+        Self {
+            tx: pool.tx,
+            live_workers: pool.live_workers,
+            loaded_workers: pool.loaded_workers,
+            model_rss_per_worker_bytes: pool.model_rss_per_worker_bytes,
+            engine_propagation_tx: Some(engine_tx),
         }
     }
 

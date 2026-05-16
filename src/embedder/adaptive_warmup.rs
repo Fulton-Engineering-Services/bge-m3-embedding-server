@@ -176,6 +176,10 @@ async fn run_adaptive_warmup_loop(
                     pending.shift_remove(&shape);
                     warmed.insert(shape);
                     shapes_this_hour += 1;
+                    // Notify peer workers so they can eagerly run trt_prewarm
+                    // (~1-3s fast disk-load) rather than paying full JIT cost
+                    // on the next real request for this shape.
+                    pool.broadcast_engine_ready(shape);
                     tracing::info!(
                         batch = shape.0,
                         seq = shape.1,

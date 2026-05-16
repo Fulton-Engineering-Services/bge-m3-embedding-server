@@ -110,14 +110,15 @@ where
     }
 }
 
-/// Emits the `chunk_run` INFO event and, on a cache miss, notifies the
-/// JIT-suspect channel so the adaptive warmup task can schedule background
-/// engine compilation.
+/// Emits the `chunk_run` INFO event and, on a cache miss, notifies both the
+/// JIT-suspect channel (adaptive warmup scheduling) and the engine propagation
+/// broadcast channel (peer worker fast disk-load).
 fn log_inference_complete(
     stats: &super::types::EmbedStats,
     worker_id: usize,
     _route: &'static str,
     jit_suspect_tx: Option<&JitSuspectSender>,
+    engine_propagation_tx: Option<&tokio::sync::broadcast::Sender<(usize, usize)>>,
     batch_len: usize,
 ) {
     let cache_hit = stats.inference_ms < CHUNK_CACHE_HIT_THRESHOLD_MS;
@@ -133,6 +134,51 @@ fn log_inference_complete(
     if !cache_hit {
         if let Some(tx) = jit_suspect_tx {
             let _ = tx.try_send((batch_len, stats.max_chunk_seq));
+        }
+        if let Some(tx) = engine_propagation_tx {
+            let _ = tx.send((batch_len, stats.max_chunk_seq));
+        }
+    }
+}
+
+/// Drains pending broadcast notifications and runs `trt_prewarm` for each
+/// new shape.
+///
+/// Called at the start of each worker loop iteration (between requests) so
+/// peers eagerly warm their in-memory TRT profile before the next real
+/// request for a new shape arrives.
+///
+/// `warmed_local` tracks shapes already warmed by this worker in the current
+/// session; the originating worker self-skips because it inserted into
+/// `warmed_local` when it first broadcasted.
+pub(super) fn drain_engine_propagation<F>(
+    rx: &mut tokio::sync::broadcast::Receiver<(usize, usize)>,
+    warmed_local: &mut std::collections::HashSet<(usize, usize)>,
+    worker_id: usize,
+    mut prewarm: F,
+) where
+    F: FnMut((usize, usize)),
+{
+    loop {
+        match rx.try_recv() {
+            Ok(shape) => {
+                if warmed_local.insert(shape) {
+                    prewarm(shape);
+                }
+            }
+            Err(
+                tokio::sync::broadcast::error::TryRecvError::Empty
+                | tokio::sync::broadcast::error::TryRecvError::Closed,
+            ) => break,
+            Err(tokio::sync::broadcast::error::TryRecvError::Lagged(n)) => {
+                tracing::warn!(
+                    worker_id,
+                    lagged = n,
+                    "engine_propagation: broadcast lagged; some shapes missed"
+                );
+                // Continue draining; missed shapes will be re-broadcast on
+                // the next slow-inference event for that shape.
+            }
         }
     }
 }
@@ -315,7 +361,11 @@ fn run_probe_batch(
     probe_run_dense(session, &ids_array, &mask_array)
 }
 
-#[allow(clippy::needless_pass_by_value, clippy::too_many_lines)]
+#[allow(
+    clippy::needless_pass_by_value,
+    clippy::too_many_lines,
+    clippy::too_many_arguments
+)]
 pub(super) fn run_worker(
     id: usize,
     cache_dir: PathBuf,
@@ -324,6 +374,13 @@ pub(super) fn run_worker(
     live_workers: Arc<AtomicUsize>,
     loaded_workers: Arc<AtomicUsize>,
     config: WorkerConfig,
+    // Sender half of the engine propagation broadcast channel. Set by
+    // EmbedPool::spawn when propagation is enabled and EP is TRT. None
+    // disables inference-JIT broadcast for this worker.
+    engine_propagation_tx: Option<tokio::sync::broadcast::Sender<(usize, usize)>>,
+    // Receiver half of the engine propagation broadcast channel. Drained
+    // between requests to run trt_prewarm for peer-compiled shapes.
+    mut engine_propagation_rx: Option<tokio::sync::broadcast::Receiver<(usize, usize)>>,
 ) -> Result<()> {
     let _guard = WorkerGuard(Arc::clone(&live_workers));
     let span = info_span!("worker", id = id);
@@ -498,8 +555,39 @@ pub(super) fn run_worker(
 
     let mut models: Option<(ort::session::Session, tokenizers::Tokenizer)> = Some(initial_models);
 
+    // Tracks shapes already prewarmed by this worker via engine propagation so
+    // we skip shapes we originated (which are already in our TRT profile).
+    let mut warmed_local: std::collections::HashSet<(usize, usize)> =
+        std::collections::HashSet::new();
+
     info!("Worker {id} entering request loop");
     loop {
+        // Drain peer engine-ready notifications and run trt_prewarm for any
+        // new shapes so the in-memory TRT profile is extended before the next
+        // real request for that shape arrives (~1-3s fast disk-load vs. full JIT).
+        if config.ep == EpSelection::TensorRt {
+            if let Some(ref mut bcast_rx) = engine_propagation_rx {
+                if let Some((session, _)) = models.as_mut() {
+                    drain_engine_propagation(bcast_rx, &mut warmed_local, id, |shape| {
+                        let started = std::time::Instant::now();
+                        let stats = trt_prewarm(session, &[shape], id, &cache_dir);
+                        let elapsed_ms =
+                            u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+                        tracing::info!(
+                            target: "bge_m3_embedding_server::trt_shape",
+                            worker_id = id,
+                            chunk_batch = shape.0,
+                            chunk_max_seq = shape.1,
+                            elapsed_ms,
+                            warmed = stats.warmed,
+                            fully_cached = stats.fully_cached,
+                            "engine_propagation_complete"
+                        );
+                    });
+                }
+            }
+        }
+
         let msg = if let Some(timeout) = config.idle_timeout.filter(|_| models.is_some()) {
             rt.block_on(async {
                 tokio::time::timeout(timeout, async { rx.lock().await.recv().await }).await
@@ -622,6 +710,7 @@ pub(super) fn run_worker(
                                 id,
                                 "dense",
                                 config.jit_suspect_tx.as_ref(),
+                                engine_propagation_tx.as_ref(),
                                 texts.len(),
                             );
                             tracing::info!(
@@ -663,6 +752,7 @@ pub(super) fn run_worker(
                                 id,
                                 "sparse",
                                 config.jit_suspect_tx.as_ref(),
+                                engine_propagation_tx.as_ref(),
                                 texts.len(),
                             );
                             tracing::info!(
@@ -704,6 +794,7 @@ pub(super) fn run_worker(
                                 id,
                                 "both",
                                 config.jit_suspect_tx.as_ref(),
+                                engine_propagation_tx.as_ref(),
                                 texts.len(),
                             );
                             tracing::info!(
@@ -755,136 +846,4 @@ pub(super) fn run_worker(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    // --- is_trt_jit_oom ---
-
-    #[test]
-    fn is_trt_jit_oom_matches_user_allocator_error() {
-        let e = anyhow::anyhow!("TRT: User allocator error during cuDNN workspace setup");
-        assert!(is_trt_jit_oom(&e));
-    }
-
-    #[test]
-    fn is_trt_jit_oom_matches_no_impl_with_workspace() {
-        let e = anyhow::anyhow!("Could not find any implementation for node; workspace too small");
-        assert!(is_trt_jit_oom(&e));
-    }
-
-    #[test]
-    fn is_trt_jit_oom_does_not_match_no_impl_without_alloc() {
-        // "Could not find any implementation" without workspace/alloc = unsupported op, not OOM
-        let e = anyhow::anyhow!("Could not find any implementation for node /Reshape_3");
-        assert!(!is_trt_jit_oom(&e));
-    }
-
-    #[test]
-    fn is_trt_jit_oom_does_not_match_unrelated_error() {
-        let e = anyhow::anyhow!("OrtStatus: NOT_IMPLEMENTED: opset 18 not supported");
-        assert!(!is_trt_jit_oom(&e));
-    }
-
-    #[test]
-    fn is_trt_jit_oom_does_not_match_empty() {
-        let e = anyhow::anyhow!("");
-        assert!(!is_trt_jit_oom(&e));
-    }
-
-    // --- embed_with_trt_retry ---
-
-    #[test]
-    fn embed_with_trt_retry_succeeds_without_retry() {
-        let cm = CostModel::conservative(2 * 1024 * 1024 * 1024);
-        let calls = std::cell::Cell::new(0u32);
-        let result = embed_with_trt_retry(
-            |_cm| {
-                calls.set(calls.get() + 1);
-                Ok(42u64)
-            },
-            &cm,
-            0,
-            "test",
-        );
-        assert_eq!(result.unwrap(), 42);
-        assert_eq!(calls.get(), 1);
-    }
-
-    #[test]
-    fn embed_with_trt_retry_fires_exactly_once_on_oom() {
-        let cm = CostModel::conservative(2 * 1024 * 1024 * 1024);
-        let calls = std::cell::Cell::new(0u32);
-        let result: anyhow::Result<u64> = embed_with_trt_retry(
-            |_cm| {
-                calls.set(calls.get() + 1);
-                if calls.get() == 1 {
-                    Err(anyhow::anyhow!("User allocator error in TRT"))
-                } else {
-                    Ok(99)
-                }
-            },
-            &cm,
-            0,
-            "test",
-        );
-        assert_eq!(result.unwrap(), 99);
-        assert_eq!(calls.get(), 2);
-    }
-
-    #[test]
-    fn embed_with_trt_retry_halves_workspace_on_retry() {
-        let original = 2 * 1024 * 1024 * 1024usize;
-        let cm = CostModel::conservative(original);
-        let observed_workspace = std::cell::Cell::new(0usize);
-        let calls = std::cell::Cell::new(0u32);
-        let _: anyhow::Result<u64> = embed_with_trt_retry(
-            |cm| {
-                calls.set(calls.get() + 1);
-                if calls.get() == 1 {
-                    Err(anyhow::anyhow!("User allocator error in TRT"))
-                } else {
-                    observed_workspace.set(cm.max_workspace_bytes);
-                    Ok(0)
-                }
-            },
-            &cm,
-            0,
-            "test",
-        );
-        assert_eq!(observed_workspace.get(), original / 2);
-    }
-
-    #[test]
-    fn embed_with_trt_retry_propagates_non_oom_error_immediately() {
-        let cm = CostModel::conservative(1024);
-        let calls = std::cell::Cell::new(0u32);
-        let result: anyhow::Result<u64> = embed_with_trt_retry(
-            |_cm| {
-                calls.set(calls.get() + 1);
-                Err(anyhow::anyhow!("Some unrelated error"))
-            },
-            &cm,
-            0,
-            "test",
-        );
-        assert!(result.is_err());
-        assert_eq!(calls.get(), 1, "non-OOM error must not retry");
-    }
-
-    #[test]
-    fn embed_with_trt_retry_propagates_second_failure() {
-        let cm = CostModel::conservative(1024);
-        let calls = std::cell::Cell::new(0u32);
-        let result: anyhow::Result<u64> = embed_with_trt_retry(
-            |_cm| {
-                calls.set(calls.get() + 1);
-                Err(anyhow::anyhow!("User allocator error in TRT"))
-            },
-            &cm,
-            0,
-            "test",
-        );
-        assert!(result.is_err());
-        assert_eq!(calls.get(), 2);
-    }
-}
+mod tests;
