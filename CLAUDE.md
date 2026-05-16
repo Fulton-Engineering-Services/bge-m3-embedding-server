@@ -64,6 +64,13 @@ Add `BGE_M3_DISABLE_AUTO_BUDGET=1` to skip the 2-minute Linux startup probe duri
 | `BGE_M3_TRT_WARMUP_SHAPES` | 16-shape grid | Comma-separated `BxL` shapes for TRT engine pre-compilation. Shrink to `1x128` on workstations. |
 | `BGE_M3_WARMUP_ONLY` | `0` | Exit after TRT engine compilation — use as an ECS init container to pre-populate the engine cache. |
 
+### TRT Operational
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `BGE_M3_PREWARM_STRICT` | `true` | When true, prewarm postcondition failure (`engine_count_after == 0` after fresh TRT compiles) causes the worker to refuse readiness and exit instead of logging WARN and continuing. Set to `0` to restore pre-PR-77 behavior. See Key Gotchas. |
+| `BGE_M3_TRT_CACHE_GC_ENABLED` | unset (disabled) | Requires `cache-gc` Cargo feature compiled in. When set to `1`, the leader worker (id=0) deletes all `_smXX.engine` plans (and aligned sidecars) whose SM suffix does not match the current host's SM at startup. **WARNING:** Never enable against a shared EFS cache in a mixed-SM ASG — it will delete plans needed by other instance types. Drain old-SM ASG first, run GC, then bring up new-SM ASG. |
+
 ### Logging
 
 | Variable | Default | Description |
@@ -142,3 +149,5 @@ Releases: `<version>`/`latest` (CPU multi-arch) and `<version>-cuda`/`latest-cud
 - **`error_on_failure()` on GPU EPs** — both `cuda` and `tensorrt` dispatch use `.error_on_failure()` so missing provider `.so` files or CUDA driver problems cause a hard startup failure rather than a silent CPU fallback.
 - **Dockerfile.cuda uses the Microsoft ORT tarball** — not pyke.io. ORT is dynamically linked (`ORT_PREFER_DYNAMIC_LINK=1`); provider `.so` files live in `/usr/local/bin/`. To upgrade ORT: bump `ARG ORT_VERSION` and `ARG ORT_MS_SHA256` in `Dockerfile.cuda`, update the `ln -s` version string, and bump `Cargo.toml` `ort = "=X.Y.Z"`.
 - **ECS capacity at `max_seq=8192`** — per-worker high-water ~10.3 GB (fp16). Formula: `workers × 10.3 GB + OS_HEADROOM ≤ task_memoryMiB`.
+- **`BGE_M3_PREWARM_STRICT` is a breaking behavior change (PR #77, default `true`)** — Prior behavior: prewarm postcondition failure (`engine_count_after == 0`) logged WARN and let the worker continue. New default: worker returns `Err`, pool init propagates, process exits with code 1, and ECS retries the container. If your deployment uses a large warmup shape grid and TRT occasionally hits VRAM exhaustion on first boot, strict mode will cause ECS restart loops. Set `BGE_M3_PREWARM_STRICT=0` to restore the previous warn-and-continue behavior while tuning. After deploying, monitor `exitCode=1` in the ECS event log on first boot. **ECS recommendation:** configure a `restartPolicy` with `restartAttempts ≤ 3` and a `restartWindow` to prevent infinite restart loops under sustained VRAM pressure. Note: a future improvement would use exit code 2 for prewarm strict failures (vs code 1 for other crashes) to enable distinct CloudWatch alarm routing.
+- **x_headers log field key rename after PR #77** — The `x_headers` JSON log field changed key format from hyphenated (`x-request-id`) to underscored (`x_request_id`). Any CloudWatch Insights queries or SIEM filters referencing `x_headers."x-*"` (hyphenated) must be updated to `x_headers."x_*"` (underscore) after deploying PR #77. HTTP header forwarding behavior is unaffected; only the emitted log field keys changed.
