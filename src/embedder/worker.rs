@@ -49,10 +49,92 @@ use crate::sysinfo;
 const CHUNK_CACHE_HIT_THRESHOLD_MS: u64 = 5_000;
 
 /// Returns `true` when an ORT error string indicates a TRT JIT workspace
-/// overflow that may resolve with a smaller batch or halved workspace budget.
+/// overflow — a condition that may resolve with a smaller batch or halved
+/// workspace budget.
+///
+/// Patterns verified against ORT 2.0.0-rc.12 TensorRT EP
+/// (`ort/src/ep/tensorrt.rs`). Re-verify on every ORT version bump.
 fn is_trt_jit_oom(e: &anyhow::Error) -> bool {
     let s = format!("{e}");
-    s.contains("User allocator error") || s.contains("Could not find any implementation")
+    let lowercase = s.to_lowercase();
+    // "User allocator error" = direct CUDA allocation failure during TRT kernel autotuning.
+    // "Could not find any implementation" qualifies only when the underlying cause is an
+    // allocation failure (workspace or alloc in the message); without this qualifier it also
+    // matches genuine unsupported-layer errors where retry is pointless and doubles latency.
+    lowercase.contains("user allocator error")
+        || (lowercase.contains("could not find any implementation")
+            && (lowercase.contains("workspace") || lowercase.contains("alloc")))
+}
+
+/// Wraps an embed call with the standard TRT JIT-OOM retry-once-with-halved-budget
+/// pattern.
+///
+/// If `embed_fn` fails and [`is_trt_jit_oom`] matches the error, retries once
+/// with `max_workspace_bytes / 2`. Logs `trt_jit_retry` on the first attempt and
+/// `trt_jit_retry_exhausted` when the retry also fails. Returns the final result.
+fn embed_with_trt_retry<T, F>(
+    mut embed_fn: F,
+    base_cm: &CostModel,
+    worker_id: usize,
+    route: &'static str,
+) -> anyhow::Result<T>
+where
+    F: FnMut(&CostModel) -> anyhow::Result<T>,
+{
+    match embed_fn(base_cm) {
+        Ok(v) => Ok(v),
+        Err(e) if is_trt_jit_oom(&e) => {
+            let halved = CostModel {
+                max_workspace_bytes: base_cm.max_workspace_bytes / 2,
+                ..*base_cm
+            };
+            tracing::warn!(
+                worker_id,
+                route,
+                original_workspace_mb = base_cm.max_workspace_bytes / (1024 * 1024),
+                halved_workspace_mb = halved.max_workspace_bytes / (1024 * 1024),
+                error = %e,
+                "trt_jit_retry"
+            );
+            embed_fn(&halved).map_err(|e2| {
+                tracing::error!(
+                    worker_id,
+                    route,
+                    error = %e2,
+                    "trt_jit_retry_exhausted"
+                );
+                e2
+            })
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Emits the `chunk_run` INFO event and, on a cache miss, notifies the
+/// JIT-suspect channel so the adaptive warmup task can schedule background
+/// engine compilation.
+fn log_inference_complete(
+    stats: &super::types::EmbedStats,
+    worker_id: usize,
+    route: &'static str,
+    jit_suspect_tx: Option<&JitSuspectSender>,
+    batch_len: usize,
+) {
+    let cache_hit = stats.inference_ms < CHUNK_CACHE_HIT_THRESHOLD_MS;
+    tracing::info!(
+        target: "bge_m3_embedding_server::trt_shape",
+        worker_id,
+        chunk_batch = batch_len,
+        chunk_max_seq = stats.max_chunk_seq,
+        inference_ms = stats.inference_ms,
+        cache_hit,
+        "chunk_run"
+    );
+    if !cache_hit {
+        if let Some(tx) = jit_suspect_tx {
+            let _ = tx.try_send((batch_len, stats.max_chunk_seq));
+        }
+    }
 }
 
 pub(super) struct WorkerGuard(pub Arc<AtomicUsize>);
@@ -522,55 +604,21 @@ pub(super) fn run_worker(
                         }
                         let t_inference = std::time::Instant::now();
                         let cm_guard = config.cost_model.load();
-                        let first = embed_dense(
-                            session,
-                            tokenizer,
-                            &texts,
+                        let result = embed_with_trt_retry(
+                            |cm| embed_dense(session, tokenizer, &texts, cm, config.model_variant),
                             &cm_guard,
-                            config.model_variant,
-                        );
-                        let trt_oom = first.as_ref().err().is_some_and(is_trt_jit_oom);
-                        let result = if trt_oom {
-                            if let Err(ref e) = first {
-                                tracing::warn!(
-                                    target: "bge_m3_embedding_server::trt_shape",
-                                    worker_id = id,
-                                    batch_size = texts.len(),
-                                    error = %e,
-                                    "trt_jit_retry"
-                                );
-                            }
-                            let halved = CostModel {
-                                max_workspace_bytes: cm_guard.max_workspace_bytes / 2,
-                                ..**cm_guard
-                            };
-                            embed_dense(session, tokenizer, &texts, &halved, config.model_variant)
-                                .map_err(|e| {
-                                    tracing::error!(
-                                        target: "bge_m3_embedding_server::trt_shape",
-                                        worker_id = id,
-                                        batch_size = texts.len(),
-                                        error = %e,
-                                        "trt_jit_retry_exhausted"
-                                    );
-                                    anyhow::anyhow!(
-                                        "Dense embed error (trt_jit_retry_exhausted): {e}"
-                                    )
-                                })
-                        } else {
-                            first.map_err(|e| anyhow::anyhow!("Dense embed error: {e}"))
-                        };
+                            id,
+                            "dense",
+                        )
+                        .map_err(|e| anyhow::anyhow!("Dense embed error: {e}"));
                         let inference_ms = t_inference.elapsed().as_millis();
                         if let Ok((_, ref stats)) = result {
-                            let cache_hit = stats.inference_ms < CHUNK_CACHE_HIT_THRESHOLD_MS;
-                            tracing::info!(
-                                target: "bge_m3_embedding_server::trt_shape",
-                                worker_id = id,
-                                chunk_batch = texts.len(),
-                                chunk_max_seq = stats.max_chunk_seq,
-                                inference_ms = stats.inference_ms,
-                                cache_hit,
-                                "chunk_run"
+                            log_inference_complete(
+                                stats,
+                                id,
+                                "dense",
+                                config.jit_suspect_tx.as_ref(),
+                                texts.len(),
                             );
                             tracing::info!(
                                 worker_id = id,
@@ -581,11 +629,6 @@ pub(super) fn run_worker(
                                 inference_ms = stats.inference_ms,
                                 "worker: dense embed complete"
                             );
-                            if !cache_hit {
-                                if let Some(ref tx) = config.jit_suspect_tx {
-                                    let _ = tx.try_send((texts.len(), stats.max_chunk_seq));
-                                }
-                            }
                         }
                         log_if_abandoned_mid_flight(&reply, "dense", id, &result, inference_ms);
                         let _ = reply.send(result);
@@ -602,55 +645,21 @@ pub(super) fn run_worker(
                         }
                         let t_inference = std::time::Instant::now();
                         let cm_guard = config.cost_model.load();
-                        let first = embed_sparse(
-                            session,
-                            tokenizer,
-                            &texts,
+                        let result = embed_with_trt_retry(
+                            |cm| embed_sparse(session, tokenizer, &texts, cm, config.model_variant),
                             &cm_guard,
-                            config.model_variant,
-                        );
-                        let trt_oom = first.as_ref().err().is_some_and(is_trt_jit_oom);
-                        let result = if trt_oom {
-                            if let Err(ref e) = first {
-                                tracing::warn!(
-                                    target: "bge_m3_embedding_server::trt_shape",
-                                    worker_id = id,
-                                    batch_size = texts.len(),
-                                    error = %e,
-                                    "trt_jit_retry"
-                                );
-                            }
-                            let halved = CostModel {
-                                max_workspace_bytes: cm_guard.max_workspace_bytes / 2,
-                                ..**cm_guard
-                            };
-                            embed_sparse(session, tokenizer, &texts, &halved, config.model_variant)
-                                .map_err(|e| {
-                                    tracing::error!(
-                                        target: "bge_m3_embedding_server::trt_shape",
-                                        worker_id = id,
-                                        batch_size = texts.len(),
-                                        error = %e,
-                                        "trt_jit_retry_exhausted"
-                                    );
-                                    anyhow::anyhow!(
-                                        "Sparse embed error (trt_jit_retry_exhausted): {e}"
-                                    )
-                                })
-                        } else {
-                            first.map_err(|e| anyhow::anyhow!("Sparse embed error: {e}"))
-                        };
+                            id,
+                            "sparse",
+                        )
+                        .map_err(|e| anyhow::anyhow!("Sparse embed error: {e}"));
                         let inference_ms = t_inference.elapsed().as_millis();
                         if let Ok((_, ref stats)) = result {
-                            let cache_hit = stats.inference_ms < CHUNK_CACHE_HIT_THRESHOLD_MS;
-                            tracing::info!(
-                                target: "bge_m3_embedding_server::trt_shape",
-                                worker_id = id,
-                                chunk_batch = texts.len(),
-                                chunk_max_seq = stats.max_chunk_seq,
-                                inference_ms = stats.inference_ms,
-                                cache_hit,
-                                "chunk_run"
+                            log_inference_complete(
+                                stats,
+                                id,
+                                "sparse",
+                                config.jit_suspect_tx.as_ref(),
+                                texts.len(),
                             );
                             tracing::info!(
                                 worker_id = id,
@@ -661,11 +670,6 @@ pub(super) fn run_worker(
                                 inference_ms = stats.inference_ms,
                                 "worker: sparse embed complete"
                             );
-                            if !cache_hit {
-                                if let Some(ref tx) = config.jit_suspect_tx {
-                                    let _ = tx.try_send((texts.len(), stats.max_chunk_seq));
-                                }
-                            }
                         }
                         log_if_abandoned_mid_flight(&reply, "sparse", id, &result, inference_ms);
                         let _ = reply.send(result);
@@ -682,50 +686,21 @@ pub(super) fn run_worker(
                         }
                         let t_inference = std::time::Instant::now();
                         let cm_guard = config.cost_model.load();
-                        let first =
-                            embed_both(session, tokenizer, &texts, &cm_guard, config.model_variant);
-                        let trt_oom = first.as_ref().err().is_some_and(is_trt_jit_oom);
-                        let result = if trt_oom {
-                            if let Err(ref e) = first {
-                                tracing::warn!(
-                                    target: "bge_m3_embedding_server::trt_shape",
-                                    worker_id = id,
-                                    batch_size = texts.len(),
-                                    error = %e,
-                                    "trt_jit_retry"
-                                );
-                            }
-                            let halved = CostModel {
-                                max_workspace_bytes: cm_guard.max_workspace_bytes / 2,
-                                ..**cm_guard
-                            };
-                            embed_both(session, tokenizer, &texts, &halved, config.model_variant)
-                                .map_err(|e| {
-                                    tracing::error!(
-                                        target: "bge_m3_embedding_server::trt_shape",
-                                        worker_id = id,
-                                        batch_size = texts.len(),
-                                        error = %e,
-                                        "trt_jit_retry_exhausted"
-                                    );
-                                    anyhow::anyhow!(
-                                        "Dual embed error (trt_jit_retry_exhausted): {e}"
-                                    )
-                                })
-                        } else {
-                            first.map_err(|e| anyhow::anyhow!("Dual embed error: {e}"))
-                        };
+                        let result = embed_with_trt_retry(
+                            |cm| embed_both(session, tokenizer, &texts, cm, config.model_variant),
+                            &cm_guard,
+                            id,
+                            "both",
+                        )
+                        .map_err(|e| anyhow::anyhow!("Dual embed error: {e}"));
                         let inference_ms = t_inference.elapsed().as_millis();
                         if let Ok((_, ref stats)) = result {
-                            let cache_hit = stats.inference_ms < CHUNK_CACHE_HIT_THRESHOLD_MS;
-                            tracing::info!(
-                                target: "bge_m3_embedding_server::trt_shape",
-                                worker_id = id,
-                                chunk_batch = texts.len(),
-                                chunk_max_seq = stats.max_chunk_seq,
-                                inference_ms = stats.inference_ms,
-                                cache_hit,
-                                "chunk_run"
+                            log_inference_complete(
+                                stats,
+                                id,
+                                "both",
+                                config.jit_suspect_tx.as_ref(),
+                                texts.len(),
                             );
                             tracing::info!(
                                 worker_id = id,
@@ -736,11 +711,6 @@ pub(super) fn run_worker(
                                 inference_ms = stats.inference_ms,
                                 "worker: both embed complete"
                             );
-                            if !cache_hit {
-                                if let Some(ref tx) = config.jit_suspect_tx {
-                                    let _ = tx.try_send((texts.len(), stats.max_chunk_seq));
-                                }
-                            }
                         }
                         log_if_abandoned_mid_flight(&reply, "both", id, &result, inference_ms);
                         let _ = reply.send(result);
@@ -778,4 +748,139 @@ pub(super) fn run_worker(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // --- is_trt_jit_oom ---
+
+    #[test]
+    fn is_trt_jit_oom_matches_user_allocator_error() {
+        let e = anyhow::anyhow!("TRT: User allocator error during cuDNN workspace setup");
+        assert!(is_trt_jit_oom(&e));
+    }
+
+    #[test]
+    fn is_trt_jit_oom_matches_no_impl_with_workspace() {
+        let e = anyhow::anyhow!("Could not find any implementation for node; workspace too small");
+        assert!(is_trt_jit_oom(&e));
+    }
+
+    #[test]
+    fn is_trt_jit_oom_does_not_match_no_impl_without_alloc() {
+        // "Could not find any implementation" without workspace/alloc = unsupported op, not OOM
+        let e = anyhow::anyhow!("Could not find any implementation for node /Reshape_3");
+        assert!(!is_trt_jit_oom(&e));
+    }
+
+    #[test]
+    fn is_trt_jit_oom_does_not_match_unrelated_error() {
+        let e = anyhow::anyhow!("OrtStatus: NOT_IMPLEMENTED: opset 18 not supported");
+        assert!(!is_trt_jit_oom(&e));
+    }
+
+    #[test]
+    fn is_trt_jit_oom_does_not_match_empty() {
+        let e = anyhow::anyhow!("");
+        assert!(!is_trt_jit_oom(&e));
+    }
+
+    // --- embed_with_trt_retry ---
+
+    #[test]
+    fn embed_with_trt_retry_succeeds_without_retry() {
+        let cm = CostModel::conservative(2 * 1024 * 1024 * 1024);
+        let calls = std::cell::Cell::new(0u32);
+        let result = embed_with_trt_retry(
+            |_cm| {
+                calls.set(calls.get() + 1);
+                Ok(42u64)
+            },
+            &cm,
+            0,
+            "test",
+        );
+        assert_eq!(result.unwrap(), 42);
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn embed_with_trt_retry_fires_exactly_once_on_oom() {
+        let cm = CostModel::conservative(2 * 1024 * 1024 * 1024);
+        let calls = std::cell::Cell::new(0u32);
+        let result: anyhow::Result<u64> = embed_with_trt_retry(
+            |_cm| {
+                calls.set(calls.get() + 1);
+                if calls.get() == 1 {
+                    Err(anyhow::anyhow!("User allocator error in TRT"))
+                } else {
+                    Ok(99)
+                }
+            },
+            &cm,
+            0,
+            "test",
+        );
+        assert_eq!(result.unwrap(), 99);
+        assert_eq!(calls.get(), 2);
+    }
+
+    #[test]
+    fn embed_with_trt_retry_halves_workspace_on_retry() {
+        let original = 2 * 1024 * 1024 * 1024usize;
+        let cm = CostModel::conservative(original);
+        let observed_workspace = std::cell::Cell::new(0usize);
+        let calls = std::cell::Cell::new(0u32);
+        let _: anyhow::Result<u64> = embed_with_trt_retry(
+            |cm| {
+                calls.set(calls.get() + 1);
+                if calls.get() == 1 {
+                    Err(anyhow::anyhow!("User allocator error in TRT"))
+                } else {
+                    observed_workspace.set(cm.max_workspace_bytes);
+                    Ok(0)
+                }
+            },
+            &cm,
+            0,
+            "test",
+        );
+        assert_eq!(observed_workspace.get(), original / 2);
+    }
+
+    #[test]
+    fn embed_with_trt_retry_propagates_non_oom_error_immediately() {
+        let cm = CostModel::conservative(1024);
+        let calls = std::cell::Cell::new(0u32);
+        let result: anyhow::Result<u64> = embed_with_trt_retry(
+            |_cm| {
+                calls.set(calls.get() + 1);
+                Err(anyhow::anyhow!("Some unrelated error"))
+            },
+            &cm,
+            0,
+            "test",
+        );
+        assert!(result.is_err());
+        assert_eq!(calls.get(), 1, "non-OOM error must not retry");
+    }
+
+    #[test]
+    fn embed_with_trt_retry_propagates_second_failure() {
+        let cm = CostModel::conservative(1024);
+        let calls = std::cell::Cell::new(0u32);
+        let result: anyhow::Result<u64> = embed_with_trt_retry(
+            |_cm| {
+                calls.set(calls.get() + 1);
+                Err(anyhow::anyhow!("User allocator error in TRT"))
+            },
+            &cm,
+            0,
+            "test",
+        );
+        assert!(result.is_err());
+        assert_eq!(calls.get(), 2);
+    }
 }
