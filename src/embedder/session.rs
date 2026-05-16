@@ -33,10 +33,14 @@ use crate::config::{EpSelection, ModelVariant};
 ///
 /// On Linux with the `tensorrt` feature: selects `TensorRT` when
 /// `ep == EpSelection::TensorRt`, with engine caching, FP16, and the
-/// specified `device_id` enabled.
+/// specified `device_id` enabled. When `trt_max_workspace_bytes` is `Some`,
+/// the workspace cap is forwarded to the TRT EP via `with_max_workspace_size`;
+/// otherwise ORT's built-in default is used.
 ///
 /// On Linux with the `cuda` feature: selects CUDA when
-/// `ep == EpSelection::Cuda`, pinned to `device_id`.
+/// `ep == EpSelection::Cuda`, pinned to `device_id`. When
+/// `gpu_mem_limit_bytes` is `Some`, the device memory limit is forwarded via
+/// `with_memory_limit`; otherwise the EP uses all available device memory.
 ///
 /// CPU fallback: returns an empty list so ORT falls back to MLAS.
 ///
@@ -203,6 +207,9 @@ pub(super) fn load_session(
 /// `device_id` selects the CUDA/TRT GPU device for this session. Computed by
 /// `EmbedPool::spawn` as `worker_index % gpu_count`. Ignored on CPU EP and
 /// macOS.
+///
+/// `trt_max_workspace_bytes` and `gpu_mem_limit_bytes` are forwarded verbatim
+/// to [`execution_providers`]; see that function's documentation for semantics.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn load_models(
     cache_dir: &Path,
