@@ -36,7 +36,7 @@ async fn spawn_propagates_leader_load_failure() {
             trt_max_workspace_bytes: None,
             gpu_mem_limit_bytes: None,
             jit_suspect_tx: None,
-            engine_propagation_enabled: false,
+            engine_propagation_tx: None,
         },
     );
 
@@ -85,7 +85,7 @@ async fn gpu_ep_clamps_workers_to_gpu_count() {
             trt_max_workspace_bytes: None,
             gpu_mem_limit_bytes: None,
             jit_suspect_tx: None,
-            engine_propagation_enabled: false,
+            engine_propagation_tx: None,
         },
     );
 
@@ -141,7 +141,7 @@ async fn spawn_multi_worker_fails_fast_on_leader_failure() {
             trt_max_workspace_bytes: None,
             gpu_mem_limit_bytes: None,
             jit_suspect_tx: None,
-            engine_propagation_enabled: false,
+            engine_propagation_tx: None,
         },
     );
 

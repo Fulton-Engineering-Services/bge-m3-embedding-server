@@ -33,6 +33,14 @@ fn is_trt_jit_oom_matches_no_impl_with_workspace() {
 }
 
 #[test]
+fn is_trt_jit_oom_matches_no_impl_with_alloc_keyword() {
+    // "alloc" branch: allocation failure during TRT autotuning reported via
+    // the "could not find any implementation" + "alloc" combination.
+    let e = anyhow::anyhow!("Could not find any implementation for node /MatMul_42; alloc failed");
+    assert!(is_trt_jit_oom(&e));
+}
+
+#[test]
 fn is_trt_jit_oom_does_not_match_no_impl_without_alloc() {
     // "Could not find any implementation" without workspace/alloc = unsupported op, not OOM
     let e = anyhow::anyhow!("Could not find any implementation for node /Reshape_3");
@@ -129,6 +137,60 @@ fn embed_with_trt_retry_propagates_non_oom_error_immediately() {
     );
     assert!(result.is_err());
     assert_eq!(calls.get(), 1, "non-OOM error must not retry");
+}
+
+/// Edge case: `max_workspace_bytes` = 0 halves to 0, then floors to 1 MiB (COR-4).
+#[test]
+fn embed_with_trt_retry_halved_workspace_floors_at_1_mib_when_original_is_zero() {
+    let cm = CostModel::conservative(0);
+    let observed_workspace = std::cell::Cell::new(0usize);
+    let calls = std::cell::Cell::new(0u32);
+    let _: anyhow::Result<u64> = embed_with_trt_retry(
+        |cm| {
+            calls.set(calls.get() + 1);
+            if calls.get() == 1 {
+                Err(anyhow::anyhow!("User allocator error in TRT"))
+            } else {
+                observed_workspace.set(cm.max_workspace_bytes);
+                Ok(0)
+            }
+        },
+        &cm,
+        0,
+        "test",
+    );
+    assert_eq!(
+        observed_workspace.get(),
+        1024 * 1024,
+        "halved workspace must floor at 1 MiB when original is 0"
+    );
+}
+
+/// Edge case: `max_workspace_bytes` = 1 halves to 0, then floors to 1 MiB (COR-4).
+#[test]
+fn embed_with_trt_retry_halved_workspace_floors_at_1_mib_when_original_is_1() {
+    let cm = CostModel::conservative(1);
+    let observed_workspace = std::cell::Cell::new(0usize);
+    let calls = std::cell::Cell::new(0u32);
+    let _: anyhow::Result<u64> = embed_with_trt_retry(
+        |cm| {
+            calls.set(calls.get() + 1);
+            if calls.get() == 1 {
+                Err(anyhow::anyhow!("User allocator error in TRT"))
+            } else {
+                observed_workspace.set(cm.max_workspace_bytes);
+                Ok(0)
+            }
+        },
+        &cm,
+        0,
+        "test",
+    );
+    assert_eq!(
+        observed_workspace.get(),
+        1024 * 1024,
+        "halved workspace must floor at 1 MiB when original is 1"
+    );
 }
 
 #[test]

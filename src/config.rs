@@ -89,6 +89,13 @@ impl std::fmt::Display for ModelVariant {
 /// Override with `BGE_M3_GPU_VRAM_BUDGET_BYTES` for GPUs with less VRAM.
 const DEFAULT_GPU_VRAM_BUDGET_BYTES: usize = 10 * 1024 * 1024 * 1024;
 
+/// Advisory upper-bound for VRAM byte values (128 GiB).
+///
+/// Current max GPU VRAM is ~96 GiB (H100 SXM). Values above this threshold
+/// almost certainly indicate a unit error (e.g. GiB instead of bytes).
+/// We warn but do not clamp, so intentional overrides still work.
+const VRAM_WARN_THRESHOLD_BYTES: usize = 128 * 1024 * 1024 * 1024;
+
 /// ONNX Runtime execution provider selection.
 ///
 /// Controlled by `BGE_M3_EP`. Defaults to [`EpSelection::Cpu`].
@@ -454,6 +461,16 @@ impl Config {
                     );
                 })
                 .ok()
+                .inspect(|&bytes| {
+                    if bytes > VRAM_WARN_THRESHOLD_BYTES {
+                        tracing::warn!(
+                            bytes,
+                            threshold = VRAM_WARN_THRESHOLD_BYTES,
+                            "BGE_M3_TRT_MAX_WORKSPACE_BYTES exceeds 128 GiB — \
+                             verify units are bytes, not GiB"
+                        );
+                    }
+                })
         });
 
         let gpu_mem_limit_bytes = lookup("BGE_M3_GPU_MEM_LIMIT_BYTES").and_then(|v| {
@@ -466,6 +483,16 @@ impl Config {
                     );
                 })
                 .ok()
+                .inspect(|&bytes| {
+                    if bytes > VRAM_WARN_THRESHOLD_BYTES {
+                        tracing::warn!(
+                            bytes,
+                            threshold = VRAM_WARN_THRESHOLD_BYTES,
+                            "BGE_M3_GPU_MEM_LIMIT_BYTES exceeds 128 GiB — \
+                             verify units are bytes, not GiB"
+                        );
+                    }
+                })
         });
 
         let adaptive_warmup_enabled = lookup("BGE_M3_ADAPTIVE_WARMUP_ENABLED")
@@ -475,7 +502,17 @@ impl Config {
             .and_then(|v| match v.as_str() {
                 "0" => Some(false),
                 "1" => Some(true),
-                _ => None,
+                other => {
+                    tracing::warn!(
+                        value = other,
+                        default = adaptive_warmup_enabled,
+                        "BGE_M3_ENGINE_PROPAGATION_ENABLED: unrecognized value \
+                         (expected \"0\" or \"1\"); defaulting to \
+                         BGE_M3_ADAPTIVE_WARMUP_ENABLED ({})",
+                        adaptive_warmup_enabled
+                    );
+                    None
+                }
             })
             .unwrap_or(adaptive_warmup_enabled);
 

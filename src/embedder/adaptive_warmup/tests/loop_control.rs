@@ -59,6 +59,28 @@ async fn wait_for_quiet_window_returns_true_when_idle_long_enough() {
     assert!(result, "should return true once idle window is satisfied");
 }
 
+/// When the queue is busy (`queue_depth` > 0) at the first sleep boundary,
+/// `wait_for_quiet_window` must return `false` immediately.
+#[tokio::test(start_paused = true)]
+async fn wait_for_quiet_window_returns_false_when_queue_busy() {
+    let pool = EmbedPool::busy_for_test();
+    assert_eq!(pool.queue_depth(), 1, "test setup: queue must start busy");
+
+    let (_, mut rx) = mpsc::channel::<(usize, usize)>(1);
+    let warmed: HashSet<(usize, usize)> = HashSet::new();
+    let mut pending: indexmap::IndexSet<(usize, usize)> = indexmap::IndexSet::new();
+
+    let task = tokio::spawn(async move {
+        wait_for_quiet_window(1, &pool, &mut rx, &mut pending, &warmed).await
+    });
+    tokio::time::advance(std::time::Duration::from_secs(2)).await;
+    let result = task.await.unwrap();
+    assert!(
+        !result,
+        "should return false when queue is busy after first sleep"
+    );
+}
+
 // ─── Hourly rate-limit reset ──────────────────────────────────────────────────
 
 /// Validates the hourly-reset arithmetic: after 3600 seconds the counter

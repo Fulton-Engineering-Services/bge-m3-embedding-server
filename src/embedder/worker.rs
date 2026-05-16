@@ -26,7 +26,6 @@ use tokio::runtime::Handle;
 use tokio::sync::{mpsc, Mutex};
 use tracing::{info, info_span};
 
-use super::adaptive_warmup::JitSuspectSender;
 use super::dense::embed_dense;
 use super::dual::embed_both;
 use super::error::ort_err;
@@ -38,7 +37,7 @@ use super::trt_warmup::{
     prewarm_persistence_postcondition_failed, prewarm_persistence_suspicious_undercount,
     trt_prewarm,
 };
-use super::types::{EmbedRequest, ProbeResult};
+use super::types::{EmbedRequest, JitSuspectSender, ProbeResult};
 use crate::binpack::CostModel;
 use crate::config::{EpSelection, ModelVariant};
 use crate::sysinfo;
@@ -85,7 +84,9 @@ where
         Ok(v) => Ok(v),
         Err(e) if is_trt_jit_oom(&e) => {
             let halved = CostModel {
-                max_workspace_bytes: base_cm.max_workspace_bytes / 2,
+                // Floor at 1 MiB to prevent integer-division from reaching 0
+                // when max_workspace_bytes is very small (e.g. in tests).
+                max_workspace_bytes: (base_cm.max_workspace_bytes / 2).max(1024 * 1024),
                 ..*base_cm
             };
             tracing::warn!(
@@ -113,6 +114,20 @@ where
 /// Emits the `chunk_run` INFO event and, on a cache miss, notifies both the
 /// JIT-suspect channel (adaptive warmup scheduling) and the engine propagation
 /// broadcast channel (peer worker fast disk-load).
+///
+/// Returns `Some((batch_len, max_chunk_seq))` when a shape was broadcast on
+/// the engine propagation channel.  The call site MUST insert this shape into
+/// `warmed_local` so the originating worker self-skips its own broadcast on
+/// the next `drain_engine_propagation` iteration (COR-1).
+///
+/// # 5000 ms threshold heuristic (COR-10)
+///
+/// `CHUNK_CACHE_HIT_THRESHOLD_MS` (5 s) is a **heuristic** proxy for "TRT
+/// engine JIT compile occurred", not a semantic guarantee.  False negatives
+/// are possible for fast-JIT small shapes; false positives are impossible
+/// because a cache-hit path never exceeds ~100 ms.  The trade-off is
+/// acceptable: the worst outcome of a false negative is that the adaptive
+/// warmup task eventually resubmits the shape on the next real cache miss.
 fn log_inference_complete(
     stats: &super::types::EmbedStats,
     worker_id: usize,
@@ -120,7 +135,7 @@ fn log_inference_complete(
     jit_suspect_tx: Option<&JitSuspectSender>,
     engine_propagation_tx: Option<&tokio::sync::broadcast::Sender<(usize, usize)>>,
     batch_len: usize,
-) {
+) -> Option<(usize, usize)> {
     let cache_hit = stats.inference_ms < CHUNK_CACHE_HIT_THRESHOLD_MS;
     tracing::info!(
         target: "bge_m3_embedding_server::trt_shape",
@@ -137,8 +152,10 @@ fn log_inference_complete(
         }
         if let Some(tx) = engine_propagation_tx {
             let _ = tx.send((batch_len, stats.max_chunk_seq));
+            return Some((batch_len, stats.max_chunk_seq));
         }
     }
+    None
 }
 
 /// Drains pending broadcast notifications and runs `trt_prewarm` for each
@@ -149,8 +166,9 @@ fn log_inference_complete(
 /// request for a new shape arrives.
 ///
 /// `warmed_local` tracks shapes already warmed by this worker in the current
-/// session; the originating worker self-skips because it inserted into
-/// `warmed_local` when it first broadcasted.
+/// session.  The originating worker self-skips on subsequent drains because
+/// `log_inference_complete` inserts the broadcast shape into `warmed_local`
+/// at the call site before returning control to the request loop.
 pub(super) fn drain_engine_propagation<F>(
     rx: &mut tokio::sync::broadcast::Receiver<(usize, usize)>,
     warmed_local: &mut std::collections::HashSet<(usize, usize)>,
@@ -254,7 +272,7 @@ pub struct WorkerConfig {
 
     /// Optional TRT workspace size cap (bytes) forwarded to ORT's TRT EP via
     /// `with_max_workspace_size`.  `None` uses ORT's built-in default.
-    /// Sourced from `BGE_M3_GPU_VRAM_BUDGET_BYTES`.
+    /// Sourced from `BGE_M3_TRT_MAX_WORKSPACE_BYTES`.
     pub trt_max_workspace_bytes: Option<usize>,
 
     /// Optional CUDA device memory limit (bytes) forwarded to the CUDA EP.
@@ -270,17 +288,15 @@ pub struct WorkerConfig {
     /// warmup is disabled.
     pub jit_suspect_tx: Option<JitSuspectSender>,
 
-    /// Controls cross-worker engine cache propagation.
+    /// Sender half of the engine propagation broadcast channel.
     ///
-    /// When `true`, `EmbedPool::spawn` creates a broadcast channel and
-    /// distributes per-worker tx/rx pairs so each worker fan-outs new
-    /// TRT engine plans to its peers.  Defaults to `adaptive_warmup_enabled`
-    /// via [`crate::config::Config::engine_propagation_enabled`].
-    ///
-    /// Setting `BGE_M3_ENGINE_PROPAGATION_ENABLED=0` in the environment
-    /// (which sets `Config::engine_propagation_enabled = false`) will disable
-    /// propagation while keeping adaptive warmup active.
-    pub engine_propagation_enabled: bool,
+    /// When `Some`, after any worker writes a new TRT engine plan to EFS, the
+    /// worker broadcasts the `(batch, seq)` shape to all subscribed peers so
+    /// they eagerly run `trt_prewarm` (~1-3s fast disk-load) instead of paying
+    /// full JIT cost on the next real request.  Each worker derives its own
+    /// `Receiver` via `tx.subscribe()` at startup.  `None` when
+    /// `BGE_M3_ENGINE_PROPAGATION_ENABLED=0` or when the EP is not TRT.
+    pub engine_propagation_tx: Option<tokio::sync::broadcast::Sender<(usize, usize)>>,
 }
 
 /// Runs a single `session.run()` for the probe, measuring RSS before and after.
@@ -373,11 +389,7 @@ fn run_probe_batch(
     probe_run_dense(session, &ids_array, &mask_array)
 }
 
-#[allow(
-    clippy::needless_pass_by_value,
-    clippy::too_many_lines,
-    clippy::too_many_arguments
-)]
+#[allow(clippy::needless_pass_by_value, clippy::too_many_lines)]
 pub(super) fn run_worker(
     id: usize,
     cache_dir: PathBuf,
@@ -386,13 +398,6 @@ pub(super) fn run_worker(
     live_workers: Arc<AtomicUsize>,
     loaded_workers: Arc<AtomicUsize>,
     config: WorkerConfig,
-    // Sender half of the engine propagation broadcast channel. Set by
-    // EmbedPool::spawn when propagation is enabled and EP is TRT. None
-    // disables inference-JIT broadcast for this worker.
-    engine_propagation_tx: Option<tokio::sync::broadcast::Sender<(usize, usize)>>,
-    // Receiver half of the engine propagation broadcast channel. Drained
-    // between requests to run trt_prewarm for peer-compiled shapes.
-    mut engine_propagation_rx: Option<tokio::sync::broadcast::Receiver<(usize, usize)>>,
 ) -> Result<()> {
     let _guard = WorkerGuard(Arc::clone(&live_workers));
     let span = info_span!("worker", id = id);
@@ -568,9 +573,19 @@ pub(super) fn run_worker(
     let mut models: Option<(ort::session::Session, tokenizers::Tokenizer)> = Some(initial_models);
 
     // Tracks shapes already prewarmed by this worker via engine propagation so
-    // we skip shapes we originated (which are already in our TRT profile).
+    // we skip shapes we originated (which are already in our TRT profile after
+    // the originating worker inserts into warmed_local before broadcasting).
     let mut warmed_local: std::collections::HashSet<(usize, usize)> =
         std::collections::HashSet::new();
+
+    // Derive per-worker broadcast receiver from the shared sender in config.
+    // Each call to tx.subscribe() creates an independent receiver starting from
+    // the current channel position, so workers only see shapes broadcast after
+    // their own subscribe point (i.e. after model load is complete).
+    let mut engine_propagation_rx = config
+        .engine_propagation_tx
+        .as_ref()
+        .map(tokio::sync::broadcast::Sender::subscribe);
 
     info!("Worker {id} entering request loop");
     loop {
@@ -717,14 +732,16 @@ pub(super) fn run_worker(
                         .map_err(|e| anyhow::anyhow!("Dense embed error: {e}"));
                         let inference_ms = t_inference.elapsed().as_millis();
                         if let Ok((_, ref stats)) = result {
-                            log_inference_complete(
+                            if let Some(shape) = log_inference_complete(
                                 stats,
                                 id,
                                 "dense",
                                 config.jit_suspect_tx.as_ref(),
-                                engine_propagation_tx.as_ref(),
+                                config.engine_propagation_tx.as_ref(),
                                 texts.len(),
-                            );
+                            ) {
+                                warmed_local.insert(shape);
+                            }
                             tracing::info!(
                                 worker_id = id,
                                 chunks = stats.chunks,
@@ -759,14 +776,16 @@ pub(super) fn run_worker(
                         .map_err(|e| anyhow::anyhow!("Sparse embed error: {e}"));
                         let inference_ms = t_inference.elapsed().as_millis();
                         if let Ok((_, ref stats)) = result {
-                            log_inference_complete(
+                            if let Some(shape) = log_inference_complete(
                                 stats,
                                 id,
                                 "sparse",
                                 config.jit_suspect_tx.as_ref(),
-                                engine_propagation_tx.as_ref(),
+                                config.engine_propagation_tx.as_ref(),
                                 texts.len(),
-                            );
+                            ) {
+                                warmed_local.insert(shape);
+                            }
                             tracing::info!(
                                 worker_id = id,
                                 chunks = stats.chunks,
@@ -801,14 +820,16 @@ pub(super) fn run_worker(
                         .map_err(|e| anyhow::anyhow!("Dual embed error: {e}"));
                         let inference_ms = t_inference.elapsed().as_millis();
                         if let Ok((_, ref stats)) = result {
-                            log_inference_complete(
+                            if let Some(shape) = log_inference_complete(
                                 stats,
                                 id,
                                 "both",
                                 config.jit_suspect_tx.as_ref(),
-                                engine_propagation_tx.as_ref(),
+                                config.engine_propagation_tx.as_ref(),
                                 texts.len(),
-                            );
+                            ) {
+                                warmed_local.insert(shape);
+                            }
                             tracing::info!(
                                 worker_id = id,
                                 chunks = stats.chunks,

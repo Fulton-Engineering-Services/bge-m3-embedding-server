@@ -48,7 +48,7 @@ mod types;
 mod worker;
 
 pub use pool::EmbedPool;
-pub(crate) use types::OS_HEADROOM_BYTES;
+pub(crate) use types::{JitSuspectSender, OS_HEADROOM_BYTES};
 pub(crate) use worker::WorkerConfig;
 
 // `SparseEmbedding` is referenced by tests via `crate::embedder::SparseEmbedding`,

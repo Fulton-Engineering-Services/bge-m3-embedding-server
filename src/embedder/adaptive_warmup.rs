@@ -56,13 +56,6 @@ use tokio::sync::mpsc;
 
 use super::pool::EmbedPool;
 
-/// Sender half of the JIT-suspect channel.
-///
-/// Workers hold an optional clone of this sender and call `try_send`
-/// (non-blocking, drops if full) after any inference whose `inference_ms`
-/// equals or exceeds the TRT cache-hit threshold.
-pub(crate) type JitSuspectSender = mpsc::Sender<(usize, usize)>;
-
 /// Configuration for the adaptive background warmup task.
 pub(crate) struct AdaptiveWarmupConfig {
     /// Whether adaptive warmup is enabled. When `false`, [`spawn_adaptive_warmup`]
@@ -115,6 +108,10 @@ async fn run_adaptive_warmup_loop(
     let mut pending: indexmap::IndexSet<(usize, usize)> = indexmap::IndexSet::new();
     let mut warmed: HashSet<(usize, usize)> = HashSet::new();
     let mut shapes_this_hour: u32 = 0;
+    // NOTE (COR-6): hour_start uses std::time::Instant, which is NOT controlled
+    // by tokio::time::pause() in tests. The hourly reset logic is therefore
+    // validated via direct arithmetic in unit tests rather than virtual-time
+    // advancement. See tests/loop_control.rs.
     let mut hour_start = Instant::now();
 
     loop {
@@ -154,13 +151,19 @@ async fn run_adaptive_warmup_loop(
         }
 
         // Confirm idle for `quiet_secs` consecutive seconds before firing.
+        // Accepted tradeoff (L-4): the queue_depth == 0 check here and the
+        // subsequent send_adaptive_warmup call are not atomic. A traffic burst
+        // arriving between these two operations queues behind the compile —
+        // the burst waits in the normal worker slot, same as any other request.
+        // See module-level doc comment for the full rationale.
         let confirmed_idle =
             wait_for_quiet_window(config.quiet_secs, &pool, &mut rx, &mut pending, &warmed).await;
         if !confirmed_idle {
             continue;
         }
 
-        // Pop and fire one shape.
+        // Pop and fire one shape. The pending.is_empty() guard above ensures
+        // pending is non-empty here, so first() always returns Some.
         if let Some(&shape) = pending.first() {
             let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
             if pool
@@ -176,10 +179,14 @@ async fn run_adaptive_warmup_loop(
                     pending.shift_remove(&shape);
                     warmed.insert(shape);
                     shapes_this_hour += 1;
-                    // Notify peer workers so they can eagerly run trt_prewarm
-                    // (~1-3s fast disk-load) rather than paying full JIT cost
-                    // on the next real request for this shape.
-                    pool.broadcast_engine_ready(shape);
+                    // Broadcast only when compile_ms > 0, which indicates a
+                    // TRT worker actually compiled or confirmed the engine from
+                    // disk. Non-TRT workers return Ok(0) immediately (no plan
+                    // written to EFS), so broadcasting for Ok(0) would send a
+                    // spurious engine-ready notification (COR-7).
+                    if compile_ms > 0 {
+                        pool.broadcast_engine_ready(shape);
+                    }
                     tracing::info!(
                         batch = shape.0,
                         seq = shape.1,

@@ -52,6 +52,30 @@ fn adaptive_warmup_enabled_set_to_yes_string() {
     assert!(cfg.adaptive_warmup_enabled);
 }
 
+/// `"false"` is not in the recognized set for `BGE_M3_ADAPTIVE_WARMUP_ENABLED`;
+/// it should be treated as disabled (falls through to the default `false`).
+#[test]
+fn adaptive_warmup_enabled_false_string_is_not_recognized_as_enabled() {
+    let map = HashMap::from([("BGE_M3_ADAPTIVE_WARMUP_ENABLED", "false")]);
+    let cfg = Config::from_lookup(lookup_from(&map));
+    assert!(
+        !cfg.adaptive_warmup_enabled,
+        "\"false\" is not in the recognized set (1|true|yes) and must not enable warmup"
+    );
+}
+
+/// `"0"` is not in the recognized set for `BGE_M3_ADAPTIVE_WARMUP_ENABLED`;
+/// it should be treated as disabled (TST-6).
+#[test]
+fn adaptive_warmup_enabled_zero_string_is_not_recognized_as_enabled() {
+    let map = HashMap::from([("BGE_M3_ADAPTIVE_WARMUP_ENABLED", "0")]);
+    let cfg = Config::from_lookup(lookup_from(&map));
+    assert!(
+        !cfg.adaptive_warmup_enabled,
+        "\"0\" is not in the recognized set (1|true|yes) and must not enable warmup"
+    );
+}
+
 // --- BGE_M3_ADAPTIVE_WARMUP_QUIET_SECS ---
 
 #[test]
@@ -125,6 +149,22 @@ fn engine_propagation_enabled_defaults_to_false_when_adaptive_disabled() {
     assert!(
         !cfg.engine_propagation_enabled,
         "engine_propagation_enabled must default to false when adaptive_warmup_enabled is false"
+    );
+}
+
+/// Unrecognized values for `BGE_M3_ENGINE_PROPAGATION_ENABLED` fall back to the
+/// `adaptive_warmup_enabled` default (SEC-3). A `warn!` is emitted but not tested
+/// here (would require tracing subscriber capture).
+#[test]
+fn engine_propagation_enabled_unrecognized_value_falls_back_to_adaptive_warmup() {
+    let map = HashMap::from([
+        ("BGE_M3_ADAPTIVE_WARMUP_ENABLED", "1"),
+        ("BGE_M3_ENGINE_PROPAGATION_ENABLED", "true"),
+    ]);
+    let cfg = Config::from_lookup(lookup_from(&map));
+    assert!(
+        cfg.engine_propagation_enabled,
+        "unrecognized value must fall back to adaptive_warmup_enabled (true here)"
     );
 }
 

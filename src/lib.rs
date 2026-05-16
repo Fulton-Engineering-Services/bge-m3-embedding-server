@@ -54,8 +54,8 @@ use tracing::info;
 use crate::binpack::CostModel;
 use crate::bootstrap::{build_router, run_readiness_probe};
 use crate::config::{Config, EpSelection};
-use crate::embedder::adaptive_warmup::{AdaptiveWarmupConfig, JitSuspectSender};
-use crate::embedder::{EmbedPool, WorkerConfig};
+use crate::embedder::adaptive_warmup::AdaptiveWarmupConfig;
+use crate::embedder::{EmbedPool, JitSuspectSender, WorkerConfig};
 use crate::gpu_stats::GpuStatsCollector;
 use crate::state::{AppState, ProbeStatus};
 
@@ -195,6 +195,18 @@ pub async fn run() -> anyhow::Result<()> {
         (None, None)
     };
 
+    // Create the engine propagation broadcast channel when enabled.
+    // Using Some(tx) vs None lets EmbedPool::spawn determine enabled status
+    // from the WorkerConfig without an additional bool field (ARC-5).
+    // The initial receiver from channel() is dropped immediately; each worker
+    // subscribes its own via tx.subscribe() inside run_worker.
+    let engine_propagation_tx = if cfg.engine_propagation_enabled {
+        let (tx, _initial_rx) = tokio::sync::broadcast::channel::<(usize, usize)>(32);
+        Some(tx)
+    } else {
+        None
+    };
+
     let (pool, init_handle) = EmbedPool::spawn(
         cfg.workers,
         PathBuf::from(&cfg.cache_dir),
@@ -213,7 +225,7 @@ pub async fn run() -> anyhow::Result<()> {
             trt_max_workspace_bytes: cfg.trt_max_workspace_bytes,
             gpu_mem_limit_bytes: cfg.gpu_mem_limit_bytes,
             jit_suspect_tx,
-            engine_propagation_enabled: cfg.engine_propagation_enabled,
+            engine_propagation_tx,
         },
     );
 

@@ -92,6 +92,13 @@ pub(crate) enum EmbedRequest {
     },
 }
 
+/// Sender half of the JIT-suspect channel.
+///
+/// Workers hold an optional clone of this sender and call `try_send`
+/// (non-blocking, drops if full) after any inference whose `inference_ms`
+/// equals or exceeds the TRT cache-hit threshold.
+pub(crate) type JitSuspectSender = tokio::sync::mpsc::Sender<(usize, usize)>;
+
 /// Result of a single probe `session.run()` call.
 pub(crate) struct ProbeResult {
     /// Process RSS (bytes) measured immediately before `session.run()`.
