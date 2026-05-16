@@ -89,8 +89,6 @@ fn check_ready_returns_err_when_pool_dead() {
 
 // ── collect_x_headers ─────────────────────────────────────────────────────
 
-// ── collect_x_headers ─────────────────────────────────────────────────────
-
 #[test]
 fn collect_x_headers_collects_x_prefix_and_skips_standard() {
     let mut headers = axum::http::HeaderMap::new();

@@ -90,11 +90,13 @@ fn deletes_aligned_sidecars_for_stale_engines() {
 
     // SM89 engine plus all known sidecar artifacts the TRT EP writes
     // alongside it.
-    let _ = write_file(dir, "eng_sm89.engine", b"sm89-plan");
+    let plan_bytes = write_file(dir, "eng_sm89.engine", b"sm89-plan");
+    let mut sidecar_bytes_total: u64 = 0;
     for suffix in ENGINE_SIDE_SUFFIXES {
         let name = format!("eng_sm89.engine{suffix}");
-        let _ = write_file(dir, &name, b"sidecar");
+        sidecar_bytes_total += write_file(dir, &name, b"sidecar");
     }
+    let expected_bytes = plan_bytes + sidecar_bytes_total;
 
     // A current-SM engine that must not be touched.
     let _ = write_file(dir, "eng_sm120.engine", b"sm120-plan");
@@ -104,6 +106,13 @@ fn deletes_aligned_sidecars_for_stale_engines() {
 
     assert_eq!(stats.plans_deleted, 1, "exactly one stale plan deleted");
     assert_eq!(stats.other_sms_observed, vec!["sm89".to_string()]);
+    assert!(
+        stats.bytes_freed >= expected_bytes,
+        "bytes_freed ({}) must include plan ({}) + sidecar ({}) sizes; got {stats:?}",
+        stats.bytes_freed,
+        plan_bytes,
+        sidecar_bytes_total,
+    );
 
     let remaining = list_basenames_sorted(dir);
     // All sm89-tagged artifacts (plan + every aligned sidecar) must be gone.
@@ -249,6 +258,36 @@ fn gcstats_default_is_zeroed() {
     assert_eq!(s.plans_deleted, 0);
     assert_eq!(s.bytes_freed, 0);
     assert!(s.other_sms_observed.is_empty());
+}
+
+/// Non-readable directory: `gc_stale_sm_plans` must not panic and must
+/// return zero-stats (the `read_dir` call silently returns an empty
+/// iterator when it cannot enumerate, so no plan is deleted).
+#[cfg(unix)]
+#[test]
+fn gc_stale_sm_plans_on_unreadable_dir_does_not_panic() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = TempDir::new().expect("tempdir");
+    let cache_dir = tmp.path().to_path_buf();
+
+    std::fs::set_permissions(&cache_dir, std::fs::Permissions::from_mode(0o000))
+        .expect("chmod 000");
+
+    let stats = gc_stale_sm_plans(&cache_dir, "sm89");
+
+    // Restore permissions so TempDir cleanup does not fail.
+    std::fs::set_permissions(&cache_dir, std::fs::Permissions::from_mode(0o755))
+        .expect("chmod 755");
+
+    assert_eq!(
+        stats.plans_deleted, 0,
+        "unreadable dir must yield zero deletions"
+    );
+    assert_eq!(
+        stats.bytes_freed, 0,
+        "unreadable dir must yield zero bytes freed"
+    );
 }
 
 /// Symlink directory: GC must treat a symlink masquerading as the cache

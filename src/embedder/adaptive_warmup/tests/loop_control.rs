@@ -91,7 +91,7 @@ async fn wait_for_quiet_window_returns_false_when_queue_busy() {
 /// therefore validates the reset *logic* via a thin wrapper around the
 /// exact condition used in `run_adaptive_warmup_loop`.
 #[test]
-fn hourly_reset_condition_fires_after_3600_seconds() {
+fn hourly_reset_condition_does_not_fire_before_one_hour() {
     let hour_start = std::time::Instant::now();
     let one_hour = std::time::Duration::from_secs(3600);
     let mut shapes_this_hour: u32 = 5;

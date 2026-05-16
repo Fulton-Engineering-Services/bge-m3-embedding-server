@@ -137,6 +137,17 @@ fn is_trt_jit_oom_does_not_match_failed_to_create_engine_with_unsupported() {
     );
 }
 
+/// `oom` alone (without `out of memory`) is a recognised qualifier.
+/// MUST classify as retryable since `oom` is in the qualifier set.
+#[test]
+fn is_trt_jit_oom_matches_failed_to_create_engine_with_oom_keyword() {
+    let e = anyhow::anyhow!(
+        "TensorRT EP failed to create engine from network. \
+         CUDA error: oom (device 0)."
+    );
+    assert!(is_trt_jit_oom(&e));
+}
+
 /// `out of memory` is the canonical CUDA OOM string. MUST classify as
 /// retryable since `memory` is in the qualifier set.
 #[test]
