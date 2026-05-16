@@ -203,6 +203,7 @@ pub(super) fn load_session(
 /// `device_id` selects the CUDA/TRT GPU device for this session. Computed by
 /// `EmbedPool::spawn` as `worker_index % gpu_count`. Ignored on CPU EP and
 /// macOS.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn load_models(
     cache_dir: &Path,
     show_download_progress: bool,

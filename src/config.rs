@@ -278,7 +278,7 @@ pub struct Config {
     /// TRT engines for them during idle windows.
     pub adaptive_warmup_enabled: bool,
 
-    /// Seconds the server must be idle (queue_depth == 0, all workers free)
+    /// Seconds the server must be idle (`queue_depth == 0`, all workers free)
     /// before the adaptive warmup loop fires a shape.
     ///
     /// Set with `BGE_M3_ADAPTIVE_WARMUP_QUIET_SECS`. Default: 3.

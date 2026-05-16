@@ -80,6 +80,16 @@ pub(crate) enum EmbedRequest {
         texts: Vec<String>,
         reply: oneshot::Sender<Result<ProbeResult>>,
     },
+    /// Adaptive background warmup: asks a worker to compile (or confirm as
+    /// cached) the TRT engine for `(batch, seq)`.  The worker replies on
+    /// `ack` with the compile duration in milliseconds, or an error if the
+    /// shape failed.  Only meaningful on TRT EP; on CPU/CUDA workers the
+    /// worker returns `Ok(0)` immediately.
+    AdaptiveWarmup {
+        batch: usize,
+        seq: usize,
+        ack: oneshot::Sender<anyhow::Result<u64>>,
+    },
 }
 
 /// Result of a single probe `session.run()` call.

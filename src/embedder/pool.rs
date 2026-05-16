@@ -389,6 +389,27 @@ impl EmbedPool {
         self.model_rss_per_worker_bytes.load(Ordering::Acquire)
     }
 
+    /// Sends an adaptive warmup request to an available worker.
+    ///
+    /// The worker calls `trt_prewarm` for `(batch, seq)` and replies on `ack`
+    /// with the compile duration in milliseconds, or an error on failure.
+    /// On non-TRT workers the reply is `Ok(0)` immediately.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err(())` if the worker channel has closed (pool shut down).
+    pub async fn send_adaptive_warmup(
+        &self,
+        batch: usize,
+        seq: usize,
+        ack: tokio::sync::oneshot::Sender<anyhow::Result<u64>>,
+    ) -> Result<(), ()> {
+        self.tx
+            .send(EmbedRequest::AdaptiveWarmup { batch, seq, ack })
+            .await
+            .map_err(|_| ())
+    }
+
     /// Returns a clone of the `Arc<AtomicUsize>` backing `live_worker_count`.
     ///
     /// Used by the warmup-only path in `lib.rs` to poll worker exit progress
@@ -460,6 +481,9 @@ impl EmbedPool {
                             rss_before: 0,
                             rss_after: 0,
                         }));
+                    }
+                    EmbedRequest::AdaptiveWarmup { ack, .. } => {
+                        let _ = ack.send(Ok(0));
                     }
                 }
             }

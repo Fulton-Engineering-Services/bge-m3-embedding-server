@@ -29,7 +29,10 @@
 //! - `trt_warmup`: `TensorRT` engine pre-warming during worker startup.
 //! - `worker`: blocking worker thread, request dispatch, probe wiring.
 //! - `pool`: `EmbedPool` async wrapper and test helpers.
+//! - `adaptive_warmup`: adaptive in-process background warmup loop for TRT
+//!   engine cache miss recovery.
 
+pub(crate) mod adaptive_warmup;
 mod dense;
 mod dual;
 mod error;

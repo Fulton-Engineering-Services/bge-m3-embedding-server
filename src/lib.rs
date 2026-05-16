@@ -54,6 +54,7 @@ use tracing::info;
 use crate::binpack::CostModel;
 use crate::bootstrap::{build_router, run_readiness_probe};
 use crate::config::{Config, EpSelection};
+use crate::embedder::adaptive_warmup::{AdaptiveWarmupConfig, JitSuspectSender};
 use crate::embedder::{EmbedPool, WorkerConfig};
 use crate::gpu_stats::GpuStatsCollector;
 use crate::state::{AppState, ProbeStatus};
@@ -172,6 +173,20 @@ pub async fn run() -> anyhow::Result<()> {
     let initial_permits = cfg.workers.saturating_sub(1).max(1);
     let request_permits = Arc::new(Semaphore::new(initial_permits));
 
+    // Pre-create the JIT-suspect channel so the sender half can be placed in
+    // WorkerConfig before the pool is spawned.  The receiver half is passed to
+    // `spawn_adaptive_warmup` after the pool is created.  When adaptive warmup
+    // is disabled the sender is dropped immediately (workers hold `None`).
+    let (jit_suspect_tx, jit_suspect_rx): (
+        Option<JitSuspectSender>,
+        Option<tokio::sync::mpsc::Receiver<(usize, usize)>>,
+    ) = if cfg.adaptive_warmup_enabled && cfg.ep == EpSelection::TensorRt {
+        let (tx, rx) = tokio::sync::mpsc::channel::<(usize, usize)>(64);
+        (Some(tx), Some(rx))
+    } else {
+        (None, None)
+    };
+
     let (pool, init_handle) = EmbedPool::spawn(
         cfg.workers,
         PathBuf::from(&cfg.cache_dir),
@@ -187,6 +202,9 @@ pub async fn run() -> anyhow::Result<()> {
             // the initial value here is a harmless placeholder.
             device_id: 0,
             gpu_count: cfg.gpu_count,
+            trt_max_workspace_bytes: cfg.trt_max_workspace_bytes,
+            gpu_mem_limit_bytes: cfg.gpu_mem_limit_bytes,
+            jit_suspect_tx,
         },
     );
 
@@ -279,6 +297,25 @@ pub async fn run() -> anyhow::Result<()> {
             "warmup-only mode: all TRT engines compiled and cached, exiting"
         );
         return Ok(());
+    }
+
+    // Spawn the adaptive warmup background task if enabled.  A clone of the
+    // pool is sufficient — `EmbedPool` is `Clone` (all fields are
+    // reference-counted).  The warmup-only mode does not use adaptive warmup
+    // (TRT engines are compiled synchronously during startup).
+    if let Some(rx) = jit_suspect_rx {
+        let adaptive_cfg = AdaptiveWarmupConfig {
+            enabled: cfg.adaptive_warmup_enabled,
+            quiet_secs: cfg.adaptive_warmup_quiet_secs,
+            max_shapes_per_hour: cfg.adaptive_warmup_max_shapes_per_hour,
+            cache_dir: PathBuf::from(&cfg.cache_dir),
+        };
+        crate::embedder::adaptive_warmup::spawn_adaptive_warmup(adaptive_cfg, pool.clone(), rx);
+        info!(
+            quiet_secs = cfg.adaptive_warmup_quiet_secs,
+            max_shapes_per_hour = cfg.adaptive_warmup_max_shapes_per_hour,
+            "adaptive warmup task spawned"
+        );
     }
 
     let state = Arc::new(AppState {

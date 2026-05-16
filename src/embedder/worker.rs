@@ -26,6 +26,7 @@ use tokio::runtime::Handle;
 use tokio::sync::{mpsc, Mutex};
 use tracing::{info, info_span};
 
+use super::adaptive_warmup::JitSuspectSender;
 use super::dense::embed_dense;
 use super::dual::embed_both;
 use super::error::ort_err;
@@ -41,6 +42,18 @@ use super::types::{EmbedRequest, ProbeResult};
 use crate::binpack::CostModel;
 use crate::config::{EpSelection, ModelVariant};
 use crate::sysinfo;
+
+/// Mirrors `trt_warmup::CACHE_HIT_THRESHOLD_MS`.  Used to classify a
+/// per-request inference as a probable TRT engine cache miss so the
+/// adaptive warmup task can proactively compile the engine.
+const CHUNK_CACHE_HIT_THRESHOLD_MS: u64 = 5_000;
+
+/// Returns `true` when an ORT error string indicates a TRT JIT workspace
+/// overflow that may resolve with a smaller batch or halved workspace budget.
+fn is_trt_jit_oom(e: &anyhow::Error) -> bool {
+    let s = format!("{e}");
+    s.contains("User allocator error") || s.contains("Could not find any implementation")
+}
 
 pub(super) struct WorkerGuard(pub Arc<AtomicUsize>);
 
@@ -110,6 +123,24 @@ pub struct WorkerConfig {
     /// `EmbedPool::spawn` to compute per-worker `device_id` values and to
     /// clamp `BGE_M3_WORKERS` for GPU execution providers.
     pub gpu_count: usize,
+
+    /// Optional TRT workspace size cap (bytes) forwarded to ORT's TRT EP via
+    /// `with_max_workspace_size`.  `None` uses ORT's built-in default.
+    /// Sourced from `BGE_M3_GPU_VRAM_BUDGET_BYTES`.
+    pub trt_max_workspace_bytes: Option<usize>,
+
+    /// Optional CUDA device memory limit (bytes) forwarded to the CUDA EP.
+    /// `None` uses ORT's built-in default.
+    pub gpu_mem_limit_bytes: Option<usize>,
+
+    /// Sender half of the JIT-suspect channel created before pool spawn.
+    ///
+    /// After each successful inference, if `inference_ms >= CHUNK_CACHE_HIT_THRESHOLD_MS`
+    /// the worker calls `try_send((batch, seq))` so the adaptive warmup task
+    /// can schedule background engine compilation.  Non-blocking: if the
+    /// channel is full the message is silently dropped.  `None` when adaptive
+    /// warmup is disabled.
+    pub jit_suspect_tx: Option<JitSuspectSender>,
 }
 
 /// Runs a single `session.run()` for the probe, measuring RSS before and after.
@@ -238,6 +269,8 @@ pub(super) fn run_worker(
         config.intra_threads,
         config.ep,
         config.device_id,
+        config.trt_max_workspace_bytes,
+        config.gpu_mem_limit_bytes,
     ) {
         Ok(mut models) => {
             // Prime the ORT session arena with a tiny session.run() BEFORE
@@ -416,6 +449,8 @@ pub(super) fn run_worker(
                         config.intra_threads,
                         config.ep,
                         config.device_id,
+                        config.trt_max_workspace_bytes,
+                        config.gpu_mem_limit_bytes,
                     ) {
                         Ok(mut m) => {
                             // Prime the freshly-loaded session arena so the
@@ -454,6 +489,9 @@ pub(super) fn run_worker(
                                 EmbedRequest::Probe { reply, .. } => {
                                     let _ = reply.send(Err(err));
                                 }
+                                EmbedRequest::AdaptiveWarmup { ack, .. } => {
+                                    let _ = ack.send(Err(err));
+                                }
                             }
                             continue;
                         }
@@ -484,16 +522,56 @@ pub(super) fn run_worker(
                         }
                         let t_inference = std::time::Instant::now();
                         let cm_guard = config.cost_model.load();
-                        let result = embed_dense(
+                        let first = embed_dense(
                             session,
                             tokenizer,
                             &texts,
                             &cm_guard,
                             config.model_variant,
-                        )
-                        .map_err(|e| anyhow::anyhow!("Dense embed error: {e}"));
+                        );
+                        let trt_oom = first.as_ref().err().is_some_and(is_trt_jit_oom);
+                        let result = if trt_oom {
+                            if let Err(ref e) = first {
+                                tracing::warn!(
+                                    target: "bge_m3_embedding_server::trt_shape",
+                                    worker_id = id,
+                                    batch_size = texts.len(),
+                                    error = %e,
+                                    "trt_jit_retry"
+                                );
+                            }
+                            let halved = CostModel {
+                                max_workspace_bytes: cm_guard.max_workspace_bytes / 2,
+                                ..**cm_guard
+                            };
+                            embed_dense(session, tokenizer, &texts, &halved, config.model_variant)
+                                .map_err(|e| {
+                                    tracing::error!(
+                                        target: "bge_m3_embedding_server::trt_shape",
+                                        worker_id = id,
+                                        batch_size = texts.len(),
+                                        error = %e,
+                                        "trt_jit_retry_exhausted"
+                                    );
+                                    anyhow::anyhow!(
+                                        "Dense embed error (trt_jit_retry_exhausted): {e}"
+                                    )
+                                })
+                        } else {
+                            first.map_err(|e| anyhow::anyhow!("Dense embed error: {e}"))
+                        };
                         let inference_ms = t_inference.elapsed().as_millis();
                         if let Ok((_, ref stats)) = result {
+                            let cache_hit = stats.inference_ms < CHUNK_CACHE_HIT_THRESHOLD_MS;
+                            tracing::info!(
+                                target: "bge_m3_embedding_server::trt_shape",
+                                worker_id = id,
+                                chunk_batch = texts.len(),
+                                chunk_max_seq = stats.max_chunk_seq,
+                                inference_ms = stats.inference_ms,
+                                cache_hit,
+                                "chunk_run"
+                            );
                             tracing::info!(
                                 worker_id = id,
                                 chunks = stats.chunks,
@@ -503,6 +581,11 @@ pub(super) fn run_worker(
                                 inference_ms = stats.inference_ms,
                                 "worker: dense embed complete"
                             );
+                            if !cache_hit {
+                                if let Some(ref tx) = config.jit_suspect_tx {
+                                    let _ = tx.try_send((texts.len(), stats.max_chunk_seq));
+                                }
+                            }
                         }
                         log_if_abandoned_mid_flight(&reply, "dense", id, &result, inference_ms);
                         let _ = reply.send(result);
@@ -519,16 +602,56 @@ pub(super) fn run_worker(
                         }
                         let t_inference = std::time::Instant::now();
                         let cm_guard = config.cost_model.load();
-                        let result = embed_sparse(
+                        let first = embed_sparse(
                             session,
                             tokenizer,
                             &texts,
                             &cm_guard,
                             config.model_variant,
-                        )
-                        .map_err(|e| anyhow::anyhow!("Sparse embed error: {e}"));
+                        );
+                        let trt_oom = first.as_ref().err().is_some_and(is_trt_jit_oom);
+                        let result = if trt_oom {
+                            if let Err(ref e) = first {
+                                tracing::warn!(
+                                    target: "bge_m3_embedding_server::trt_shape",
+                                    worker_id = id,
+                                    batch_size = texts.len(),
+                                    error = %e,
+                                    "trt_jit_retry"
+                                );
+                            }
+                            let halved = CostModel {
+                                max_workspace_bytes: cm_guard.max_workspace_bytes / 2,
+                                ..**cm_guard
+                            };
+                            embed_sparse(session, tokenizer, &texts, &halved, config.model_variant)
+                                .map_err(|e| {
+                                    tracing::error!(
+                                        target: "bge_m3_embedding_server::trt_shape",
+                                        worker_id = id,
+                                        batch_size = texts.len(),
+                                        error = %e,
+                                        "trt_jit_retry_exhausted"
+                                    );
+                                    anyhow::anyhow!(
+                                        "Sparse embed error (trt_jit_retry_exhausted): {e}"
+                                    )
+                                })
+                        } else {
+                            first.map_err(|e| anyhow::anyhow!("Sparse embed error: {e}"))
+                        };
                         let inference_ms = t_inference.elapsed().as_millis();
                         if let Ok((_, ref stats)) = result {
+                            let cache_hit = stats.inference_ms < CHUNK_CACHE_HIT_THRESHOLD_MS;
+                            tracing::info!(
+                                target: "bge_m3_embedding_server::trt_shape",
+                                worker_id = id,
+                                chunk_batch = texts.len(),
+                                chunk_max_seq = stats.max_chunk_seq,
+                                inference_ms = stats.inference_ms,
+                                cache_hit,
+                                "chunk_run"
+                            );
                             tracing::info!(
                                 worker_id = id,
                                 chunks = stats.chunks,
@@ -538,6 +661,11 @@ pub(super) fn run_worker(
                                 inference_ms = stats.inference_ms,
                                 "worker: sparse embed complete"
                             );
+                            if !cache_hit {
+                                if let Some(ref tx) = config.jit_suspect_tx {
+                                    let _ = tx.try_send((texts.len(), stats.max_chunk_seq));
+                                }
+                            }
                         }
                         log_if_abandoned_mid_flight(&reply, "sparse", id, &result, inference_ms);
                         let _ = reply.send(result);
@@ -554,11 +682,51 @@ pub(super) fn run_worker(
                         }
                         let t_inference = std::time::Instant::now();
                         let cm_guard = config.cost_model.load();
-                        let result =
-                            embed_both(session, tokenizer, &texts, &cm_guard, config.model_variant)
-                                .map_err(|e| anyhow::anyhow!("Dual embed error: {e}"));
+                        let first =
+                            embed_both(session, tokenizer, &texts, &cm_guard, config.model_variant);
+                        let trt_oom = first.as_ref().err().is_some_and(is_trt_jit_oom);
+                        let result = if trt_oom {
+                            if let Err(ref e) = first {
+                                tracing::warn!(
+                                    target: "bge_m3_embedding_server::trt_shape",
+                                    worker_id = id,
+                                    batch_size = texts.len(),
+                                    error = %e,
+                                    "trt_jit_retry"
+                                );
+                            }
+                            let halved = CostModel {
+                                max_workspace_bytes: cm_guard.max_workspace_bytes / 2,
+                                ..**cm_guard
+                            };
+                            embed_both(session, tokenizer, &texts, &halved, config.model_variant)
+                                .map_err(|e| {
+                                    tracing::error!(
+                                        target: "bge_m3_embedding_server::trt_shape",
+                                        worker_id = id,
+                                        batch_size = texts.len(),
+                                        error = %e,
+                                        "trt_jit_retry_exhausted"
+                                    );
+                                    anyhow::anyhow!(
+                                        "Dual embed error (trt_jit_retry_exhausted): {e}"
+                                    )
+                                })
+                        } else {
+                            first.map_err(|e| anyhow::anyhow!("Dual embed error: {e}"))
+                        };
                         let inference_ms = t_inference.elapsed().as_millis();
                         if let Ok((_, ref stats)) = result {
+                            let cache_hit = stats.inference_ms < CHUNK_CACHE_HIT_THRESHOLD_MS;
+                            tracing::info!(
+                                target: "bge_m3_embedding_server::trt_shape",
+                                worker_id = id,
+                                chunk_batch = texts.len(),
+                                chunk_max_seq = stats.max_chunk_seq,
+                                inference_ms = stats.inference_ms,
+                                cache_hit,
+                                "chunk_run"
+                            );
                             tracing::info!(
                                 worker_id = id,
                                 chunks = stats.chunks,
@@ -568,6 +736,11 @@ pub(super) fn run_worker(
                                 inference_ms = stats.inference_ms,
                                 "worker: both embed complete"
                             );
+                            if !cache_hit {
+                                if let Some(ref tx) = config.jit_suspect_tx {
+                                    let _ = tx.try_send((texts.len(), stats.max_chunk_seq));
+                                }
+                            }
                         }
                         log_if_abandoned_mid_flight(&reply, "both", id, &result, inference_ms);
                         let _ = reply.send(result);
@@ -578,6 +751,26 @@ pub(super) fn run_worker(
                         // Probes are internal — no client-disconnect path applies.
                         let result = run_probe_batch(session, tokenizer, &texts);
                         let _ = reply.send(result);
+                    }
+                    EmbedRequest::AdaptiveWarmup { batch, seq, ack } => {
+                        // Run trt_prewarm for a single shape so the TRT EP
+                        // compiles and caches the engine during an idle window.
+                        // On CPU/CUDA EP this is a cheap no-op (returns Ok(0)).
+                        let result: anyhow::Result<u64> = if config.ep == EpSelection::TensorRt {
+                            let shape = vec![(batch, seq)];
+                            let stats = trt_prewarm(session, &shape, id, &cache_dir);
+                            if stats.warmed > 0 || stats.fully_cached {
+                                Ok(stats.total_compile_ms)
+                            } else {
+                                Err(anyhow::anyhow!(
+                                    "adaptive warmup: no shapes warmed for \
+                                     ({batch}, {seq}) on worker {id}"
+                                ))
+                            }
+                        } else {
+                            Ok(0)
+                        };
+                        let _ = ack.send(result);
                     }
                 }
             }
