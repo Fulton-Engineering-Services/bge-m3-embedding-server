@@ -86,7 +86,7 @@ pub(crate) fn detect_sm_for_device(device_id: u32) -> Option<String> {
 /// Pure: no I/O, no globals. The exhaustive correctness tests in the
 /// sibling test module exercise every failure shape so the production
 /// invariant ("strict `X.Y` only") cannot drift.
-fn parse_compute_capability(stdout: &str) -> Option<String> {
+pub(crate) fn parse_compute_capability(stdout: &str) -> Option<String> {
     let first_line = stdout.lines().find(|l| !l.trim().is_empty())?.trim();
     let (major, minor) = first_line.split_once('.')?;
     if major.is_empty() || minor.is_empty() {

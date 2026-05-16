@@ -76,7 +76,7 @@ const CHUNK_CACHE_HIT_THRESHOLD_MS: u64 = 5_000;
 ///    latency. `alloc` subsumes `cuMemAlloc`; `memory` subsumes
 ///    `out of memory`.
 ///
-/// # Known gap (`TODO(jpf)`)
+/// # Known gap
 ///
 /// The verbatim 2026-05-16 production error string did NOT include any
 /// qualifier — the TRT logger appears to emit workspace/alloc detail to a
@@ -90,6 +90,8 @@ const CHUNK_CACHE_HIT_THRESHOLD_MS: u64 = 5_000;
 /// logger output into the embed error chain). Until then, this function
 /// will continue to return `false` for the verbatim production message and
 /// callers will see HTTP 500 on first build failure.
+///
+/// Tracking: <https://github.com/Fulton-Engineering-Services/bge-m3-embedding-server/issues/78>
 fn is_trt_jit_oom(e: &anyhow::Error) -> bool {
     let s = format!("{e}");
     let lowercase = s.to_lowercase();
@@ -548,10 +550,14 @@ pub(super) fn run_worker(
     // deletion to occur. When the feature is OFF this entire block is
     // physically absent from the binary. See `trt_cache_gc.rs` for the
     // multi-SM ASG hazard model.
+    // Only the leader worker (id == 0) runs GC. Workers load sequentially
+    // (CLAUDE.md invariant), so worker 0 always finishes GC before worker 1
+    // starts — this guard is race-free and prevents spurious WARN cascades on
+    // workers 1..N that would otherwise each attempt (and log) the same sweep.
     #[cfg(feature = "cache-gc")]
-    if config.trt_cache_gc_enabled && config.ep != EpSelection::Cpu {
+    if id == 0 && config.trt_cache_gc_enabled && config.ep != EpSelection::Cpu {
         let engine_cache_dir = trt_cache::engine_cache_path(&cache_dir);
-        match detect_current_sm(config.device_id) {
+        match detect_sm_for_device(config.device_id) {
             Some(current_sm) => {
                 tracing::warn!(
                     target: "bge_m3_embedding_server::trt_cache_gc",
@@ -1107,86 +1113,32 @@ pub(super) fn run_worker(
 /// also lets the predicate be reused at future call sites (e.g. an admin
 /// endpoint that wants to surface the same decision) without dragging in
 /// the rest of the prewarm statistics.
+///
+/// # Strict-mode semantics
+///
+/// Strict mode (`prewarm_strict=true`) only blocks readiness when
+/// `engine_count_after == 0` — i.e. **complete zero-plan failure** where
+/// fresh compiles occurred but not a single `.engine` file landed on disk.
+/// This is the 2026-05 failure mode where every worker hit TRT autotuner OOM
+/// mid-build, leaving the cache empty and every subsequent real request
+/// returning HTTP 500.
+///
+/// **Partial undercounts** (e.g. 1 engine persisted out of 16 compiled) do
+/// NOT block readiness — workers will serve traffic using the one cached shape
+/// and JIT-compile any missing shapes on first request. This is acceptable:
+/// partial persistence is most commonly caused by TRT's subgraph fusing
+/// (multiple `(batch, seq)` shapes sharing one engine file), not by a hard
+/// persistence failure.
+///
+/// If threshold-based undercount blocking becomes necessary in the future,
+/// the [`prewarm_persistence_suspicious_undercount`] branch already has the
+/// scaffolding — promote it from WARN to a readiness gate here.
 fn should_fail_readiness(fresh_compiles: usize, engine_count_after: usize, strict: bool) -> bool {
     if !strict {
         return false;
     }
     prewarm_persistence_postcondition_failed(fresh_compiles, engine_count_after)
         || prewarm_persistence_suspicious_undercount(fresh_compiles, engine_count_after)
-}
-
-/// Detects the compute capability of CUDA device `device_id` by shelling
-/// out to `nvidia-smi --query-gpu=compute_cap --format=csv,noheader -i
-/// <device_id>` and parsing the returned `X.Y` string into `sm{X}{Y}`.
-///
-/// Returns `None` when the binary is missing, the device cannot be
-/// queried, or the output cannot be parsed. The destructive cache GC
-/// treats `None` as a soft skip (logs a WARN and does not delete).
-///
-/// **Only compiled when the `cache-gc` feature is enabled** — the
-/// production build is not allowed to invoke the GC, so there is no
-/// reason to carry this helper in the default binary.
-#[cfg(feature = "cache-gc")]
-fn detect_current_sm(device_id: u32) -> Option<String> {
-    let output = std::process::Command::new("nvidia-smi")
-        .arg("--query-gpu=compute_cap")
-        .arg("--format=csv,noheader")
-        .arg("-i")
-        .arg(device_id.to_string())
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let stdout = String::from_utf8(output.stdout).ok()?;
-    parse_compute_cap(stdout.trim())
-}
-
-/// Parses a `nvidia-smi --query-gpu=compute_cap` line (`"8.9"`, `"12.0"`)
-/// into the cache-tag form (`"sm89"`, `"sm120"`).
-///
-/// Returns `None` on any parse failure so the caller skips GC rather
-/// than constructing a malformed tag. Accepts only `X.Y` shapes with
-/// purely numeric components.
-#[cfg(feature = "cache-gc")]
-fn parse_compute_cap(s: &str) -> Option<String> {
-    let trimmed = s.trim();
-    let mut parts = trimmed.splitn(2, '.');
-    let major = parts.next()?.trim();
-    let minor = parts.next()?.trim();
-    if major.is_empty() || minor.is_empty() {
-        return None;
-    }
-    if !major.chars().all(|c| c.is_ascii_digit()) || !minor.chars().all(|c| c.is_ascii_digit()) {
-        return None;
-    }
-    Some(format!("sm{major}{minor}"))
-}
-
-#[cfg(all(test, feature = "cache-gc"))]
-mod parse_compute_cap_tests {
-    use super::parse_compute_cap;
-
-    #[test]
-    fn handles_typical_outputs() {
-        assert_eq!(parse_compute_cap("8.9"), Some("sm89".to_string()));
-        assert_eq!(parse_compute_cap("8.9\n"), Some("sm89".to_string()));
-        assert_eq!(parse_compute_cap("12.0"), Some("sm120".to_string()));
-        assert_eq!(parse_compute_cap("  7.5  "), Some("sm75".to_string()));
-    }
-
-    #[test]
-    fn rejects_garbage() {
-        assert_eq!(parse_compute_cap(""), None);
-        assert_eq!(parse_compute_cap("8"), None);
-        assert_eq!(parse_compute_cap("8.x"), None);
-        assert_eq!(parse_compute_cap("not a version"), None);
-        assert_eq!(parse_compute_cap("a.b"), None);
-        // Trailing components after the minor are rejected — only X.Y
-        // is accepted to prevent accidental tag widening on future
-        // nvidia-smi output changes.
-        assert_eq!(parse_compute_cap("8.9.0"), None);
-    }
 }
 
 #[cfg(test)]
