@@ -12,7 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::*;
+//! Tests for `is_trt_jit_oom` error-pattern matching and
+//! `embed_with_trt_retry` retry semantics and workspace-halving logic.
+
+use super::super::{embed_with_trt_retry, is_trt_jit_oom};
+use crate::binpack::CostModel;
 
 // --- is_trt_jit_oom ---
 
@@ -142,83 +146,4 @@ fn embed_with_trt_retry_propagates_second_failure() {
     );
     assert!(result.is_err());
     assert_eq!(calls.get(), 2);
-}
-
-// --- drain_engine_propagation ---
-
-/// The same shape sent twice results in the prewarm closure being called
-/// exactly once (deduplicated via `warmed_local`).
-#[test]
-fn drain_deduplicates_same_shape() {
-    let (tx, mut rx) = tokio::sync::broadcast::channel::<(usize, usize)>(32);
-    tx.send((4, 512)).unwrap();
-    tx.send((4, 512)).unwrap();
-
-    let mut warmed_local = std::collections::HashSet::new();
-    let mut call_count = 0u32;
-
-    drain_engine_propagation(&mut rx, &mut warmed_local, 0, |_shape| {
-        call_count += 1;
-    });
-
-    assert_eq!(
-        call_count, 1,
-        "prewarm closure must be called exactly once for a duplicate shape"
-    );
-    assert!(warmed_local.contains(&(4_usize, 512_usize)));
-}
-
-/// A shape already in `warmed_local` before the drain must not trigger the
-/// prewarm closure.
-#[test]
-fn drain_skips_already_warmed() {
-    let (tx, mut rx) = tokio::sync::broadcast::channel::<(usize, usize)>(32);
-    tx.send((1, 128)).unwrap();
-
-    let mut warmed_local = std::collections::HashSet::new();
-    warmed_local.insert((1_usize, 128_usize));
-    let mut call_count = 0u32;
-
-    drain_engine_propagation(&mut rx, &mut warmed_local, 0, |_shape| {
-        call_count += 1;
-    });
-
-    assert_eq!(
-        call_count, 0,
-        "already-warmed shape must not trigger the prewarm closure"
-    );
-}
-
-/// Filling the channel past its capacity causes a `Lagged` error; drain must
-/// handle it without panicking and continue processing remaining items.
-#[test]
-fn drain_handles_lagged_without_panic() {
-    // Capacity 4 — send 6 items to trigger lagging.
-    let (tx, mut rx) = tokio::sync::broadcast::channel::<(usize, usize)>(4);
-    for i in 0..6usize {
-        let _ = tx.send((i, 128));
-    }
-
-    let mut warmed_local = std::collections::HashSet::new();
-    // Must not panic.
-    drain_engine_propagation(&mut rx, &mut warmed_local, 0, |_| {});
-}
-
-/// An empty channel causes the prewarm closure to never be called and drain
-/// exits cleanly.
-#[test]
-fn drain_exits_on_empty() {
-    let (_tx, mut rx) = tokio::sync::broadcast::channel::<(usize, usize)>(32);
-
-    let mut warmed_local = std::collections::HashSet::new();
-    let mut call_count = 0u32;
-
-    drain_engine_propagation(&mut rx, &mut warmed_local, 0, |_shape| {
-        call_count += 1;
-    });
-
-    assert_eq!(
-        call_count, 0,
-        "empty channel must not invoke the prewarm closure"
-    );
 }
