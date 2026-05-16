@@ -14,7 +14,9 @@
 
 use axum::http::{header, HeaderValue};
 
-use super::super::common::{check_ready, collect_x_headers, validate_input, MAX_STRING_CHARS};
+use super::super::common::{
+    check_ready, codekeeper_project, collect_x_headers, validate_input, MAX_STRING_CHARS,
+};
 use super::helpers::make_state;
 use crate::error::AppError;
 
@@ -140,4 +142,35 @@ fn collect_x_headers_multiple_x_headers_sorted() {
     let keys: Vec<&str> = result.0.keys().map(String::as_str).collect();
     // BTreeMap guarantees alphabetical order
     assert_eq!(keys, vec!["x-project", "x-request-id"]);
+}
+
+// ── codekeeper_project ─────────────────────────────────────────────────────
+
+#[test]
+fn codekeeper_project_returns_header_when_present() {
+    let mut headers = axum::http::HeaderMap::new();
+    headers.insert(
+        axum::http::HeaderName::from_static("x-codekeeper-project"),
+        HeaderValue::from_static("my-project"),
+    );
+
+    assert_eq!(codekeeper_project(&headers).as_deref(), Some("my-project"));
+}
+
+#[test]
+fn codekeeper_project_returns_none_when_missing() {
+    let headers = axum::http::HeaderMap::new();
+    assert_eq!(codekeeper_project(&headers), None);
+}
+
+#[test]
+fn codekeeper_project_returns_none_for_non_utf8_header() {
+    let mut headers = axum::http::HeaderMap::new();
+    let non_utf8 = HeaderValue::from_bytes(&[0x66, 0x6f, 0x80, 0x6f]).expect("valid header bytes");
+    headers.insert(
+        axum::http::HeaderName::from_static("x-codekeeper-project"),
+        non_utf8,
+    );
+
+    assert_eq!(codekeeper_project(&headers), None);
 }

@@ -19,7 +19,7 @@ use std::time::Instant;
 
 use axum::{extract::State, http::HeaderMap, Json};
 
-use super::common::{check_ready, collect_x_headers, validate_input};
+use super::common::{check_ready, codekeeper_project, collect_x_headers, validate_input};
 use crate::error::AppError;
 use crate::models::{DualEmbeddingData, DualRequest, DualResponse, SparseValues, Usage};
 use crate::state::AppState;
@@ -47,6 +47,7 @@ use crate::state::AppState;
         tokenize_ms,
         inference_ms,
         total_ms,
+        codekeeper_project = tracing::field::Empty,
         x_headers = tracing::field::Empty
     )
 )]
@@ -56,6 +57,9 @@ pub async fn both_embeddings(
     Json(req): Json<DualRequest>,
 ) -> Result<Json<DualResponse>, AppError> {
     check_ready(&state)?;
+    if let Some(project) = codekeeper_project(&headers) {
+        tracing::Span::current().record("codekeeper_project", tracing::field::display(project));
+    }
     let x_headers = collect_x_headers(&headers);
     if !x_headers.is_empty() {
         tracing::Span::current().record(
