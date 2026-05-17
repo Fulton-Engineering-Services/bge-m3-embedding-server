@@ -137,7 +137,7 @@ pub async fn run() -> anyhow::Result<()> {
         "bge-m3-embedding-server build info"
     );
 
-    let cfg = Config::from_env();
+    let cfg = Config::from_env()?;
 
     let disable_probe_cache = std::env::var("BGE_M3_DISABLE_PROBE_CACHE")
         .is_ok_and(|v| matches!(v.as_str(), "1" | "true" | "yes"));
@@ -452,6 +452,7 @@ pub async fn run() -> anyhow::Result<()> {
     #[cfg(feature = "tls")]
     if let (Some(cert), Some(key)) = (cfg.tls_cert_path.as_ref(), cfg.tls_key_path.as_ref()) {
         use axum_server::tls_rustls::RustlsConfig;
+        use axum_server::Handle;
         let tls_config = RustlsConfig::from_pem_file(cert, key)
             .await
             .map_err(|e| anyhow::anyhow!("TLS config error: {e}"))?;
@@ -460,7 +461,15 @@ pub async fn run() -> anyhow::Result<()> {
             .parse()
             .map_err(|e| anyhow::anyhow!("invalid bind addr: {e}"))?;
         info!(bind = %cfg.bind_addr, mode = "tls", "Listening");
+        let handle = Handle::new();
+        let h = handle.clone();
+        tokio::spawn(async move {
+            tokio::signal::ctrl_c().await.ok();
+            tracing::info!("TLS shutdown signal received, draining connections");
+            h.graceful_shutdown(Some(std::time::Duration::from_secs(30)));
+        });
         axum_server::bind_rustls(addr, tls_config)
+            .handle(handle)
             .serve(app.into_make_service())
             .await?;
         return Ok(());

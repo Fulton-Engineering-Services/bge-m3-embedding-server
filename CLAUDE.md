@@ -19,6 +19,8 @@ BGE_M3_EQUIVALENCE_TEST=1 BGE_M3_CACHE_DIR=/tmp/bge-m3-cache \
 
 **Always run `cargo fmt --all` before pushing** — CI fails the format check even when all tests pass.
 
+**`--features tls` requires `cmake` and a C toolchain** at build time because `aws-lc-sys` (pulled in by `axum-server/tls-rustls`) compiles a bundled AWS-LC C library. On Ubuntu: `sudo apt-get install -y cmake`. On macOS: `brew install cmake` or Xcode CLT (already ships `cmake`).
+
 ## Run Locally
 
 ```bash
@@ -46,6 +48,8 @@ Add `BGE_M3_DISABLE_AUTO_BUDGET=1` to skip the 2-minute Linux startup probe duri
 |----------|---------|-------------|
 | `BGE_M3_CACHE_DIR` | `/cache` | ONNX model cache path |
 | `BGE_M3_BIND` | `0.0.0.0:8081` | TCP bind address |
+| `BGE_M3_TLS_CERT_PATH` | unset | Path to TLS certificate PEM file. When set together with `BGE_M3_TLS_KEY_PATH` and the server is built with `--features tls`, the server binds HTTPS instead of HTTP. Both must be set or both must be absent — setting only one is a startup error. |
+| `BGE_M3_TLS_KEY_PATH` | unset | Path to TLS private key PEM file. Must be set together with `BGE_M3_TLS_CERT_PATH`; see above. |
 | `BGE_M3_WORKERS` | `2` | Worker threads (each with its own ORT session). For GPU EPs, set equal to `BGE_M3_GPU_COUNT`. |
 | `BGE_M3_INTRA_THREADS` | `1` | ORT intra-op threads per worker. Raise to `floor(num_cpus / workers)` on under-utilized hosts. |
 | `BGE_M3_MAX_BATCH` | `256` | Max texts per request |

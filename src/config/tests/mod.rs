@@ -25,6 +25,7 @@
 //!   `BGE_M3_TRT_MAX_WORKSPACE_BYTES`, `BGE_M3_GPU_MEM_LIMIT_BYTES`.
 //! - `adaptive`: `BGE_M3_ADAPTIVE_WARMUP_*` and `BGE_M3_ENGINE_PROPAGATION_ENABLED`.
 //! - `gpu`: `BGE_M3_GPU_COUNT`, workers field, and GPU-EP cost-model override.
+//! - `tls`: `BGE_M3_TLS_CERT_PATH`, `BGE_M3_TLS_KEY_PATH`, and `Config::validate` half-config guard.
 
 mod adaptive;
 mod budget;
@@ -32,5 +33,6 @@ mod defaults;
 mod ep;
 mod gpu;
 mod helpers;
+mod tls;
 mod trt_shapes;
 mod tuning;

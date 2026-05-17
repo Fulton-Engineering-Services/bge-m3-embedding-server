@@ -420,9 +420,36 @@ impl Config {
     /// Creates a [`Config`] by reading environment variables.
     ///
     /// Unrecognized or missing variables fall back to their defaults.
-    #[must_use]
-    pub fn from_env() -> Self {
-        Self::from_lookup(|key| env::var(key).ok())
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when exactly one of `BGE_M3_TLS_CERT_PATH` /
+    /// `BGE_M3_TLS_KEY_PATH` is set: a half-configured TLS pair would cause
+    /// the server to silently fall back to plain HTTP rather than fail loudly.
+    pub fn from_env() -> anyhow::Result<Self> {
+        let cfg = Self::from_lookup(|key| env::var(key).ok());
+        cfg.validate()?;
+        Ok(cfg)
+    }
+
+    /// Validates configuration invariants that cannot be enforced by the
+    /// type system alone.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when exactly one of `tls_cert_path` / `tls_key_path` is
+    /// `Some`. Both must be present or both must be absent.
+    pub(crate) fn validate(&self) -> anyhow::Result<()> {
+        match (&self.tls_cert_path, &self.tls_key_path) {
+            (Some(_), None) | (None, Some(_)) => {
+                anyhow::bail!(
+                    "TLS misconfiguration: BGE_M3_TLS_CERT_PATH and \
+                     BGE_M3_TLS_KEY_PATH must both be set or both be absent"
+                );
+            }
+            _ => {}
+        }
+        Ok(())
     }
 
     #[allow(clippy::too_many_lines)]

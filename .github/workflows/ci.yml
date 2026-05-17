@@ -75,6 +75,28 @@ jobs:
       - name: Run tests (cache-gc)
         run: cargo nextest run --features "download-ort cache-gc" --no-tests=warn
 
+  test-tls:
+    name: Test (tls feature)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9  # stable
+        with:
+          toolchain: stable
+          components: clippy
+
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4  # v2
+      - uses: taiki-e/install-action@554bdce7edf79d43854a6b7c1e392e7da7eb97a9  # cargo-nextest
+
+      - name: Install cmake (required by aws-lc-sys)
+        run: sudo apt-get install -y cmake
+
+      - name: Clippy (tls)
+        run: cargo clippy --all-targets --features "download-ort tls" -- -D warnings
+
+      - name: Run tests (tls)
+        run: cargo nextest run --features "download-ort tls" --no-tests=warn
+
   msrv:
     name: MSRV (1.88)
     runs-on: ubuntu-latest
