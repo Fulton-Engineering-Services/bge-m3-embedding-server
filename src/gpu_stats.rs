@@ -26,8 +26,8 @@
 
 #[cfg(feature = "nvml")]
 mod inner {
-    use nvml_wrapper::enum_wrappers::device::TemperatureSensor;
     use nvml_wrapper::Nvml;
+    use nvml_wrapper::enum_wrappers::device::TemperatureSensor;
     use tracing::{debug, info, warn};
 
     enum NvmlState {

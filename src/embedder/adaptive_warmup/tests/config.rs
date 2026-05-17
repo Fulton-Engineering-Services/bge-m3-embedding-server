@@ -17,7 +17,7 @@
 
 use tokio::sync::mpsc;
 
-use super::super::{spawn_adaptive_warmup, AdaptiveWarmupConfig};
+use super::super::{AdaptiveWarmupConfig, spawn_adaptive_warmup};
 use crate::embedder::pool::EmbedPool;
 
 // ─── AdaptiveWarmupConfig field tests ────────────────────────────────────────

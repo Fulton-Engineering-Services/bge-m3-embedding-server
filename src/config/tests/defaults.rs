@@ -15,7 +15,7 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
-use super::super::{Config, ModelVariant, MODEL_MAX_SEQ};
+use super::super::{Config, MODEL_MAX_SEQ, ModelVariant};
 use super::helpers::lookup_from;
 
 #[test]

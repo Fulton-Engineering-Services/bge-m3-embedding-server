@@ -1,7 +1,7 @@
 [package]
 name = "bge-m3-embedding-server"
 version = "1.4.1"
-edition = "2021"
+edition = "2024"
 license = "Apache-2.0"
 description = "Axum HTTP server serving BGE-M3 dense and sparse embeddings via ONNX Runtime"
 repository = "https://github.com/Fulton-Engineering-Services/bge-m3-embedding-server"

@@ -87,12 +87,16 @@ pub(crate) fn build_execution_providers(cache: &Path) -> Vec<ort::ep::ExecutionP
     match config.as_str() {
         "mlas_only" => vec![],
         "coreml_all" => vec![base().build()],
-        "coreml_cpu_only" => vec![base()
-            .with_compute_units(ort::ep::coreml::ComputeUnits::CPUOnly)
-            .build()],
-        "coreml_cpu_and_gpu" => vec![base()
-            .with_compute_units(ort::ep::coreml::ComputeUnits::CPUAndGPU)
-            .build()],
+        "coreml_cpu_only" => vec![
+            base()
+                .with_compute_units(ort::ep::coreml::ComputeUnits::CPUOnly)
+                .build(),
+        ],
+        "coreml_cpu_and_gpu" => vec![
+            base()
+                .with_compute_units(ort::ep::coreml::ComputeUnits::CPUAndGPU)
+                .build(),
+        ],
         other => panic!(
             "Unknown BGE_M3_BENCH_EP={other}. \
              Use: mlas_only, coreml_all, coreml_cpu_only, coreml_cpu_and_gpu"

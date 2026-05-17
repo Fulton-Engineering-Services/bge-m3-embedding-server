@@ -283,12 +283,11 @@ fn embed_sparse(
         // promoting FP16 tensor data to F32 during extraction. Verified with
         // ort 2.0.0-rc.11 on MLAS and CoreML EPs. If a future ORT version
         // changes this behavior, extraction will fail with a type mismatch error.
-        let token_emb = if let Ok(t) = outputs["token_embeddings"].try_extract_array::<f32>() {
-            t
-        } else {
-            outputs["last_hidden_state"]
+        let token_emb = match outputs["token_embeddings"].try_extract_array::<f32>() {
+            Ok(t) => t,
+            _ => outputs["last_hidden_state"]
                 .try_extract_array::<f32>()
-                .map_err(ort_err)?
+                .map_err(ort_err)?,
         };
 
         let mut token_weights: HashMap<usize, f32> = HashMap::new();

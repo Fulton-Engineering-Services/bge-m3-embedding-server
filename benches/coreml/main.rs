@@ -56,7 +56,7 @@ mod dense;
 mod setup;
 mod sparse;
 
-use criterion::{criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, criterion_group, criterion_main};
 
 use crate::dense::{bench_dense, bench_embed_dense};
 use crate::setup::{

@@ -12,14 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::sync::atomic::{AtomicBool, AtomicU8};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU8};
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
+use axum::Json;
 use axum::extract::State;
 use axum::http::HeaderMap;
-use axum::Json;
 use tokio::sync::Semaphore;
 
 use super::super::dense_embeddings;

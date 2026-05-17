@@ -826,17 +826,16 @@ fn resolve_cost_model_override<F: Fn(&str) -> Option<String>>(
     // 3. Explicit coefficient override — requires A, B, AND available memory.
     if let (Some(a_str), Some(b_str)) =
         (lookup("BGE_M3_COST_MODEL_A"), lookup("BGE_M3_COST_MODEL_B"))
+        && let (Ok(a), Ok(b)) = (a_str.parse::<f64>(), b_str.parse::<f64>())
     {
-        if let (Ok(a), Ok(b)) = (a_str.parse::<f64>(), b_str.parse::<f64>()) {
-            let max_workspace = lookup("BGE_M3_AVAILABLE_MEMORY_BYTES")
-                .and_then(|v| v.parse::<usize>().ok())
-                .unwrap_or(CostModel::DEFAULT_MAX_WORKSPACE);
-            return Some(CostModel {
-                a,
-                b,
-                max_workspace_bytes: max_workspace,
-            });
-        }
+        let max_workspace = lookup("BGE_M3_AVAILABLE_MEMORY_BYTES")
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(CostModel::DEFAULT_MAX_WORKSPACE);
+        return Some(CostModel {
+            a,
+            b,
+            max_workspace_bytes: max_workspace,
+        });
     }
 
     // 4. No override — run the startup probe.

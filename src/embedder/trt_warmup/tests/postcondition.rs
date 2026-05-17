@@ -16,8 +16,8 @@
 //! `prewarm_persistence_suspicious_undercount`.
 
 use super::super::{
-    prewarm_persistence_postcondition_failed, prewarm_persistence_suspicious_undercount,
-    SUSPICIOUS_UNDERCOUNT_MIN_FRESH,
+    SUSPICIOUS_UNDERCOUNT_MIN_FRESH, prewarm_persistence_postcondition_failed,
+    prewarm_persistence_suspicious_undercount,
 };
 
 // ─── prewarm_persistence_postcondition_failed ─────────────────────────

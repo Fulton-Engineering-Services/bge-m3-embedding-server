@@ -14,10 +14,10 @@
 
 //! `GET /health` handler — readiness status, worker counts, and tuning diagnostics.
 
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
-use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
+use axum::{Json, extract::State, http::StatusCode, response::IntoResponse};
 
 use crate::state::{AppState, ProbeStatus};
 

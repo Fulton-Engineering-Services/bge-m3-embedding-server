@@ -66,10 +66,10 @@ pub(super) fn collect_x_headers(headers: &HeaderMap) -> XHeaders {
     let mut map = BTreeMap::new();
     for (name, value) in headers {
         let name_str = name.as_str();
-        if name_str.starts_with("x-") {
-            if let Ok(val) = value.to_str() {
-                map.insert(name_str.replace('-', "_"), val.to_owned());
-            }
+        if name_str.starts_with("x-")
+            && let Ok(val) = value.to_str()
+        {
+            map.insert(name_str.replace('-', "_"), val.to_owned());
         }
     }
     XHeaders(map)

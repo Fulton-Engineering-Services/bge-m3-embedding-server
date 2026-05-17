@@ -26,7 +26,7 @@
 //             when rss_before == rss_after (non-Linux or no ORT activity).
 // -----------------------------------------------------------------------
 
-use super::super::fit::{fit_cost_model, DataPoint};
+use super::super::fit::{DataPoint, fit_cost_model};
 use super::super::runner::PROBE_SHAPES;
 use super::super::validate::validate_max_seq_shape;
 use crate::binpack::CostModel;

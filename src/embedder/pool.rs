@@ -15,18 +15,18 @@
 //! `EmbedPool` async wrapper around the worker thread pool.
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use anyhow::Result;
-use tokio::sync::{mpsc, oneshot, Mutex};
+use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::task::JoinHandle;
-use tracing::{info, info_span, Instrument};
+use tracing::{Instrument, info, info_span};
 
 use super::math::median_usize;
 use super::trt_warmup::shard_shapes;
 use super::types::{DualEmbedding, EmbedRequest, EmbedStats, ProbeResult, SparseEmbedding};
-use super::worker::{run_worker, WorkerConfig};
+use super::worker::{WorkerConfig, run_worker};
 use crate::config::EpSelection;
 
 /// Sender half of the engine propagation broadcast channel.

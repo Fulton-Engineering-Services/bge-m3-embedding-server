@@ -21,7 +21,7 @@
 
 use std::hint::black_box;
 
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
+use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 
 // ---------------------------------------------------------------------------
 // bench_text_input_deser

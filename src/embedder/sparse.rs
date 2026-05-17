@@ -21,7 +21,7 @@ use super::error::ort_err;
 use super::math::{seq_len_distribution, sparse_maxpool, sparse_project};
 use super::tokenize::{build_chunk_arrays, tokenize_no_pad};
 use super::types::{EmbedStats, SparseEmbedding};
-use crate::binpack::{bin_pack, CostModel};
+use crate::binpack::{CostModel, bin_pack};
 use crate::config::ModelVariant;
 
 /// Produces sparse embeddings via the BGE-M3 sparse-linear projection.

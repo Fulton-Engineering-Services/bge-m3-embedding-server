@@ -23,8 +23,8 @@ use ndarray::ArrayView1;
 use ort::value::TensorRef;
 
 use crate::setup::{
-    bench_model_variant, build_execution_providers, cache_dir, ep_name, load_bench_models,
-    load_corpus, load_sparse_weights, onnx_batch_size, SPECIAL_TOKENS,
+    SPECIAL_TOKENS, bench_model_variant, build_execution_providers, cache_dir, ep_name,
+    load_bench_models, load_corpus, load_sparse_weights, onnx_batch_size,
 };
 
 pub(crate) fn bench_embed_sparse(

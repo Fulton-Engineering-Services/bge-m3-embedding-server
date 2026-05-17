@@ -17,7 +17,7 @@
 
 use std::collections::HashMap;
 
-use super::super::{parse_trt_warmup_shapes, Config};
+use super::super::{Config, parse_trt_warmup_shapes};
 use super::helpers::lookup_from;
 
 // --- BGE_M3_TRT_WARMUP_SHAPES ---

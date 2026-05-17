@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::super::{bin_pack, CostModel};
+use super::super::{CostModel, bin_pack};
 use super::helpers::{linear_model, model};
 
 // ── basic correctness ──────────────────────────────────────────────────

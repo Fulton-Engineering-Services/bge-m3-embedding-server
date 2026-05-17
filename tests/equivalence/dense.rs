@@ -21,8 +21,8 @@
 //! returned by [`super::helpers::cosine_tolerances_for`].
 
 use crate::helpers::{
-    cosine_similarity, cosine_tolerances_for, fixture_dir, l2_normalize, load_npy_f32,
-    locate_model_file, locate_tokenizer, Tolerances,
+    Tolerances, cosine_similarity, cosine_tolerances_for, fixture_dir, l2_normalize, load_npy_f32,
+    locate_model_file, locate_tokenizer,
 };
 
 /// Runs the full equivalence check for each fixture sequence length.

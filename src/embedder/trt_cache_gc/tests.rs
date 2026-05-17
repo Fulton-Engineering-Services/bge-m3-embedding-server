@@ -25,7 +25,7 @@ use std::path::Path;
 
 use tempfile::TempDir;
 
-use super::{gc_stale_sm_plans, GcStats, ENGINE_SIDE_SUFFIXES};
+use super::{ENGINE_SIDE_SUFFIXES, GcStats, gc_stale_sm_plans};
 
 /// Convenience helper: write a byte-string file under `dir/name` and return
 /// its size for `bytes_freed` cross-checks.

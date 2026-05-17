@@ -177,11 +177,7 @@ fn count_nvidia_gpus_from_proc() -> Option<usize> {
         .ok()?
         .filter_map(std::result::Result::ok)
         .count();
-    if count > 0 {
-        Some(count)
-    } else {
-        None
-    }
+    if count > 0 { Some(count) } else { None }
 }
 
 /// Returns the current process's RSS (Resident Set Size) in bytes, or `None`

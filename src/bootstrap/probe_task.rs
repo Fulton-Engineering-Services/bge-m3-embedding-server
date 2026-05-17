@@ -16,8 +16,8 @@
 //! and the EFS cache is empty (or disabled).
 
 use std::path::PathBuf;
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 use tracing::info;
 

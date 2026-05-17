@@ -21,7 +21,7 @@ use super::error::ort_err;
 use super::math::{normalize_l2, seq_len_distribution};
 use super::tokenize::{build_chunk_arrays, tokenize_no_pad};
 use super::types::EmbedStats;
-use crate::binpack::{bin_pack, CostModel};
+use crate::binpack::{CostModel, bin_pack};
 use crate::config::ModelVariant;
 
 /// Produces L2-normalized dense embeddings.

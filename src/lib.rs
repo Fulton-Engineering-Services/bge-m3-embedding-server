@@ -43,8 +43,8 @@ pub mod sysinfo;
 pub mod weights;
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
@@ -473,8 +473,8 @@ pub async fn run() -> anyhow::Result<()> {
 
     #[cfg(feature = "tls")]
     if let (Some(cert), Some(key)) = (cfg.tls_cert_path.as_ref(), cfg.tls_key_path.as_ref()) {
-        use axum_server::tls_rustls::RustlsConfig;
         use axum_server::Handle;
+        use axum_server::tls_rustls::RustlsConfig;
         let tls_config = RustlsConfig::from_pem_file(cert, key)
             .await
             .map_err(|e| anyhow::anyhow!("TLS config error: {e}"))?;
@@ -628,7 +628,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn tls_rustls_config_loads_valid_pem_files() {
         use axum_server::tls_rustls::RustlsConfig;
-        use rcgen::{generate_simple_self_signed, CertifiedKey};
+        use rcgen::{CertifiedKey, generate_simple_self_signed};
 
         // Both aws-lc-rs and ring are in the dep tree; install aws-lc-rs
         // explicitly so rustls 0.23 does not panic with an "ambiguous
