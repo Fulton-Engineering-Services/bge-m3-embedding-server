@@ -20,6 +20,7 @@ path = "src/main.rs"
 
 [dependencies]
 axum = "0.8"
+axum-server = { version = "0.7", features = ["tls-rustls"], optional = true }
 indexmap = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "time"] }
 serde = { version = "1", features = ["derive"] }
@@ -92,6 +93,12 @@ tensorrt = ["ort/cuda", "ort/tensorrt", "nvml"]
 ## destructive WARN is logged before any deletion. See `docs/cache-gc.md`
 ## (or the README section "Stale-SM Cache GC") for the full hazard model.
 cache-gc = []
+
+## Enable optional native TLS via axum-server + tokio-rustls.
+## When `BGE_M3_TLS_CERT_PATH` and `BGE_M3_TLS_KEY_PATH` are both set at
+## runtime, the server binds HTTPS instead of HTTP. When either is absent,
+## the server falls back to plain HTTP.
+tls = ["dep:axum-server"]
 
 [dev-dependencies]
 tokio = { version = "1", features = ["test-util"] }

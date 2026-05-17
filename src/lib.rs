@@ -391,9 +391,6 @@ pub async fn run() -> anyhow::Result<()> {
 
     let app = build_router(Arc::clone(&state), cfg.max_body_bytes);
 
-    let listener = tokio::net::TcpListener::bind(&cfg.bind_addr).await?;
-    info!(bind = %cfg.bind_addr, "Listening");
-
     let state_for_readiness = Arc::clone(&state);
     let cfg_max_seq = cfg.max_seq_length;
     let cfg_workers = cfg.workers;
@@ -452,6 +449,25 @@ pub async fn run() -> anyhow::Result<()> {
         });
     }
 
+    #[cfg(feature = "tls")]
+    if let (Some(cert), Some(key)) = (cfg.tls_cert_path.as_ref(), cfg.tls_key_path.as_ref()) {
+        use axum_server::tls_rustls::RustlsConfig;
+        let tls_config = RustlsConfig::from_pem_file(cert, key)
+            .await
+            .map_err(|e| anyhow::anyhow!("TLS config error: {e}"))?;
+        let addr: std::net::SocketAddr = cfg
+            .bind_addr
+            .parse()
+            .map_err(|e| anyhow::anyhow!("invalid bind addr: {e}"))?;
+        info!(bind = %cfg.bind_addr, mode = "tls", "Listening");
+        axum_server::bind_rustls(addr, tls_config)
+            .serve(app.into_make_service())
+            .await?;
+        return Ok(());
+    }
+
+    let listener = tokio::net::TcpListener::bind(&cfg.bind_addr).await?;
+    info!(bind = %cfg.bind_addr, mode = "plain", "Listening");
     axum::serve(listener, app).await?;
     Ok(())
 }

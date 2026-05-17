@@ -151,6 +151,16 @@ pub struct Config {
     /// Set with `BGE_M3_BIND`. Defaults to `0.0.0.0:8081`.
     /// The `0.0.0.0` default is intentional for Docker container deployments.
     pub bind_addr: String,
+    /// Path to the TLS certificate PEM file.
+    ///
+    /// Set with `BGE_M3_TLS_CERT_PATH`. When set together with
+    /// `BGE_M3_TLS_KEY_PATH` and the `tls` Cargo feature is compiled in,
+    /// the server binds HTTPS instead of HTTP.
+    pub tls_cert_path: Option<std::path::PathBuf>,
+    /// Path to the TLS private key PEM file.
+    ///
+    /// Set with `BGE_M3_TLS_KEY_PATH`.
+    pub tls_key_path: Option<std::path::PathBuf>,
     /// Number of embedding worker threads to spawn.
     ///
     /// Set with `BGE_M3_WORKERS`. Defaults to `2`. Minimum effective value is `1`.
@@ -604,6 +614,9 @@ impl Config {
             .and_then(|v| v.parse::<usize>().ok())
             .unwrap_or(33_554_432);
 
+        let tls_cert_path = lookup("BGE_M3_TLS_CERT_PATH").map(std::path::PathBuf::from);
+        let tls_key_path = lookup("BGE_M3_TLS_KEY_PATH").map(std::path::PathBuf::from);
+
         let warmup_only = lookup("BGE_M3_WARMUP_ONLY")
             .is_some_and(|v| matches!(v.as_str(), "1" | "true" | "yes"));
 
@@ -637,6 +650,8 @@ impl Config {
         Self {
             cache_dir: lookup("BGE_M3_CACHE_DIR").unwrap_or_else(|| "/cache".to_string()),
             bind_addr: lookup("BGE_M3_BIND").unwrap_or_else(|| "0.0.0.0:8081".to_string()),
+            tls_cert_path,
+            tls_key_path,
             workers,
             intra_threads,
             max_batch,
