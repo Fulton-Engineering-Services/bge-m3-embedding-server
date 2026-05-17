@@ -108,6 +108,8 @@ proptest = "1"
 criterion = { version = "0.8", features = ["html_reports"] }
 sha2 = "0.11"
 tempfile = "3"
+rcgen = "0.13"
+rustls = { version = "0.23", features = ["aws-lc-rs"] }
 
 [[bench]]
 name = "embeddings"

@@ -121,8 +121,10 @@ jobs:
       - uses: taiki-e/install-action@554bdce7edf79d43854a6b7c1e392e7da7eb97a9  # cargo-nextest
         with:
           tool: cargo-llvm-cov,cargo-nextest
+      - name: Install cmake (required by aws-lc-sys for the tls feature)
+        run: sudo apt-get install -y cmake
       - name: Generate coverage
-        run: cargo llvm-cov nextest --features download-ort --lcov --output-path lcov.info
+        run: cargo llvm-cov nextest --features "download-ort tls" --lcov --output-path lcov.info
       - name: Upload to Codecov
         uses: codecov/codecov-action@57e3a136b779b570ffcdbf80b3bdc90e7fab3de2  # v5
         with:

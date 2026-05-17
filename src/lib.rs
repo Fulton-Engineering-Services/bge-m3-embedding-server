@@ -591,4 +591,67 @@ mod tests {
             "live counter must be untouched after timeout"
         );
     }
+
+    // ─── TLS cert-loading path ────────────────────────────────────────────
+    //
+    // The axum_server::bind_rustls(...).serve(...) call requires an actual
+    // listening socket and cannot be integration-tested here. These tests
+    // exercise the RustlsConfig::from_pem_file path that precedes it,
+    // covering the cert-loading and error-mapping logic in `run()`.
+
+    /// `RustlsConfig::from_pem_file` succeeds when given valid PEM files
+    /// produced by rcgen.  This covers the happy-path cert-loading lines in
+    /// the `#[cfg(feature = "tls")]` bind block inside `run()`.
+    #[cfg(feature = "tls")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn tls_rustls_config_loads_valid_pem_files() {
+        use axum_server::tls_rustls::RustlsConfig;
+        use rcgen::{generate_simple_self_signed, CertifiedKey};
+
+        // Both aws-lc-rs and ring are in the dep tree; install aws-lc-rs
+        // explicitly so rustls 0.23 does not panic with an "ambiguous
+        // provider" error before we even read the PEM files.
+        rustls::crypto::aws_lc_rs::default_provider()
+            .install_default()
+            .ok();
+
+        let CertifiedKey { cert, key_pair } =
+            generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let cert_pem = cert.pem();
+        let key_pem = key_pair.serialize_pem();
+
+        let cert_file = tempfile::NamedTempFile::new().unwrap();
+        let key_file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(cert_file.path(), &cert_pem).unwrap();
+        std::fs::write(key_file.path(), &key_pem).unwrap();
+
+        let result = RustlsConfig::from_pem_file(cert_file.path(), key_file.path()).await;
+        assert!(
+            result.is_ok(),
+            "RustlsConfig::from_pem_file must succeed with valid PEM files"
+        );
+    }
+
+    /// `RustlsConfig::from_pem_file` returns an error when the cert file does
+    /// not exist.  This covers the `.map_err(|e| anyhow::anyhow!(...))` arm
+    /// in the TLS bind block.
+    #[cfg(feature = "tls")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn tls_rustls_config_errors_on_missing_cert_file() {
+        use axum_server::tls_rustls::RustlsConfig;
+
+        rustls::crypto::aws_lc_rs::default_provider()
+            .install_default()
+            .ok();
+
+        let result = RustlsConfig::from_pem_file(
+            "/nonexistent/path/server.crt",
+            "/nonexistent/path/server.key",
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "RustlsConfig::from_pem_file must return Err for missing files"
+        );
+    }
 }
