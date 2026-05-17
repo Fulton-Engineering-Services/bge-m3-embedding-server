@@ -536,12 +536,9 @@ jobs:
           output-file: /tmp/sbom-${{ needs.version.outputs.version }}-tls.spdx.json
 
       - name: Upload TLS SBOM to GitHub Release
-        uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda  # v3
-        with:
-          tag_name: ${{ needs.version.outputs.tag }}
-          files: /tmp/sbom-${{ needs.version.outputs.version }}-tls.spdx.json
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release upload "${{ needs.version.outputs.tag }}" /tmp/sbom-${{ needs.version.outputs.version }}-tls.spdx.json --clobber
 
   # ── CUDA image release (single-arch amd64, signed + SBOM) ─────────────
   release-cuda:
@@ -599,12 +596,9 @@ jobs:
           output-file: /tmp/sbom-${{ needs.version.outputs.version }}-cuda.spdx.json
 
       - name: Upload CUDA SBOM to GitHub Release
-        uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda  # v3
-        with:
-          tag_name: ${{ needs.version.outputs.tag }}
-          files: /tmp/sbom-${{ needs.version.outputs.version }}-cuda.spdx.json
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release upload "${{ needs.version.outputs.tag }}" /tmp/sbom-${{ needs.version.outputs.version }}-cuda.spdx.json --clobber
 
   # ── CUDA TLS image release (single-arch amd64, signed + SBOM) ─────────
   release-cuda-tls:
@@ -662,12 +656,9 @@ jobs:
           output-file: /tmp/sbom-${{ needs.version.outputs.version }}-cuda-tls.spdx.json
 
       - name: Upload CUDA TLS SBOM to GitHub Release
-        uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda  # v3
-        with:
-          tag_name: ${{ needs.version.outputs.tag }}
-          files: /tmp/sbom-${{ needs.version.outputs.version }}-cuda-tls.spdx.json
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release upload "${{ needs.version.outputs.tag }}" /tmp/sbom-${{ needs.version.outputs.version }}-cuda-tls.spdx.json --clobber
 
   # ── CUDA cache-gc image release (single-arch amd64, signed + SBOM) ────
   # WARNING: only deploy this image in a controlled maintenance window against
@@ -727,9 +718,6 @@ jobs:
           output-file: /tmp/sbom-${{ needs.version.outputs.version }}-cuda-cache-gc.spdx.json
 
       - name: Upload CUDA cache-gc SBOM to GitHub Release
-        uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda  # v3
-        with:
-          tag_name: ${{ needs.version.outputs.tag }}
-          files: /tmp/sbom-${{ needs.version.outputs.version }}-cuda-cache-gc.spdx.json
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release upload "${{ needs.version.outputs.tag }}" /tmp/sbom-${{ needs.version.outputs.version }}-cuda-cache-gc.spdx.json --clobber
