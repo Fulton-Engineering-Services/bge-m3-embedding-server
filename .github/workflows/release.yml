@@ -538,7 +538,7 @@ jobs:
       - name: Upload TLS SBOM to GitHub Release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release upload "${{ needs.version.outputs.tag }}" /tmp/sbom-${{ needs.version.outputs.version }}-tls.spdx.json --clobber
+        run: gh release upload "${{ needs.version.outputs.tag }}" /tmp/sbom-${{ needs.version.outputs.version }}-tls.spdx.json --repo "${{ github.repository }}" --clobber
 
   # ── CUDA image release (single-arch amd64, signed + SBOM) ─────────────
   release-cuda:
@@ -598,7 +598,7 @@ jobs:
       - name: Upload CUDA SBOM to GitHub Release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release upload "${{ needs.version.outputs.tag }}" /tmp/sbom-${{ needs.version.outputs.version }}-cuda.spdx.json --clobber
+        run: gh release upload "${{ needs.version.outputs.tag }}" /tmp/sbom-${{ needs.version.outputs.version }}-cuda.spdx.json --repo "${{ github.repository }}" --clobber
 
   # ── CUDA TLS image release (single-arch amd64, signed + SBOM) ─────────
   release-cuda-tls:
@@ -658,7 +658,7 @@ jobs:
       - name: Upload CUDA TLS SBOM to GitHub Release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release upload "${{ needs.version.outputs.tag }}" /tmp/sbom-${{ needs.version.outputs.version }}-cuda-tls.spdx.json --clobber
+        run: gh release upload "${{ needs.version.outputs.tag }}" /tmp/sbom-${{ needs.version.outputs.version }}-cuda-tls.spdx.json --repo "${{ github.repository }}" --clobber
 
   # ── CUDA cache-gc image release (single-arch amd64, signed + SBOM) ────
   # WARNING: only deploy this image in a controlled maintenance window against
@@ -720,4 +720,4 @@ jobs:
       - name: Upload CUDA cache-gc SBOM to GitHub Release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release upload "${{ needs.version.outputs.tag }}" /tmp/sbom-${{ needs.version.outputs.version }}-cuda-cache-gc.spdx.json --clobber
+        run: gh release upload "${{ needs.version.outputs.tag }}" /tmp/sbom-${{ needs.version.outputs.version }}-cuda-cache-gc.spdx.json --repo "${{ github.repository }}" --clobber
