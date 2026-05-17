@@ -12,22 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! `EmbedPool` tests.
+//! Unit tests for the `worker` module.
 //!
-//! - `helpers`: shared test helpers (`bad_cache_dir`, `test_cost_model_handle`).
-//! - `spawn`: pool spawning and initialization failure propagation.
-//! - `channel`: channel-closed error paths and fixture-pool round-trips.
-//! - `lifecycle`: worker counts, model RSS, `EmbedStats`, queue depth, and
-//!   `median_usize`.
-//! - `math_helpers`: pure `normalize_l2`, `sparse_project`, and
-//!   `sparse_maxpool` math.
-//! - `corpus`: `REPO_REVISION` drift detection and benchmark corpus shape
-//!   validation.
+//! - `trt_retry`: `is_trt_jit_oom` pattern matching and
+//!   `embed_with_trt_retry` retry/workspace-halving logic.
+//! - `propagation`: `drain_engine_propagation` deduplication, lagged-channel
+//!   handling, and idempotency for already-warmed shapes.
+//! - `prewarm_strict`: pure-function tests for the `BGE_M3_PREWARM_STRICT`
+//!   decision predicate (`should_fail_readiness`).
 
-mod channel;
-mod corpus;
-mod helpers;
-mod lifecycle;
-mod math_helpers;
+mod prewarm_strict;
 mod propagation;
-mod spawn;
+mod trt_retry;

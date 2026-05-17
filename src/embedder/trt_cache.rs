@@ -320,56 +320,147 @@ pub(crate) fn log_cache_state(info: &TrtCacheInfo) {
     }
 }
 
-/// Counts `.engine` files in `dir` without allocating a sorted list.
+/// Returns `true` when `name` is a TRT engine plan basename whose `_smXX`
+/// suffix matches the requested SM exactly.
 ///
-/// Returns `0` when the directory does not exist or cannot be read (covers both
-/// cold-cache and permission-error cases). Used by `trt_warmup` to decide
-/// whether to run the coverage-check fast path before attempting a full
-/// prewarm sweep.
-pub(super) fn count_engine_files(dir: &Path) -> usize {
-    std::fs::read_dir(dir).map_or(0, |rd| {
-        rd.flatten()
-            .filter(|e| {
-                e.file_type().is_ok_and(|t| t.is_file())
-                    && e.file_name().to_string_lossy().ends_with(".engine")
-            })
-            .count()
-    })
+/// ORT names every TRT engine plan with a `_smXX.engine` suffix tied to the
+/// GPU compute capability that built it (`sm75` = T4, `sm86` = A10G, `sm89` =
+/// L40S/L4, `sm120` = Blackwell). The match must be **strict** — `sm12` must
+/// not match `sm120.engine`, or a B200 worker would happily believe a Hopper
+/// plan is usable. We accomplish this by anchoring on the leading underscore:
+/// the suffix tested is `"_{sm}.engine"`, so `_sm12.engine` and `_sm120.engine`
+/// occupy disjoint string sets.
+///
+/// Pure, no I/O — easy to unit-test.
+#[must_use]
+pub(crate) fn matches_sm_suffix(name: &str, sm: &str) -> bool {
+    let suffix = format!("_{sm}.engine");
+    name.ends_with(&suffix)
 }
 
-/// Returns sorted basenames of regular files ending in `.engine` under `engine_dir`.
+/// Returns full paths of `.engine` files under `engine_dir` that match the
+/// requested SM, or all `.engine` files when `sm` is `None`.
 ///
-/// Used for operator-visible logs before TRT prewarm; filenames are **not** a
-/// reliable `(batch, seq)` key for dynamic models (see `CLAUDE.md`).
-pub(crate) fn engine_basenames_in_dir_sorted(engine_dir: &Path) -> std::io::Result<Vec<String>> {
+/// Single source of truth for engine enumeration: every other function in
+/// this module that needs to enumerate engine plans (count, basenames,
+/// operator log line) delegates here. Centralising the filter is the design
+/// constraint behind the SM-aware refactor — a future caller that grew its
+/// own `read_dir` loop would silently regress the heterogeneous-SM safety
+/// invariant.
+///
+/// Failure modes (directory missing or unreadable) collapse to an empty
+/// `Vec`, mirroring the legacy `count_engine_files` behaviour and the
+/// "operator-visible, not load-bearing" stance of this module.
+pub(super) fn engine_files_for_sm(engine_dir: &Path, sm: Option<&str>) -> Vec<PathBuf> {
+    let Ok(read_dir) = std::fs::read_dir(engine_dir) else {
+        return Vec::new();
+    };
+    read_dir
+        .flatten()
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().into_owned();
+            if !name.ends_with(".engine") {
+                return None;
+            }
+            match sm {
+                Some(target) if !matches_sm_suffix(&name, target) => None,
+                _ => Some(e.path()),
+            }
+        })
+        .collect()
+}
+
+/// Counts `.engine` files in `dir` that match the requested SM.
+///
+/// Pass `Some("sm120")` to count only Blackwell plans; pass `None` to count
+/// every `.engine` file regardless of suffix (legacy behaviour, also what
+/// the wrapper [`count_engine_files`] does). Returns `0` when the directory
+/// does not exist or cannot be read.
+///
+/// Crate-visible (not `pub(super)`) because the warmup-only postcondition
+/// in `lib.rs` calls it directly to apply the same SM filter as the
+/// per-worker prewarm path.
+pub(crate) fn count_engine_files_for_sm(dir: &Path, sm: Option<&str>) -> usize {
+    engine_files_for_sm(dir, sm).len()
+}
+
+/// Counts every `.engine` file in `dir` regardless of `_smXX` suffix.
+///
+/// Backwards-compatible wrapper around [`count_engine_files_for_sm`] with
+/// `sm = None`. Retained because the operator-visible startup cache log
+/// (`trt cache: found cached engines` in [`log_cache_state`]) reports the
+/// total disk footprint, not the SM-filtered subset. Callers that drive
+/// the prewarm postcondition use the SM-aware variant directly.
+pub(super) fn count_engine_files(dir: &Path) -> usize {
+    count_engine_files_for_sm(dir, None)
+}
+
+/// Returns sorted basenames of `.engine` files under `engine_dir` that match
+/// the requested SM, or all `.engine` basenames when `sm` is `None`.
+///
+/// Used for operator-visible logs before TRT prewarm; filenames are **not**
+/// a reliable `(batch, seq)` key for dynamic models (see `CLAUDE.md`).
+pub(crate) fn engine_basenames_for_sm(
+    engine_dir: &Path,
+    sm: Option<&str>,
+) -> std::io::Result<Vec<String>> {
+    // We re-implement the read instead of delegating to `engine_files_for_sm`
+    // because the latter swallows I/O errors (returns empty on missing dir),
+    // whereas this function needs to propagate them so the operator log can
+    // surface "could not read engine cache directory for basename listing".
     let read_dir = std::fs::read_dir(engine_dir)?;
     let mut basenames: Vec<String> = read_dir
         .flatten()
         .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
         .filter_map(|e| {
             let name = e.file_name().to_string_lossy().into_owned();
-            name.ends_with(".engine").then_some(name)
+            if !name.ends_with(".engine") {
+                return None;
+            }
+            match sm {
+                Some(target) if !matches_sm_suffix(&name, target) => None,
+                _ => Some(name),
+            }
         })
         .collect();
     basenames.sort();
     Ok(basenames)
 }
 
-/// Lists basenames of existing `.engine` files immediately before TRT prewarm.
+/// Returns sorted basenames of every `.engine` file under `engine_dir`,
+/// regardless of `_smXX` suffix.
 ///
-/// ONNX Runtime's `TensorRT` EP names engine caches from the fused subgraph id
-/// and precision (`TensorrtExecutionProvider_TRTKernel_…_fp16_smXX.engine`), not
-/// from literal `(batch, seq)` dimensions — dynamic shapes are carried in the
-/// companion `.profile`. Operators can grep `CloudWatch` for `trt prewarm: cache
-/// engine basenames` to correlate disk state with compile times; this is not
-/// used for skip logic (see `CLAUDE.md`).
-pub(crate) fn log_engine_basenames_before_prewarm(engine_dir: &Path) {
+/// Backwards-compatible wrapper around [`engine_basenames_for_sm`] with
+/// `sm = None`. Retained for the unit tests below; production prewarm log
+/// emission goes through [`log_engine_basenames_before_prewarm_for_sm`].
+pub(crate) fn engine_basenames_in_dir_sorted(engine_dir: &Path) -> std::io::Result<Vec<String>> {
+    engine_basenames_for_sm(engine_dir, None)
+}
+
+/// Lists basenames of `.engine` files immediately before TRT prewarm.
+///
+/// When `sm` is `Some("smXX")` only basenames whose `_smXX.engine` suffix
+/// matches are listed (and counted); when `None`, every `.engine` file is
+/// listed. Emits a sibling `engine_basename_total_count` field so operators
+/// reading `CloudWatch` can see the heterogeneous-SM picture at a glance —
+/// e.g. `matching=0, total=3` is the exact failure mode behind the
+/// 2026-05-16 codekeeper outage on Blackwell with stale L40S plans.
+///
+/// ONNX Runtime's `TensorRT` EP names engine caches from the fused subgraph
+/// id and precision (`TensorrtExecutionProvider_TRTKernel_…_fp16_smXX.engine`),
+/// not from literal `(batch, seq)` dimensions — dynamic shapes are carried
+/// in the companion `.profile`. Operators can grep `CloudWatch` for
+/// `trt prewarm: cache engine basenames` to correlate disk state with
+/// compile times; this is not used for skip logic (see `CLAUDE.md`).
+pub(crate) fn log_engine_basenames_before_prewarm_for_sm(engine_dir: &Path, sm: Option<&str>) {
     const MAX_LIST: usize = 64;
-    let basenames = match engine_basenames_in_dir_sorted(engine_dir) {
+    let basenames = match engine_basenames_for_sm(engine_dir, sm) {
         Ok(v) => v,
         Err(e) => {
             tracing::info!(
                 cache_path = %engine_dir.display(),
+                detected_sm = sm.unwrap_or("unfiltered"),
                 error = %e,
                 "trt prewarm: could not read engine cache directory for basename listing"
             );
@@ -377,28 +468,48 @@ pub(crate) fn log_engine_basenames_before_prewarm(engine_dir: &Path) {
         }
     };
 
-    let total = basenames.len();
+    let matching_total = basenames.len();
     let mut listed = basenames;
-    let truncated = total > MAX_LIST;
+    let truncated = matching_total > MAX_LIST;
     if truncated {
         listed.truncate(MAX_LIST);
     }
+    // Also surface the unfiltered total so heterogeneous-SM situations are
+    // obvious at a glance. When `sm` is `None` this equals `matching_total`.
+    let unfiltered_total = if sm.is_some() {
+        engine_basenames_for_sm(engine_dir, None).map_or(matching_total, |v| v.len())
+    } else {
+        matching_total
+    };
 
-    if total == 0 {
+    if matching_total == 0 {
         tracing::info!(
             cache_path = %engine_dir.display(),
+            detected_sm = sm.unwrap_or("unfiltered"),
             engine_basename_count = 0,
-            "trt prewarm: cache engine basenames (none on disk yet)"
+            engine_basename_total_count = unfiltered_total,
+            "trt prewarm: cache engine basenames (none for this SM)"
         );
     } else {
         tracing::info!(
             cache_path = %engine_dir.display(),
-            engine_basename_count = total,
+            detected_sm = sm.unwrap_or("unfiltered"),
+            engine_basename_count = matching_total,
+            engine_basename_total_count = unfiltered_total,
             truncated,
             engine_basenames = ?listed,
             "trt prewarm: cache engine basenames (for operator correlation; not shape-specific)"
         );
     }
+}
+
+/// Backwards-compatible wrapper for the unfiltered prewarm basename log.
+///
+/// Delegates to [`log_engine_basenames_before_prewarm_for_sm`] with
+/// `sm = None` — equivalent to today's behaviour for callers that have not
+/// yet been updated to pass the worker's detected SM.
+pub(crate) fn log_engine_basenames_before_prewarm(engine_dir: &Path) {
+    log_engine_basenames_before_prewarm_for_sm(engine_dir, None);
 }
 
 /// Flushes every regular file in `dir` plus the directory's own metadata to
@@ -788,6 +899,218 @@ mod tests {
             !dir.join(".write_probe").exists(),
             "stale probe must be cleaned up after a successful run"
         );
+    }
+
+    // ─── matches_sm_suffix (strict suffix match) ──────────────────────────
+
+    /// Exact-match positives for every SM in the supported fleet.
+    #[test]
+    fn matches_sm_suffix_accepts_exact_match() {
+        assert!(matches_sm_suffix(
+            "TensorrtExecutionProvider_TRTKernel_graph_a_fp16_sm89.engine",
+            "sm89"
+        ));
+        assert!(matches_sm_suffix("foo_sm75.engine", "sm75"));
+        assert!(matches_sm_suffix("foo_sm86.engine", "sm86"));
+        assert!(matches_sm_suffix("foo_sm120.engine", "sm120"));
+    }
+
+    /// CRITICAL regression guard: requesting `sm12` MUST NOT match a
+    /// `_sm120.engine` plan. The 2026-05-16 outage hinged on accidentally
+    /// counting Blackwell plans as "the cache is warm for sm12" or vice
+    /// versa. Anchoring on `_sm{XX}.engine` is the only safe match shape.
+    #[test]
+    fn matches_sm_suffix_rejects_prefix_collision() {
+        assert!(!matches_sm_suffix("foo_sm120.engine", "sm12"));
+        assert!(!matches_sm_suffix("foo_sm89.engine", "sm8"));
+        assert!(!matches_sm_suffix("foo_sm890.engine", "sm89"));
+        assert!(!matches_sm_suffix("foo_sm121.engine", "sm12"));
+    }
+
+    /// Different SMs in the cache must not cross-match.
+    #[test]
+    fn matches_sm_suffix_rejects_different_sm() {
+        assert!(!matches_sm_suffix("foo_sm89.engine", "sm120"));
+        assert!(!matches_sm_suffix("foo_sm120.engine", "sm89"));
+        assert!(!matches_sm_suffix("foo_sm75.engine", "sm86"));
+    }
+
+    /// `.profile` sidecars share the prefix but the function must not
+    /// accept them — only `.engine` files are valid TRT plans.
+    #[test]
+    fn matches_sm_suffix_rejects_non_engine_extension() {
+        assert!(!matches_sm_suffix("foo_sm89.profile", "sm89"));
+        assert!(!matches_sm_suffix("foo_sm89.txt", "sm89"));
+    }
+
+    /// Files without the leading underscore (unlikely but defensive)
+    /// must not match — the underscore is what disambiguates `_sm12` from
+    /// `_sm120`.
+    #[test]
+    fn matches_sm_suffix_requires_leading_underscore() {
+        assert!(!matches_sm_suffix("sm89.engine", "sm89"));
+        assert!(!matches_sm_suffix("xsm89.engine", "sm89"));
+    }
+
+    // ─── engine_files_for_sm (heterogeneous-cache filtering) ──────────────
+
+    /// **The exact production scenario** from the 2026-05-16 codekeeper outage.
+    /// Cache contains plans for three SMs (`sm86`, `sm89`, `sm120`); a worker
+    /// on a Blackwell GPU (`sm120`) asks for its own SM and must see exactly
+    /// one entry — not three. The pre-fix bookkeeping counted all three and
+    /// reported `cache_hit:true, engine_count_before:3` even though only the
+    /// `sm120` plan was usable.
+    #[test]
+    fn engine_files_for_sm_isolates_blackwell_from_heterogeneous_cache() {
+        let tmp = TempDir::new().expect("tempdir");
+        let dir = tmp.path().join("trt-engines");
+        fs::create_dir_all(&dir).unwrap();
+        // The exact production filename shape per CloudWatch evidence.
+        fs::write(
+            dir.join("TensorrtExecutionProvider_TRTKernel_subgraph_fp16_sm86.engine"),
+            b"a10g",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("TensorrtExecutionProvider_TRTKernel_subgraph_fp16_sm89.engine"),
+            b"l40s",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("TensorrtExecutionProvider_TRTKernel_subgraph_fp16_sm120.engine"),
+            b"blackwell",
+        )
+        .unwrap();
+
+        let sm120 = engine_files_for_sm(&dir, Some("sm120"));
+        assert_eq!(sm120.len(), 1, "sm120 worker must see exactly 1 plan");
+        let sm89 = engine_files_for_sm(&dir, Some("sm89"));
+        assert_eq!(sm89.len(), 1, "sm89 worker must see exactly 1 plan");
+        let unfiltered = engine_files_for_sm(&dir, None);
+        assert_eq!(unfiltered.len(), 3, "None passthrough must see all 3");
+
+        // Sibling SM check: an SM that is not present on disk must return
+        // empty — this is the fresh-deploy / stale-cache failure mode the
+        // postcondition is meant to surface as `cache_hit:false`.
+        let sm75 = engine_files_for_sm(&dir, Some("sm75"));
+        assert!(sm75.is_empty(), "sm75 (no plan) must return empty");
+    }
+
+    /// `None` SM acts as a passthrough (today's behaviour), counting every
+    /// `.engine` file regardless of suffix. Pinned so a future refactor
+    /// cannot accidentally introduce a filter-on-None regression.
+    #[test]
+    fn engine_files_for_sm_none_passthrough_matches_legacy() {
+        let tmp = TempDir::new().expect("tempdir");
+        let dir = tmp.path().join("trt-engines");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("a_sm89.engine"), b"x").unwrap();
+        fs::write(dir.join("b_sm120.engine"), b"y").unwrap();
+        fs::write(dir.join("c.profile"), b"z").unwrap();
+        fs::write(dir.join("d.txt"), b"w").unwrap();
+
+        let all = engine_files_for_sm(&dir, None);
+        assert_eq!(
+            all.len(),
+            2,
+            "None must return every .engine, ignoring .profile/.txt"
+        );
+        assert_eq!(count_engine_files(&dir), 2);
+        assert_eq!(count_engine_files_for_sm(&dir, None), 2);
+    }
+
+    /// Missing cache directory collapses to an empty Vec — the same shape
+    /// as the legacy `count_engine_files` fallback. Required so the prewarm
+    /// path can call this on a cold-boot worker without error handling.
+    #[test]
+    fn engine_files_for_sm_missing_directory_returns_empty() {
+        let tmp = TempDir::new().expect("tempdir");
+        let missing = tmp.path().join("never-created");
+        assert!(engine_files_for_sm(&missing, Some("sm120")).is_empty());
+        assert!(engine_files_for_sm(&missing, None).is_empty());
+        assert_eq!(count_engine_files_for_sm(&missing, Some("sm120")), 0);
+    }
+
+    /// Empty cache directory returns empty for every SM.
+    #[test]
+    fn engine_files_for_sm_empty_directory_returns_empty() {
+        let tmp = TempDir::new().expect("tempdir");
+        let dir = tmp.path().join("trt-engines");
+        fs::create_dir_all(&dir).unwrap();
+        assert!(engine_files_for_sm(&dir, Some("sm120")).is_empty());
+        assert!(engine_files_for_sm(&dir, None).is_empty());
+    }
+
+    /// `.profile` sibling files (TRT input-shape profiles) MUST be ignored
+    /// by every engine enumerator. We retain them on disk for diagnostic
+    /// purposes (counted under `profile_count` in [`TrtCacheInfo`]) but
+    /// they are never engine plans and must not be returned here.
+    #[test]
+    fn engine_files_for_sm_ignores_profile_sidecars() {
+        let tmp = TempDir::new().expect("tempdir");
+        let dir = tmp.path().join("trt-engines");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("foo_sm120.engine"), b"plan").unwrap();
+        fs::write(dir.join("foo_sm120.profile"), b"shapes").unwrap();
+
+        let sm120 = engine_files_for_sm(&dir, Some("sm120"));
+        assert_eq!(sm120.len(), 1);
+        assert!(sm120[0].to_string_lossy().ends_with(".engine"));
+    }
+
+    /// Subdirectories and non-file entries must be skipped. Defensive
+    /// against future cache layouts that add per-shape subdirs.
+    #[test]
+    fn engine_files_for_sm_skips_non_files() {
+        let tmp = TempDir::new().expect("tempdir");
+        let dir = tmp.path().join("trt-engines");
+        fs::create_dir_all(&dir).unwrap();
+        fs::create_dir_all(dir.join("subdir_sm120.engine")).unwrap();
+        fs::write(dir.join("real_sm120.engine"), b"plan").unwrap();
+
+        let files = engine_files_for_sm(&dir, Some("sm120"));
+        assert_eq!(files.len(), 1, "subdir named *.engine must not be counted");
+    }
+
+    // ─── engine_basenames_for_sm (sorted, SM-aware) ───────────────────────
+
+    /// SM filter returns only matching basenames, sorted. The unfiltered
+    /// case returns every `.engine` basename, sorted (backward compat with
+    /// [`engine_basenames_in_dir_sorted`]).
+    #[test]
+    fn engine_basenames_for_sm_sorted_and_filtered() {
+        let tmp = TempDir::new().expect("tempdir");
+        let dir = tmp.path().join("trt-engines");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("z_sm120.engine"), b"").unwrap();
+        fs::write(dir.join("a_sm120.engine"), b"").unwrap();
+        fs::write(dir.join("m_sm89.engine"), b"").unwrap();
+
+        let sm120 = engine_basenames_for_sm(&dir, Some("sm120")).unwrap();
+        assert_eq!(
+            sm120,
+            vec!["a_sm120.engine".to_string(), "z_sm120.engine".to_string()]
+        );
+        let unfiltered = engine_basenames_for_sm(&dir, None).unwrap();
+        assert_eq!(
+            unfiltered,
+            vec![
+                "a_sm120.engine".to_string(),
+                "m_sm89.engine".to_string(),
+                "z_sm120.engine".to_string(),
+            ]
+        );
+    }
+
+    /// Missing directory propagates as `Err` (so the operator log can
+    /// surface the I/O error path). Pinned because `engine_files_for_sm`
+    /// swallows it — the two have different error-handling contracts.
+    #[test]
+    fn engine_basenames_for_sm_missing_directory_errors() {
+        let tmp = TempDir::new().expect("tempdir");
+        let missing = tmp.path().join("nope");
+        assert!(engine_basenames_for_sm(&missing, Some("sm120")).is_err());
+        assert!(engine_basenames_for_sm(&missing, None).is_err());
     }
 
     /// On Linux only: a directory with `0o555` (read+execute, no write)

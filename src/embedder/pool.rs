@@ -29,6 +29,9 @@ use super::types::{DualEmbedding, EmbedRequest, EmbedStats, ProbeResult, SparseE
 use super::worker::{run_worker, WorkerConfig};
 use crate::config::EpSelection;
 
+/// Sender half of the engine propagation broadcast channel.
+type PropTx = tokio::sync::broadcast::Sender<(usize, usize)>;
+
 /// Awaits worker `id`'s readiness signal, but also resolves immediately if the
 /// worker's `JoinHandle` finishes before signaling readiness.
 ///
@@ -102,9 +105,32 @@ pub struct EmbedPool {
     /// budget. Returns `0` on non-Linux targets where RSS measurement is
     /// unavailable, or before the init task has completed.
     model_rss_per_worker_bytes: Arc<AtomicUsize>,
+    /// Broadcast sender for cross-worker TRT engine cache propagation.
+    ///
+    /// When `Some`, after any worker writes a new engine plan to EFS, a
+    /// `(batch, seq)` shape notification is broadcast to every subscribed
+    /// worker so they eagerly run `trt_prewarm` (~1-3s fast disk-load) instead
+    /// of paying full JIT cost on the next real request. `None` when
+    /// `BGE_M3_ENGINE_PROPAGATION_ENABLED=0`.
+    engine_propagation_tx: Option<PropTx>,
 }
 
 impl EmbedPool {
+    /// Broadcasts a `(batch, seq)` shape notification to all subscribed peer
+    /// workers, signaling that the TRT engine plan for this shape is now on EFS.
+    ///
+    /// Workers receive the notification in their main loop drain and run
+    /// `trt_prewarm` against their own session for a ~1-3s fast disk-load
+    /// rather than paying full JIT cost on the next real request for this shape.
+    ///
+    /// `send` returns `Err` only when there are zero subscribers (all workers
+    /// gone). This is non-fatal; the engine plan is still on EFS.
+    pub fn broadcast_engine_ready(&self, shape: (usize, usize)) {
+        if let Some(tx) = &self.engine_propagation_tx {
+            let _ = tx.send(shape);
+        }
+    }
+
     /// Spawns `n` embedding worker threads and returns the pool plus an init
     /// handle that resolves once all workers have finished loading their models.
     ///
@@ -137,6 +163,14 @@ impl EmbedPool {
         let capacity = n * 4;
         let (tx, rx) = mpsc::channel::<EmbedRequest>(capacity);
         let rx = Arc::new(Mutex::new(rx));
+
+        // The engine propagation broadcast channel is created by the caller
+        // (lib.rs) and passed in via config.engine_propagation_tx. Some(tx)
+        // means propagation is enabled; None means disabled. This eliminates
+        // the redundant engine_propagation_enabled bool (ARC-5).
+        let engine_propagation_tx_for_pool = config.engine_propagation_tx.clone();
+        // Clone for capture into the async init task (used by make_worker_config).
+        let engine_propagation_tx_for_init = config.engine_propagation_tx.clone();
 
         // Channel carries Result<usize> where the Ok variant is the RSS delta
         // (bytes) measured by each worker around load_models().
@@ -184,6 +218,12 @@ impl EmbedPool {
                     let mut wc = config.clone();
                     wc.device_id =
                         u32::try_from(id).unwrap_or(0) % u32::try_from(gpu_count).unwrap_or(1);
+                    // engine_propagation_tx is inherited from config.clone() for
+                    // disabled (None) workers. For enabled workers, re-clone from
+                    // the init-task's captured sender so each worker's tx clone
+                    // shares the same underlying channel.
+                    wc.engine_propagation_tx
+                        .clone_from(&engine_propagation_tx_for_init);
                     if config.ep == EpSelection::TensorRt
                         && n > 1
                         && !config.trt_warmup_shapes.is_empty()
@@ -267,6 +307,7 @@ impl EmbedPool {
                 live_workers,
                 loaded_workers,
                 model_rss_per_worker_bytes,
+                engine_propagation_tx: engine_propagation_tx_for_pool,
             },
             init_handle,
         )
@@ -389,6 +430,27 @@ impl EmbedPool {
         self.model_rss_per_worker_bytes.load(Ordering::Acquire)
     }
 
+    /// Sends an adaptive warmup request to an available worker.
+    ///
+    /// The worker calls `trt_prewarm` for `(batch, seq)` and replies on `ack`
+    /// with the compile duration in milliseconds, or an error on failure.
+    /// On non-TRT workers the reply is `Ok(0)` immediately.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err(())` if the worker channel has closed (pool shut down).
+    pub async fn send_adaptive_warmup(
+        &self,
+        batch: usize,
+        seq: usize,
+        ack: tokio::sync::oneshot::Sender<anyhow::Result<u64>>,
+    ) -> Result<(), ()> {
+        self.tx
+            .send(EmbedRequest::AdaptiveWarmup { batch, seq, ack })
+            .await
+            .map_err(|_| ())
+    }
+
     /// Returns a clone of the `Arc<AtomicUsize>` backing `live_worker_count`.
     ///
     /// Used by the warmup-only path in `lib.rs` to poll worker exit progress
@@ -420,6 +482,7 @@ impl EmbedPool {
             live_workers: Arc::new(AtomicUsize::new(0)),
             loaded_workers: Arc::new(AtomicUsize::new(0)),
             model_rss_per_worker_bytes: Arc::new(AtomicUsize::new(0)),
+            engine_propagation_tx: None,
         }
     }
 
@@ -461,6 +524,9 @@ impl EmbedPool {
                             rss_after: 0,
                         }));
                     }
+                    EmbedRequest::AdaptiveWarmup { ack, .. } => {
+                        let _ = ack.send(Ok(0));
+                    }
                 }
             }
         });
@@ -469,6 +535,7 @@ impl EmbedPool {
             live_workers: Arc::new(AtomicUsize::new(1)),
             loaded_workers: Arc::new(AtomicUsize::new(1)),
             model_rss_per_worker_bytes: Arc::new(AtomicUsize::new(0)),
+            engine_propagation_tx: None,
         }
     }
 
@@ -479,6 +546,94 @@ impl EmbedPool {
             live_workers: Arc::new(AtomicUsize::new(1)),
             loaded_workers: Arc::new(AtomicUsize::new(0)),
             model_rss_per_worker_bytes: Arc::new(AtomicUsize::new(0)),
+            engine_propagation_tx: None,
+        }
+    }
+
+    /// Creates an [`EmbedPool`] whose `queue_depth()` reports `1`.
+    ///
+    /// The channel is pre-filled with one dummy request before the receiver is
+    /// handed off to a background holder task, so `queue_depth()` returns `1`
+    /// for the lifetime of the pool.  Only valid inside a tokio test context.
+    pub(crate) fn busy_for_test() -> Self {
+        let (tx, rx) = mpsc::channel::<EmbedRequest>(1);
+        // Fill the single slot while the receiver is still in scope.
+        let (reply_tx, _) = tokio::sync::oneshot::channel();
+        let _ = tx.try_send(EmbedRequest::Dense {
+            texts: vec![],
+            reply: reply_tx,
+        });
+        // Hold the receiver alive so the channel is not disconnected.
+        tokio::spawn(async move {
+            let _rx = rx;
+            std::future::pending::<()>().await;
+        });
+        Self {
+            tx,
+            live_workers: Arc::new(AtomicUsize::new(1)),
+            loaded_workers: Arc::new(AtomicUsize::new(1)),
+            model_rss_per_worker_bytes: Arc::new(AtomicUsize::new(0)),
+            engine_propagation_tx: None,
+        }
+    }
+
+    /// Creates an [`EmbedPool`] backed by `with_fixed_responses` with the
+    /// provided broadcast sender wired in.
+    ///
+    /// Used by propagation tests that need to verify `broadcast_engine_ready`
+    /// without spawning real workers.
+    pub(crate) fn for_propagation_test(
+        dense_fixture: Vec<Vec<f32>>,
+        sparse_fixture: Vec<SparseEmbedding>,
+        engine_tx: PropTx,
+    ) -> Self {
+        let pool = Self::with_fixed_responses(dense_fixture, sparse_fixture);
+        Self {
+            tx: pool.tx,
+            live_workers: pool.live_workers,
+            loaded_workers: pool.loaded_workers,
+            model_rss_per_worker_bytes: pool.model_rss_per_worker_bytes,
+            engine_propagation_tx: Some(engine_tx),
+        }
+    }
+
+    /// Creates an [`EmbedPool`] where `AdaptiveWarmup` returns `Ok(compile_ms)`
+    /// with a non-zero value (simulating a TRT worker that compiled an engine).
+    ///
+    /// Used by broadcast tests that need to verify `broadcast_engine_ready` IS
+    /// called when `compile_ms > 0` (i.e. a real TRT compile occurred).
+    pub(crate) fn for_trt_propagation_test(engine_tx: PropTx, compile_ms: u64) -> Self {
+        let (tx, mut rx) = mpsc::channel::<EmbedRequest>(8);
+        tokio::spawn(async move {
+            while let Some(req) = rx.recv().await {
+                match req {
+                    EmbedRequest::AdaptiveWarmup { ack, .. } => {
+                        let _ = ack.send(Ok(compile_ms));
+                    }
+                    EmbedRequest::Dense { reply, .. } => {
+                        let _ = reply.send(Ok((vec![], EmbedStats::default())));
+                    }
+                    EmbedRequest::Sparse { reply, .. } => {
+                        let _ = reply.send(Ok((vec![], EmbedStats::default())));
+                    }
+                    EmbedRequest::Both { reply, .. } => {
+                        let _ = reply.send(Ok((vec![], EmbedStats::default())));
+                    }
+                    EmbedRequest::Probe { reply, .. } => {
+                        let _ = reply.send(Ok(ProbeResult {
+                            rss_before: 0,
+                            rss_after: 0,
+                        }));
+                    }
+                }
+            }
+        });
+        Self {
+            tx,
+            live_workers: Arc::new(AtomicUsize::new(1)),
+            loaded_workers: Arc::new(AtomicUsize::new(1)),
+            model_rss_per_worker_bytes: Arc::new(AtomicUsize::new(0)),
+            engine_propagation_tx: Some(engine_tx),
         }
     }
 
@@ -493,3 +648,23 @@ impl EmbedPool {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod adaptive_warmup_tests {
+    use super::*;
+
+    /// `send_adaptive_warmup` must return `Err(())` when the channel receiver
+    /// has been dropped (pool shut down).  `closed_for_test()` drops the
+    /// receiver immediately after channel creation, so the very first send
+    /// observes a closed channel.
+    #[tokio::test]
+    async fn send_adaptive_warmup_returns_err_when_channel_closed() {
+        let pool = EmbedPool::closed_for_test();
+        let (ack_tx, _ack_rx) = oneshot::channel();
+        let result = pool.send_adaptive_warmup(1, 128, ack_tx).await;
+        assert!(
+            result.is_err(),
+            "send_adaptive_warmup must return Err(()) when channel is closed"
+        );
+    }
+}

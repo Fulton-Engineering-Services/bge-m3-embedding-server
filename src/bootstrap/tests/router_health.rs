@@ -31,7 +31,7 @@ use crate::state::{AppState, ProbeStatus};
 
 #[tokio::test]
 async fn router_health_returns_503_when_not_ready() {
-    let app = build_router(make_test_state(false, 256));
+    let app = build_router(make_test_state(false, 256), 33_554_432);
     let req = Request::builder()
         .method("GET")
         .uri("/health")
@@ -51,19 +51,22 @@ async fn router_health_returns_503_when_not_ready() {
 
 #[tokio::test]
 async fn router_health_returns_200_idle_when_models_unloaded() {
-    let app = build_router(Arc::new(AppState {
-        pool: EmbedPool::idle_for_test(),
-        ready: AtomicBool::new(true),
-        max_batch: 256,
-        total_workers: 1,
-        max_seq_length: 8192,
-        tuning: std::sync::OnceLock::new(),
-        cost_model: Arc::new(ArcSwap::from_pointee(CostModel::conservative(
-            CostModel::DEFAULT_MAX_WORKSPACE,
-        ))),
-        probe_status: AtomicU8::new(ProbeStatus::Disabled as u8),
-        request_permits: Arc::new(Semaphore::new(usize::MAX >> 3)),
-    }));
+    let app = build_router(
+        Arc::new(AppState {
+            pool: EmbedPool::idle_for_test(),
+            ready: AtomicBool::new(true),
+            max_batch: 256,
+            total_workers: 1,
+            max_seq_length: 8192,
+            tuning: std::sync::OnceLock::new(),
+            cost_model: Arc::new(ArcSwap::from_pointee(CostModel::conservative(
+                CostModel::DEFAULT_MAX_WORKSPACE,
+            ))),
+            probe_status: AtomicU8::new(ProbeStatus::Disabled as u8),
+            request_permits: Arc::new(Semaphore::new(usize::MAX >> 3)),
+        }),
+        33_554_432,
+    );
     let req = Request::builder()
         .method("GET")
         .uri("/health")
@@ -83,7 +86,7 @@ async fn router_health_returns_200_idle_when_models_unloaded() {
 
 #[tokio::test]
 async fn router_health_returns_503_when_pool_dead() {
-    let app = build_router(make_test_state(true, 256));
+    let app = build_router(make_test_state(true, 256), 33_554_432);
     let req = Request::builder()
         .method("GET")
         .uri("/health")

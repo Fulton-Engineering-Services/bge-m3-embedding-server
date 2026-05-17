@@ -80,7 +80,24 @@ pub(crate) enum EmbedRequest {
         texts: Vec<String>,
         reply: oneshot::Sender<Result<ProbeResult>>,
     },
+    /// Adaptive background warmup: asks a worker to compile (or confirm as
+    /// cached) the TRT engine for `(batch, seq)`.  The worker replies on
+    /// `ack` with the compile duration in milliseconds, or an error if the
+    /// shape failed.  Only meaningful on TRT EP; on CPU/CUDA workers the
+    /// worker returns `Ok(0)` immediately.
+    AdaptiveWarmup {
+        batch: usize,
+        seq: usize,
+        ack: oneshot::Sender<anyhow::Result<u64>>,
+    },
 }
+
+/// Sender half of the JIT-suspect channel.
+///
+/// Workers hold an optional clone of this sender and call `try_send`
+/// (non-blocking, drops if full) after any inference whose `inference_ms`
+/// equals or exceeds the TRT cache-hit threshold.
+pub(crate) type JitSuspectSender = tokio::sync::mpsc::Sender<(usize, usize)>;
 
 /// Result of a single probe `session.run()` call.
 pub(crate) struct ProbeResult {

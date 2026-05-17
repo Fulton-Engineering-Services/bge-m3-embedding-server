@@ -46,7 +46,6 @@ use crate::state::AppState;
         tokenize_ms,
         inference_ms,
         total_ms,
-        x_headers = tracing::field::Empty
     )
 )]
 pub async fn dense_embeddings(
@@ -56,12 +55,6 @@ pub async fn dense_embeddings(
 ) -> Result<Json<DenseResponse>, AppError> {
     check_ready(&state)?;
     let x_headers = collect_x_headers(&headers);
-    if !x_headers.is_empty() {
-        tracing::Span::current().record(
-            "x_headers",
-            tracing::field::display(serde_json::to_string(&x_headers).unwrap_or_default()),
-        );
-    }
     let texts = req.input.0;
     drop(req.model);
     validate_input(&texts, state.max_batch)?;
@@ -89,6 +82,12 @@ pub async fn dense_embeddings(
         .record("tokenize_ms", embed_stats.tokenize_ms)
         .record("inference_ms", embed_stats.inference_ms)
         .record("total_ms", total_ms);
+    // x_headers (normalized: hyphens → underscores) are emitted at event level so
+    // they appear under $.fields.x_headers in JSON logs and are accessible to
+    // downstream log processors. Each caller-supplied X-* header is included
+    // generically; no header name is special-cased here.
+    let x_headers_val =
+        (!x_headers.is_empty()).then(|| serde_json::to_string(&x_headers).unwrap_or_default());
     tracing::info!(
         route = "dense",
         batch_size,
@@ -99,6 +98,7 @@ pub async fn dense_embeddings(
         tokenize_ms = embed_stats.tokenize_ms,
         inference_ms = embed_stats.inference_ms,
         total_ms,
+        x_headers = x_headers_val,
         "embedding request complete"
     );
 

@@ -54,7 +54,8 @@ use tracing::info;
 use crate::binpack::CostModel;
 use crate::bootstrap::{build_router, run_readiness_probe};
 use crate::config::{Config, EpSelection};
-use crate::embedder::{EmbedPool, WorkerConfig};
+use crate::embedder::adaptive_warmup::AdaptiveWarmupConfig;
+use crate::embedder::{EmbedPool, JitSuspectSender, WorkerConfig};
 use crate::gpu_stats::GpuStatsCollector;
 use crate::state::{AppState, ProbeStatus};
 
@@ -172,6 +173,40 @@ pub async fn run() -> anyhow::Result<()> {
     let initial_permits = cfg.workers.saturating_sub(1).max(1);
     let request_permits = Arc::new(Semaphore::new(initial_permits));
 
+    // Pre-create the JIT-suspect channel so the sender half can be placed in
+    // WorkerConfig before the pool is spawned.  The receiver half is passed to
+    // `spawn_adaptive_warmup` after the pool is created.  When adaptive warmup
+    // is disabled the sender is dropped immediately (workers hold `None`).
+    let (jit_suspect_tx, jit_suspect_rx): (
+        Option<JitSuspectSender>,
+        Option<tokio::sync::mpsc::Receiver<(usize, usize)>>,
+    ) = if cfg.adaptive_warmup_enabled && cfg.ep == EpSelection::TensorRt {
+        let (tx, rx) = tokio::sync::mpsc::channel::<(usize, usize)>(64);
+        (Some(tx), Some(rx))
+    } else {
+        if cfg.adaptive_warmup_enabled {
+            tracing::warn!(
+                ep = %cfg.ep,
+                "BGE_M3_ADAPTIVE_WARMUP_ENABLED=1 has no effect when the execution \
+                 provider is not TensorRT — adaptive warmup only compiles TRT engine \
+                 files. Set BGE_M3_EP=tensorrt or unset BGE_M3_ADAPTIVE_WARMUP_ENABLED."
+            );
+        }
+        (None, None)
+    };
+
+    // Create the engine propagation broadcast channel when enabled.
+    // Using Some(tx) vs None lets EmbedPool::spawn determine enabled status
+    // from the WorkerConfig without an additional bool field (ARC-5).
+    // The initial receiver from channel() is dropped immediately; each worker
+    // subscribes its own via tx.subscribe() inside run_worker.
+    let engine_propagation_tx = if cfg.engine_propagation_enabled {
+        let (tx, _initial_rx) = tokio::sync::broadcast::channel::<(usize, usize)>(32);
+        Some(tx)
+    } else {
+        None
+    };
+
     let (pool, init_handle) = EmbedPool::spawn(
         cfg.workers,
         PathBuf::from(&cfg.cache_dir),
@@ -187,6 +222,13 @@ pub async fn run() -> anyhow::Result<()> {
             // the initial value here is a harmless placeholder.
             device_id: 0,
             gpu_count: cfg.gpu_count,
+            trt_max_workspace_bytes: cfg.trt_max_workspace_bytes,
+            gpu_mem_limit_bytes: cfg.gpu_mem_limit_bytes,
+            jit_suspect_tx,
+            engine_propagation_tx,
+            prewarm_strict: cfg.prewarm_strict,
+            #[cfg(feature = "cache-gc")]
+            trt_cache_gc_enabled: cfg.trt_cache_gc_enabled,
         },
     );
 
@@ -259,26 +301,80 @@ pub async fn run() -> anyhow::Result<()> {
 
         let trt_info = crate::embedder::trt_cache::ensure_and_inspect(&cache_dir_path);
 
-        if warmup_postcondition_failed(cfg.ep, trt_info.engine_count) {
+        // Detect SM for device 0 so the postcondition check counts only
+        // plans usable by this host's GPUs, not stale `_smXX.engine` plans
+        // left over on EFS from a previous instance family. Without this,
+        // a fresh sm120 (Blackwell) deploy with a leftover sm89 (L40S)
+        // plan would exit 0 even when zero usable plans were produced —
+        // hiding the persistence failure behind the stale total count.
+        //
+        // `gpu_count` is assumed homogeneous (per `CLAUDE.md`: ASGs must
+        // share an instance family when reusing an EFS cache), so device 0
+        // is a sound representative for the whole pool.
+        let detected_sm: Option<String> = if cfg.ep == EpSelection::TensorRt {
+            crate::embedder::sm_detect::detect_sm_for_device(0)
+        } else {
+            None
+        };
+        let matching_engine_count = crate::embedder::trt_cache::count_engine_files_for_sm(
+            &engine_cache_dir,
+            detected_sm.as_deref(),
+        );
+        info!(
+            target: "bge_m3_embedding_server::trt_cache",
+            ep = %cfg.ep,
+            device_id = 0,
+            detected_sm = detected_sm.as_deref().unwrap_or("unfiltered"),
+            cache_path = %engine_cache_dir.display(),
+            matching_engine_count,
+            total_engine_count = trt_info.engine_count,
+            "trt cache: SM-filtered engine plan enumeration (warmup-only mode)"
+        );
+
+        if warmup_postcondition_failed(cfg.ep, matching_engine_count) {
             tracing::error!(
-                engine_count = trt_info.engine_count,
+                matching_engine_count,
+                total_engine_count = trt_info.engine_count,
+                detected_sm = detected_sm.as_deref().unwrap_or("unfiltered"),
                 cache_path = %trt_info.path.display(),
                 ep = %cfg.ep,
                 "warmup-only postcondition failed: compile-success events \
-                 present but no .engine files on disk; check TRT EP \
-                 construction, EFS mount, and engine cache path resolution"
+                 present but no .engine files matching this host's SM on disk; \
+                 check TRT EP construction, EFS mount, engine cache path resolution, \
+                 and that the warmup container ran on the same GPU family as the \
+                 serving fleet"
             );
             std::process::exit(WARMUP_POSTCONDITION_FAILED_EXIT_CODE);
         }
 
         info!(
-            engine_count = trt_info.engine_count,
+            matching_engine_count,
+            total_engine_count = trt_info.engine_count,
             profile_count = trt_info.profile_count,
+            detected_sm = detected_sm.as_deref().unwrap_or("unfiltered"),
             cache_path = %trt_info.path.display(),
             ep = %cfg.ep,
             "warmup-only mode: all TRT engines compiled and cached, exiting"
         );
         return Ok(());
+    }
+
+    // Spawn the adaptive warmup background task if enabled.  A clone of the
+    // pool is sufficient — `EmbedPool` is `Clone` (all fields are
+    // reference-counted).  The warmup-only mode does not use adaptive warmup
+    // (TRT engines are compiled synchronously during startup).
+    if let Some(rx) = jit_suspect_rx {
+        let adaptive_cfg = AdaptiveWarmupConfig {
+            enabled: cfg.adaptive_warmup_enabled,
+            quiet_secs: cfg.adaptive_warmup_quiet_secs,
+            max_shapes_per_hour: cfg.adaptive_warmup_max_shapes_per_hour,
+        };
+        crate::embedder::adaptive_warmup::spawn_adaptive_warmup(adaptive_cfg, pool.clone(), rx);
+        info!(
+            quiet_secs = cfg.adaptive_warmup_quiet_secs,
+            max_shapes_per_hour = cfg.adaptive_warmup_max_shapes_per_hour,
+            "adaptive warmup task spawned"
+        );
     }
 
     let state = Arc::new(AppState {
@@ -293,7 +389,7 @@ pub async fn run() -> anyhow::Result<()> {
         request_permits,
     });
 
-    let app = build_router(Arc::clone(&state));
+    let app = build_router(Arc::clone(&state), cfg.max_body_bytes);
 
     let listener = tokio::net::TcpListener::bind(&cfg.bind_addr).await?;
     info!(bind = %cfg.bind_addr, "Listening");

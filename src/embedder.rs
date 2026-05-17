@@ -20,16 +20,24 @@
 //! - `model_files`: hf-hub download / cache layout for the ONNX model files.
 //! - `tokenize`: tokenizer load + no-pad tokenization + chunk-array build.
 //! - `session`: ORT execution-provider config and session loading.
+//! - `sm_detect`: per-device GPU compute-capability detection (`smXY`) used
+//!   to filter the TRT engine cache by the worker's own SM.
 //! - `math`: pure dense/sparse math helpers (testable without ORT).
 //! - `dense`: dense embedding pipeline.
 //! - `sparse`: BGE-M3 SPLADE-style sparse embedding pipeline.
 //! - `dual`: paired dense + sparse embedding pipeline (one forward pass).
 //! - `trt_cache`: `TensorRT` engine-cache path construction, inspection, and
 //!   durability (fsync after compile).
+//! - `trt_cache_gc` (feature `cache-gc`, off by default): destructive
+//!   stale-SM engine plan garbage collection — only present in dedicated
+//!   maintenance / dev binaries.
 //! - `trt_warmup`: `TensorRT` engine pre-warming during worker startup.
 //! - `worker`: blocking worker thread, request dispatch, probe wiring.
 //! - `pool`: `EmbedPool` async wrapper and test helpers.
+//! - `adaptive_warmup`: adaptive in-process background warmup loop for TRT
+//!   engine cache miss recovery.
 
+pub(crate) mod adaptive_warmup;
 mod dense;
 mod dual;
 mod error;
@@ -37,15 +45,18 @@ mod math;
 mod model_files;
 mod pool;
 mod session;
+pub(crate) mod sm_detect;
 mod sparse;
 mod tokenize;
 pub(crate) mod trt_cache;
+#[cfg(feature = "cache-gc")]
+pub(crate) mod trt_cache_gc;
 mod trt_warmup;
 mod types;
 mod worker;
 
 pub use pool::EmbedPool;
-pub(crate) use types::OS_HEADROOM_BYTES;
+pub(crate) use types::{JitSuspectSender, OS_HEADROOM_BYTES};
 pub(crate) use worker::WorkerConfig;
 
 // `SparseEmbedding` is referenced by tests via `crate::embedder::SparseEmbedding`,

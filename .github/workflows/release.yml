@@ -320,7 +320,7 @@ jobs:
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
         with:
           path: /tmp/digests-cuda
-          pattern: digests-cuda-*
+          pattern: digests-cuda-amd64
           merge-multiple: true
 
       - name: Set up Docker Buildx
@@ -341,4 +341,94 @@ jobs:
           docker buildx imagetools create \
             -t "$IMAGE:${VERSION}-cuda" \
             -t "$IMAGE:latest-cuda" \
+            $(printf "$IMAGE@sha256:%s " *)
+
+  # ── CUDA cache-gc maintenance image (parallel with build-cuda) ─────────────
+  # Identical to build-cuda but compiled with --build-arg CACHE_GC_FEATURES=cache-gc.
+  # WARNING: only run this image in a controlled maintenance window against
+  # a homogeneous ASG — see Dockerfile.cuda and trt_cache_gc.rs for hazards.
+  build-cuda-cache-gc:
+    name: Build CUDA cache-gc image (amd64)
+    needs: [version]
+    if: needs.version.outputs.exists == 'false'
+    permissions:
+      contents: read
+      packages: write
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd  # v4.0.0
+
+      - name: Log in to GHCR
+        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121  # v4.1.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push CUDA cache-gc image by digest
+        id: build-cuda-cache-gc
+        uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f  # v7.1.0
+        with:
+          context: .
+          file: Dockerfile.cuda
+          platforms: linux/amd64
+          build-args: CACHE_GC_FEATURES=cache-gc
+          outputs: type=image,name=${{ env.REGISTRY }}/${{ needs.version.outputs.repo }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=linux/amd64-cuda-cache-gc
+          cache-to: type=gha,scope=linux/amd64-cuda-cache-gc,mode=max
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.version=${{ needs.version.outputs.version }}-cuda-cache-gc
+            org.opencontainers.image.revision=${{ github.sha }}
+
+      - name: Export CUDA cache-gc digest
+        run: |
+          mkdir -p /tmp/digests-cuda-cache-gc
+          digest="${{ steps.build-cuda-cache-gc.outputs.digest }}"
+          touch "/tmp/digests-cuda-cache-gc/${digest#sha256:}"
+
+      - name: Upload CUDA cache-gc digest
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: digests-cuda-cache-gc-amd64
+          path: /tmp/digests-cuda-cache-gc/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge-cuda-cache-gc:
+    name: Tag CUDA cache-gc image
+    needs: [version, build-cuda-cache-gc, release]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Download CUDA cache-gc digest
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+        with:
+          path: /tmp/digests-cuda-cache-gc
+          pattern: digests-cuda-cache-gc-amd64
+          merge-multiple: true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd  # v4.0.0
+
+      - name: Log in to GHCR
+        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121  # v4.1.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create CUDA cache-gc image manifest and push tags
+        working-directory: /tmp/digests-cuda-cache-gc
+        run: |
+          IMAGE="${{ env.REGISTRY }}/${{ needs.version.outputs.repo }}"
+          VERSION="${{ needs.version.outputs.version }}"
+          docker buildx imagetools create \
+            -t "$IMAGE:${VERSION}-cuda-cache-gc" \
+            -t "$IMAGE:latest-cuda-cache-gc" \
             $(printf "$IMAGE@sha256:%s " *)

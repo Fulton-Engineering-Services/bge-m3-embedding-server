@@ -89,6 +89,13 @@ impl std::fmt::Display for ModelVariant {
 /// Override with `BGE_M3_GPU_VRAM_BUDGET_BYTES` for GPUs with less VRAM.
 const DEFAULT_GPU_VRAM_BUDGET_BYTES: usize = 10 * 1024 * 1024 * 1024;
 
+/// Advisory upper-bound for VRAM byte values (128 GiB).
+///
+/// Current max GPU VRAM is ~96 GiB (H100 SXM). Values above this threshold
+/// almost certainly indicate a unit error (e.g. GiB instead of bytes).
+/// We warn but do not clamp, so intentional overrides still work.
+const VRAM_WARN_THRESHOLD_BYTES: usize = 128 * 1024 * 1024 * 1024;
+
 /// ONNX Runtime execution provider selection.
 ///
 /// Controlled by `BGE_M3_EP`. Defaults to [`EpSelection::Cpu`].
@@ -133,6 +140,7 @@ pub const MODEL_MAX_SEQ: usize = 8192;
 ///
 /// All fields are read once at startup via [`Config::from_env`]. Changes to
 /// environment variables after startup have no effect.
+#[allow(clippy::struct_excessive_bools)]
 pub struct Config {
     /// Path to the directory where ONNX model files are cached.
     ///
@@ -257,6 +265,50 @@ pub struct Config {
     /// Lower this on GPUs with less VRAM (e.g. `8589934592` for 8 GiB).
     pub gpu_vram_budget_bytes: Option<usize>,
 
+    /// TRT EP workspace size cap in bytes.
+    ///
+    /// Set with `BGE_M3_TRT_MAX_WORKSPACE_BYTES`. When `None`, TRT uses its
+    /// default "as large as possible" workspace — which can OOM on saturated
+    /// VRAM. Set to a value that leaves room for resident model weights and
+    /// cached engine plans (e.g. 4 GiB = `4294967296` on an L40S with 4 workers).
+    pub trt_max_workspace_bytes: Option<usize>,
+
+    /// CUDA EP device-level memory limit in bytes.
+    ///
+    /// Set with `BGE_M3_GPU_MEM_LIMIT_BYTES`. When `None`, CUDA EP uses all
+    /// available device memory. Symmetric to `trt_max_workspace_bytes`.
+    pub gpu_mem_limit_bytes: Option<usize>,
+
+    /// Enable the in-process adaptive background warmup loop.
+    ///
+    /// Set with `BGE_M3_ADAPTIVE_WARMUP_ENABLED=1`. When enabled, the server
+    /// detects unseen `(batch, seq)` shapes during live inference and compiles
+    /// TRT engines for them during idle windows.
+    pub adaptive_warmup_enabled: bool,
+
+    /// Enable cross-worker engine cache propagation via broadcast channel.
+    ///
+    /// When true, after any worker writes a new TRT engine plan to EFS (via the
+    /// `adaptive_warmup` loop or a real-inference JIT compile), a `(batch, seq)`
+    /// shape notification is broadcast to every peer worker so they eagerly run
+    /// `trt_prewarm` against their own session (~1-3s fast disk-load).
+    ///
+    /// Defaults to `adaptive_warmup_enabled`. Set `BGE_M3_ENGINE_PROPAGATION_ENABLED=0`
+    /// to disable propagation while keeping adaptive warmup active (debugging).
+    pub engine_propagation_enabled: bool,
+
+    /// Seconds the server must be idle (`queue_depth == 0`, all workers free)
+    /// before the adaptive warmup loop fires a shape.
+    ///
+    /// Set with `BGE_M3_ADAPTIVE_WARMUP_QUIET_SECS`. Default: 3.
+    pub adaptive_warmup_quiet_secs: u64,
+
+    /// Maximum number of shapes the adaptive warmup loop may compile per hour.
+    ///
+    /// Set with `BGE_M3_ADAPTIVE_WARMUP_MAX_SHAPES_PER_HOUR`. Default: 12.
+    /// Prevents pathological traffic patterns from compiling indefinitely.
+    pub adaptive_warmup_max_shapes_per_hour: u32,
+
     /// List of `(batch_size, seq_len)` shapes to pre-compile as `TensorRT` engine
     /// files during worker startup.
     ///
@@ -300,6 +352,58 @@ pub struct Config {
     /// `tensorrt` — warmup-only on CPU is a no-op (there is nothing to compile)
     /// but the server still exits 0 cleanly rather than erroring.
     pub warmup_only: bool,
+
+    /// When `true`, prewarm postcondition failures cause workers to refuse
+    /// to signal ready (the pool init handle errors out and the readiness
+    /// probe triggers a hard process exit). When `false`, postcondition
+    /// failures only log a WARN and workers still signal ready — preserving
+    /// pre-fix behaviour for debugging and operators who explicitly opt
+    /// out of fail-loud startup.
+    ///
+    /// Set with `BGE_M3_PREWARM_STRICT`. Defaults to `true`.
+    ///
+    /// The 2026-05 codekeeper outage motivated this default: every worker
+    /// on a 4× Blackwell task hit a TRT autotuner workspace OOM mid-build
+    /// (`IBuilder::buildSerializedNetwork: Error Code 10`), the postcondition
+    /// logged a WARN, `/health` returned `200 ok`, and the task served HTTP
+    /// 500 traffic on the same shape that failed prewarm. Strict-mode would
+    /// have forced an immediate task exit, which ECS retries — far better
+    /// than routing traffic to a known-broken pool.
+    pub prewarm_strict: bool,
+
+    /// Maximum HTTP request body size in bytes.
+    ///
+    /// Set with `BGE_M3_MAX_BODY_BYTES`. Defaults to `33_554_432` (32 MiB).
+    /// Raise this value when embedding large batches with long function bodies
+    /// that exceed the default limit (HTTP 413 Content Too Large).
+    pub max_body_bytes: usize,
+
+    /// When `true`, scan the TRT engine cache at worker startup and
+    /// **destructively delete** plan files whose `_smXX` suffix does not
+    /// match the current device. Sourced from `BGE_M3_TRT_CACHE_GC_ENABLED`,
+    /// defaults to `false`.
+    ///
+    /// # ⚠️ HAZARD — multi-SM ASG cache coexistence
+    ///
+    /// This field exists only when the `cache-gc` Cargo feature is
+    /// compiled in. Production binaries are built without the feature so
+    /// this field is physically absent and `BGE_M3_TRT_CACHE_GC_ENABLED`
+    /// is silently ignored.
+    ///
+    /// Even with the feature compiled in, defaulting to `false` is
+    /// deliberate: ORT's TRT EP namespaces engine plans by SM so plans
+    /// for different compute capabilities coexist safely; an ASG that
+    /// shares an EFS engine cache across instance families
+    /// (T4 / A10G / L4 / L40S / Blackwell) **relies on that coexistence**.
+    /// A binary that enables this flag against a shared multi-SM cache
+    /// will delete plans that are still in active use by peer tasks. Only
+    /// enable on a dedicated maintenance or dev binary whose cache
+    /// directory is not shared with production traffic.
+    ///
+    /// See `src/embedder/trt_cache_gc.rs` and the README section
+    /// "Stale-SM Cache GC" for the full hazard model.
+    #[cfg(feature = "cache-gc")]
+    pub trt_cache_gc_enabled: bool,
 }
 
 impl Config {
@@ -400,6 +504,80 @@ impl Config {
         let gpu_vram_budget_bytes =
             lookup("BGE_M3_GPU_VRAM_BUDGET_BYTES").and_then(|v| v.parse::<usize>().ok());
 
+        let trt_max_workspace_bytes = lookup("BGE_M3_TRT_MAX_WORKSPACE_BYTES").and_then(|v| {
+            v.parse::<usize>()
+                .inspect_err(|e| {
+                    tracing::warn!(
+                        raw = %v,
+                        error = %e,
+                        "BGE_M3_TRT_MAX_WORKSPACE_BYTES parse failed — TRT workspace cap disabled"
+                    );
+                })
+                .ok()
+                .inspect(|&bytes| {
+                    if bytes > VRAM_WARN_THRESHOLD_BYTES {
+                        tracing::warn!(
+                            bytes,
+                            threshold = VRAM_WARN_THRESHOLD_BYTES,
+                            "BGE_M3_TRT_MAX_WORKSPACE_BYTES exceeds 128 GiB — \
+                             verify units are bytes, not GiB"
+                        );
+                    }
+                })
+        });
+
+        let gpu_mem_limit_bytes = lookup("BGE_M3_GPU_MEM_LIMIT_BYTES").and_then(|v| {
+            v.parse::<usize>()
+                .inspect_err(|e| {
+                    tracing::warn!(
+                        raw = %v,
+                        error = %e,
+                        "BGE_M3_GPU_MEM_LIMIT_BYTES parse failed — CUDA memory limit disabled"
+                    );
+                })
+                .ok()
+                .inspect(|&bytes| {
+                    if bytes > VRAM_WARN_THRESHOLD_BYTES {
+                        tracing::warn!(
+                            bytes,
+                            threshold = VRAM_WARN_THRESHOLD_BYTES,
+                            "BGE_M3_GPU_MEM_LIMIT_BYTES exceeds 128 GiB — \
+                             verify units are bytes, not GiB"
+                        );
+                    }
+                })
+        });
+
+        let adaptive_warmup_enabled = lookup("BGE_M3_ADAPTIVE_WARMUP_ENABLED")
+            .is_some_and(|v| matches!(v.as_str(), "1" | "true" | "yes"));
+
+        let engine_propagation_enabled = lookup("BGE_M3_ENGINE_PROPAGATION_ENABLED")
+            .and_then(|v| match v.as_str() {
+                "0" => Some(false),
+                "1" => Some(true),
+                other => {
+                    tracing::warn!(
+                        value = other,
+                        default = adaptive_warmup_enabled,
+                        "BGE_M3_ENGINE_PROPAGATION_ENABLED: unrecognized value \
+                         (expected \"0\" or \"1\"); defaulting to \
+                         BGE_M3_ADAPTIVE_WARMUP_ENABLED ({})",
+                        adaptive_warmup_enabled
+                    );
+                    None
+                }
+            })
+            .unwrap_or(adaptive_warmup_enabled);
+
+        let adaptive_warmup_quiet_secs = lookup("BGE_M3_ADAPTIVE_WARMUP_QUIET_SECS")
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(3);
+
+        let adaptive_warmup_max_shapes_per_hour =
+            lookup("BGE_M3_ADAPTIVE_WARMUP_MAX_SHAPES_PER_HOUR")
+                .and_then(|v| v.parse::<u32>().ok())
+                .unwrap_or(12);
+
         // When a GPU EP is active, the host-RAM probe is meaningless — VRAM is
         // the constraint. Override the cost model unconditionally so the probe
         // is skipped and the VRAM budget drives bin-packing instead.
@@ -422,7 +600,29 @@ impl Config {
 
         let trt_warmup_shapes = parse_trt_warmup_shapes(lookup("BGE_M3_TRT_WARMUP_SHAPES"));
 
+        let max_body_bytes = lookup("BGE_M3_MAX_BODY_BYTES")
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(33_554_432);
+
         let warmup_only = lookup("BGE_M3_WARMUP_ONLY")
+            .is_some_and(|v| matches!(v.as_str(), "1" | "true" | "yes"));
+
+        // BGE_M3_PREWARM_STRICT: default ON. Anything that isn't an explicit
+        // disable token (`0`/`false`/`no`) leaves the safe default in place
+        // — fat-fingered values get the protective behaviour, not a silent
+        // disable.
+        let prewarm_strict = !matches!(
+            lookup("BGE_M3_PREWARM_STRICT").as_deref(),
+            Some("0" | "false" | "no")
+        );
+
+        // BGE_M3_TRT_CACHE_GC_ENABLED: strict opt-in, default OFF. Only
+        // parsed when the `cache-gc` Cargo feature is enabled — in normal
+        // production builds the env var has zero effect because the field
+        // it would populate does not exist. See the `Config::
+        // trt_cache_gc_enabled` field docs for the hazard model.
+        #[cfg(feature = "cache-gc")]
+        let trt_cache_gc_enabled = lookup("BGE_M3_TRT_CACHE_GC_ENABLED")
             .is_some_and(|v| matches!(v.as_str(), "1" | "true" | "yes"));
 
         if warmup_only && ep != EpSelection::TensorRt {
@@ -448,9 +648,19 @@ impl Config {
             heartbeat_secs,
             ep,
             gpu_vram_budget_bytes,
+            trt_max_workspace_bytes,
+            gpu_mem_limit_bytes,
+            adaptive_warmup_enabled,
+            engine_propagation_enabled,
+            adaptive_warmup_quiet_secs,
+            adaptive_warmup_max_shapes_per_hour,
             gpu_count,
             trt_warmup_shapes,
+            max_body_bytes,
             warmup_only,
+            prewarm_strict,
+            #[cfg(feature = "cache-gc")]
+            trt_cache_gc_enabled,
         }
     }
 }

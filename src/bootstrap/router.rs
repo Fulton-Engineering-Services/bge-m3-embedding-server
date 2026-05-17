@@ -73,8 +73,9 @@ impl<B> MakeSpan<B> for RouteAwareSpan {
 }
 
 /// Builds the Axum [`Router`] with all embedding, health, and fleet-discovery
-/// routes, a 2 MiB body limit, request-id propagation, and structured tracing.
-pub fn build_router(state: Arc<AppState>) -> Router {
+/// routes, a configurable body limit (default 32 MiB), request-id propagation,
+/// and structured tracing.
+pub fn build_router(state: Arc<AppState>, max_body_bytes: usize) -> Router {
     Router::new()
         .route("/v1/embeddings", post(handler::dense_embeddings))
         .route("/v1/sparse-embeddings", post(handler::sparse_embeddings))
@@ -90,7 +91,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/v1/embeddings%3aboth", post(handler::both_embeddings))
         .route("/v1/models", get(handler::models))
         .route("/health", get(handler::health))
-        .layer(DefaultBodyLimit::max(2_097_152))
+        .layer(DefaultBodyLimit::max(max_body_bytes))
         .layer(PropagateRequestIdLayer::x_request_id())
         .layer(
             TraceLayer::new_for_http()

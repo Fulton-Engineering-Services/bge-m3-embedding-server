@@ -356,6 +356,32 @@ Two opt-in Cargo features enable NVIDIA GPU inference:
 The `tensorrt` feature implies `cuda` (TRT requires the CUDA EP underneath it). Both features are
 no-ops on macOS (CoreML is always used there) and in CPU-only builds.
 
+### Stale-SM Cache GC (`cache-gc` feature — dev / maintenance only)
+
+There is also a `cache-gc` Cargo feature, **off by default**, that compiles in a destructive
+stale-SM TRT engine cache garbage collector. **Do not enable `cache-gc` for any binary that is
+deployed against a shared production EFS engine cache.**
+
+ORT's TRT EP namespaces engine plan filenames by compute capability (`_sm75`, `_sm86`, `_sm89`,
+`_sm120`, …) so plans for different SMs coexist safely in the same cache directory — production
+fleets that mix instance families (T4 / A10G / L4 / L40S / Blackwell) deliberately rely on this
+property. The GC deletes "other-SM" plans; in a multi-SM ASG it would delete plans that are still
+in active use by peer tasks running on different hardware, forcing 30–170 s recompiles (and
+possibly TRT autotuner OOMs) on those peers.
+
+The GC has two independent gates that both must be ON for any deletion to occur:
+
+1. **Compile gate** — build with `--features cache-gc`. Production binaries built without the
+   feature physically lack the GC code; `BGE_M3_TRT_CACHE_GC_ENABLED=1` is silently ignored.
+2. **Runtime gate** — set `BGE_M3_TRT_CACHE_GC_ENABLED=1`. Defaults to `false` even when the
+   feature is compiled in. The binary emits a destructive `WARN` line on
+   `target = "bge_m3_embedding_server::trt_cache_gc"` containing the substring
+   `"destructive cache GC ran"` so CloudWatch alarms can trip on it.
+
+Intended use: a dedicated maintenance / dev binary whose deployment does not share a cache
+directory with any production task. A future cache-maintenance tool with fleet-topology
+awareness will own this concern for shared caches.
+
 **Key constraints when using GPU EPs:**
 
 - `BGE_M3_WORKERS` is clamped to `BGE_M3_GPU_COUNT` (default: auto-detected, minimum 1). Each

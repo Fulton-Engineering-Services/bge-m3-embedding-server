@@ -16,9 +16,21 @@
 //!
 //! - `helpers`: `lookup_from` test helper.
 //! - `defaults`: default values and clamp behaviour for workers, batches, and seq length.
-//! - `features`: cost-model overrides, idle timeout, memory safety, model variants,
-//!   heartbeat settings, GPU count, and EP selection.
+//! - `budget`: `BGE_M3_DISABLE_AUTO_BUDGET`, `BGE_M3_TOKEN_BUDGET`, explicit cost-model
+//!   overrides.
+//! - `tuning`: `BGE_M3_IDLE_TIMEOUT_SECS`, `BGE_M3_MEMORY_SAFETY_FACTOR`, `BGE_M3_MODEL`,
+//!   `BGE_M3_HEARTBEAT_SECS`.
+//! - `trt_shapes`: `BGE_M3_TRT_WARMUP_SHAPES` parsing and default grid invariants.
+//! - `ep`: `BGE_M3_WARMUP_ONLY`, `BGE_M3_EP`, `BGE_M3_GPU_VRAM_BUDGET_BYTES`,
+//!   `BGE_M3_TRT_MAX_WORKSPACE_BYTES`, `BGE_M3_GPU_MEM_LIMIT_BYTES`.
+//! - `adaptive`: `BGE_M3_ADAPTIVE_WARMUP_*` and `BGE_M3_ENGINE_PROPAGATION_ENABLED`.
+//! - `gpu`: `BGE_M3_GPU_COUNT`, workers field, and GPU-EP cost-model override.
 
+mod adaptive;
+mod budget;
 mod defaults;
-mod features;
+mod ep;
+mod gpu;
 mod helpers;
+mod trt_shapes;
+mod tuning;

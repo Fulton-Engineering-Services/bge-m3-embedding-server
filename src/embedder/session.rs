@@ -33,10 +33,14 @@ use crate::config::{EpSelection, ModelVariant};
 ///
 /// On Linux with the `tensorrt` feature: selects `TensorRT` when
 /// `ep == EpSelection::TensorRt`, with engine caching, FP16, and the
-/// specified `device_id` enabled.
+/// specified `device_id` enabled. When `trt_max_workspace_bytes` is `Some`,
+/// the workspace cap is forwarded to the TRT EP via `with_max_workspace_size`;
+/// otherwise ORT's built-in default is used.
 ///
 /// On Linux with the `cuda` feature: selects CUDA when
-/// `ep == EpSelection::Cuda`, pinned to `device_id`.
+/// `ep == EpSelection::Cuda`, pinned to `device_id`. When
+/// `gpu_mem_limit_bytes` is `Some`, the device memory limit is forwarded via
+/// `with_memory_limit`; otherwise the EP uses all available device memory.
 ///
 /// CPU fallback: returns an empty list so ORT falls back to MLAS.
 ///
@@ -51,12 +55,15 @@ pub(super) fn execution_providers(
     cache_dir: &Path,
     ep: EpSelection,
     device_id: u32,
+    trt_max_workspace_bytes: Option<usize>,
+    gpu_mem_limit_bytes: Option<usize>,
 ) -> Vec<ort::ep::ExecutionProviderDispatch> {
     // macOS: always CoreML regardless of BGE_M3_EP.
     // The cfg blocks are mutually exclusive so only one branch is compiled per target.
     #[cfg(target_os = "macos")]
     {
         let _ = device_id;
+        let _ = (trt_max_workspace_bytes, gpu_mem_limit_bytes);
         let coreml_cache = cache_dir.join("coreml");
         let strategy = match std::env::var("BGE_M3_COREML_STRATEGY").ok().as_deref() {
             Some("default") => ort::ep::coreml::SpecializationStrategy::Default,
@@ -121,15 +128,17 @@ pub(super) fn execution_providers(
             // instead of silently serving CPU inference. Greppable in
             // CloudWatch via the new field `error_on_failure: true` on the
             // "ORT execution providers configured" event.
-            return vec![ort::ep::TensorRT::default()
+            let mut trt_ep = ort::ep::TensorRT::default()
                 .with_device_id(device_id.cast_signed())
                 .with_engine_cache(true)
                 .with_engine_cache_path(cache_info.path.display().to_string())
                 .with_timing_cache(true)
                 .with_timing_cache_path(timing_cache.display().to_string())
-                .with_fp16(true)
-                .build()
-                .error_on_failure()];
+                .with_fp16(true);
+            if let Some(cap) = trt_max_workspace_bytes {
+                trt_ep = trt_ep.with_max_workspace_size(cap);
+            }
+            return vec![trt_ep.build().error_on_failure()];
         }
 
         // Linux CUDA (feature-gated).
@@ -143,14 +152,20 @@ pub(super) fn execution_providers(
                 error_on_failure = true,
                 "ORT execution providers configured"
             );
-            return vec![ort::ep::CUDA::default()
-                .with_device_id(device_id.cast_signed())
-                .build()
-                .error_on_failure()];
+            let mut cuda_ep = ort::ep::CUDA::default().with_device_id(device_id.cast_signed());
+            if let Some(limit) = gpu_mem_limit_bytes {
+                cuda_ep = cuda_ep.with_memory_limit(limit);
+            }
+            return vec![cuda_ep.build().error_on_failure()];
         }
 
         // CPU fallback (always available).
-        let _ = (cache_dir, device_id);
+        let _ = (
+            cache_dir,
+            device_id,
+            trt_max_workspace_bytes,
+            gpu_mem_limit_bytes,
+        );
         tracing::info!(
             ep_selection = %ep,
             ep_active = "CPU/MLAS",
@@ -186,24 +201,53 @@ pub(super) fn load_session(
     Ok(session)
 }
 
+/// Configuration for loading an ORT session and tokenizer for a single GPU worker.
+///
+/// Bundles the parameters that were previously passed individually to [`load_models`],
+/// removing the 9-argument list and the associated `#[allow(clippy::too_many_arguments)]`
+/// suppression. All fields map 1:1 to the corresponding `WorkerConfig` fields.
+pub(super) struct GpuSessionConfig<'a> {
+    /// Path to the ONNX model cache directory.
+    pub cache_dir: &'a Path,
+    /// ONNX model variant (FP32, FP16, INT8).
+    pub model_variant: ModelVariant,
+    /// Maximum tokenized sequence length.
+    pub max_seq_length: usize,
+    /// Intra-op thread count for ORT sessions.
+    pub intra_threads: usize,
+    /// Execution provider selection.
+    pub ep: EpSelection,
+    /// GPU device ID for this worker.
+    pub device_id: u32,
+    /// Optional TRT EP workspace size cap in bytes.
+    pub trt_max_workspace_bytes: Option<usize>,
+    /// Optional CUDA EP device memory limit in bytes.
+    pub gpu_mem_limit_bytes: Option<usize>,
+}
+
 /// Downloads (if not already cached) and loads both the ORT session and the
 /// tokenizer for the given model variant, returning them as a pair.
 ///
-/// `device_id` selects the CUDA/TRT GPU device for this session. Computed by
-/// `EmbedPool::spawn` as `worker_index % gpu_count`. Ignored on CPU EP and
+/// `cfg.device_id` selects the CUDA/TRT GPU device for this session. Computed
+/// by `EmbedPool::spawn` as `worker_index % gpu_count`. Ignored on CPU EP and
 /// macOS.
+///
+/// `cfg.trt_max_workspace_bytes` and `cfg.gpu_mem_limit_bytes` are forwarded
+/// verbatim to [`execution_providers`]; see that function's documentation for
+/// semantics.
 pub(super) fn load_models(
-    cache_dir: &Path,
+    cfg: &GpuSessionConfig<'_>,
     show_download_progress: bool,
-    model_variant: ModelVariant,
-    max_seq_length: usize,
-    intra_threads: usize,
-    ep: EpSelection,
-    device_id: u32,
 ) -> Result<(ort::session::Session, tokenizers::Tokenizer)> {
-    let files = download_model_files(cache_dir, show_download_progress, model_variant)?;
-    let tokenizer = load_tokenizer(&files.tokenizer_path, max_seq_length)?;
-    let eps = execution_providers(cache_dir, ep, device_id);
-    let session = load_session(&files.onnx_path, eps, intra_threads)?;
+    let files = download_model_files(cfg.cache_dir, show_download_progress, cfg.model_variant)?;
+    let tokenizer = load_tokenizer(&files.tokenizer_path, cfg.max_seq_length)?;
+    let eps = execution_providers(
+        cfg.cache_dir,
+        cfg.ep,
+        cfg.device_id,
+        cfg.trt_max_workspace_bytes,
+        cfg.gpu_mem_limit_bytes,
+    );
+    let session = load_session(&files.onnx_path, eps, cfg.intra_threads)?;
     Ok((session, tokenizer))
 }

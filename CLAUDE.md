@@ -49,14 +49,28 @@ Add `BGE_M3_DISABLE_AUTO_BUDGET=1` to skip the 2-minute Linux startup probe duri
 | `BGE_M3_WORKERS` | `2` | Worker threads (each with its own ORT session). For GPU EPs, set equal to `BGE_M3_GPU_COUNT`. |
 | `BGE_M3_INTRA_THREADS` | `1` | ORT intra-op threads per worker. Raise to `floor(num_cpus / workers)` on under-utilized hosts. |
 | `BGE_M3_MAX_BATCH` | `256` | Max texts per request |
+| `BGE_M3_MAX_BODY_BYTES` | `33554432` | Maximum HTTP request body size in bytes. Raise for large embedding batches with long function bodies. |
 | `BGE_M3_MAX_SEQ_LENGTH` | `8192` | Max tokenized sequence length `[1, 8192]` |
 | `BGE_M3_IDLE_TIMEOUT_SECS` | `300` | Seconds before models are unloaded; `0` disables |
 | `BGE_M3_MODEL` | `fp16` | Model variant: `fp32` (BAAI, ~2.16 GB/session), `fp16` (Xenova, ~1.08 GB), `int8` (Xenova quantized, ~568 MB) |
 | `BGE_M3_EP` | `cpu` | Execution provider: `cpu`, `cuda`, or `tensorrt`. CoreML is always used on macOS. |
 | `BGE_M3_GPU_COUNT` | auto | GPU device count. Auto-detected from `/proc/driver/nvidia/gpus/`; set explicitly on multi-GPU ECS tasks. |
 | `BGE_M3_GPU_VRAM_BUDGET_BYTES` | 10 GiB | VRAM workspace ceiling for GPU EPs. |
+| `BGE_M3_TRT_MAX_WORKSPACE_BYTES` | unset (TRT default) | TRT EP kernel autotuner workspace cap (bytes). Set to `4294967296` (4 GiB) on L40S/H100 with 4 workers to prevent JIT allocation failures when VRAM is 87%+ saturated. |
+| `BGE_M3_GPU_MEM_LIMIT_BYTES` | unset (all available) | CUDA EP device memory limit (bytes). Symmetric cap for the CUDA execution provider. |
+| `BGE_M3_ADAPTIVE_WARMUP_ENABLED` | `0` | `1` to enable the in-process background JIT warmup loop. Detects unseen `(batch, seq)` shapes during inference and pre-compiles them when the GPU is idle. |
+| `BGE_M3_ADAPTIVE_WARMUP_QUIET_SECS` | `3` | Seconds of full idle (queue empty, all workers free) required before the adaptive loop fires a warmup compile. `0` returns immediately (no sleep before first idle check). |
+| `BGE_M3_ADAPTIVE_WARMUP_MAX_SHAPES_PER_HOUR` | `12` | Per-process cap on adaptive warmup compiles per hour. Prevents pathological traffic from compiling indefinitely. |
+| `BGE_M3_ENGINE_PROPAGATION_ENABLED` | matches `adaptive_warmup_enabled` | Broadcast `(batch, seq)` shape notifications to peer workers after a new TRT engine plan is written to EFS. Peers run `trt_prewarm` for a ~1-3s fast disk-load instead of full JIT. Disable for debugging (keeps adaptive warmup active). |
 | `BGE_M3_TRT_WARMUP_SHAPES` | 16-shape grid | Comma-separated `BxL` shapes for TRT engine pre-compilation. Shrink to `1x128` on workstations. |
 | `BGE_M3_WARMUP_ONLY` | `0` | Exit after TRT engine compilation — use as an ECS init container to pre-populate the engine cache. |
+
+### TRT Operational
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `BGE_M3_PREWARM_STRICT` | `true` | When true, prewarm postcondition failure (`engine_count_after == 0` after fresh TRT compiles) causes the worker to refuse readiness and exit instead of logging WARN and continuing. Set to `0` to restore pre-PR-77 behavior. See Key Gotchas. |
+| `BGE_M3_TRT_CACHE_GC_ENABLED` | unset (disabled) | Requires `cache-gc` Cargo feature compiled in. When set to `1`, the leader worker (id=0) deletes all `_smXX.engine` plans (and aligned sidecars) whose SM suffix does not match the current host's SM at startup. **WARNING:** Never enable against a shared EFS cache in a mixed-SM ASG — it will delete plans needed by other instance types. Drain old-SM ASG first, run GC, then bring up new-SM ASG. |
 
 ### Logging
 
@@ -92,6 +106,7 @@ Every JSON log line begins with `"bge_module":"server"` and `"build":"cpu"` or `
 - **Tokenize-once, bin-pack:** texts tokenized in one pass, grouped into `session.run()` calls using the quadratic cost model `a·BS + b·BS²` to fit `max_workspace_bytes`.
 - **Startup probe (Linux):** sweeps 7 `(batch, seq)` shapes, fits OLS cost-model coefficients, caches to `{cache_dir}/probe-coefficients.json` (keyed by `version × model × max_seq × arch`).
 - **Sparse projection:** token hidden states → `sparse_linear.safetensors` (4 KB) → ReLU → max-pool.
+- **Cross-worker engine propagation:** After any worker writes a new TRT engine plan (adaptive_warmup or real-inference JIT), a `tokio::sync::broadcast` channel fans out the `(batch, seq)` shape to every peer. Each peer drains the channel between requests and runs `trt_prewarm` (~1-3s fast disk-load from EFS) against its own session. Per-worker `warmed_local: HashSet` ensures idempotency. See the homogeneous-SM constraint (L-5 in `adaptive_warmup.rs` docs): plans are SM-specific, so all GPUs in the pool must share the same compute capability.
 
 Verify tuning after deploy: `curl http://localhost:8081/health | jq '{status,max_seq_length,tuning}'`
 Healthy values: `a_bytes_per_token` ≈ 18000–20000 (fp16, amd64); `b_bytes_per_token_sq` ≈ 5–8; `model_rss_bytes_per_worker` ≈ 1.1 GB.
@@ -135,3 +150,5 @@ Releases: `<version>`/`latest` (CPU multi-arch) and `<version>-cuda`/`latest-cud
 - **`error_on_failure()` on GPU EPs** — both `cuda` and `tensorrt` dispatch use `.error_on_failure()` so missing provider `.so` files or CUDA driver problems cause a hard startup failure rather than a silent CPU fallback.
 - **Dockerfile.cuda uses the Microsoft ORT tarball** — not pyke.io. ORT is dynamically linked (`ORT_PREFER_DYNAMIC_LINK=1`); provider `.so` files live in `/usr/local/bin/`. To upgrade ORT: bump `ARG ORT_VERSION` and `ARG ORT_MS_SHA256` in `Dockerfile.cuda`, update the `ln -s` version string, and bump `Cargo.toml` `ort = "=X.Y.Z"`.
 - **ECS capacity at `max_seq=8192`** — per-worker high-water ~10.3 GB (fp16). Formula: `workers × 10.3 GB + OS_HEADROOM ≤ task_memoryMiB`.
+- **`BGE_M3_PREWARM_STRICT` is a breaking behavior change (PR #77, default `true`)** — Prior behavior: prewarm postcondition failure (`engine_count_after == 0`) logged WARN and let the worker continue. New default: worker returns `Err`, pool init propagates, process exits with code 1, and ECS retries the container. If your deployment uses a large warmup shape grid and TRT occasionally hits VRAM exhaustion on first boot, strict mode will cause ECS restart loops. Set `BGE_M3_PREWARM_STRICT=0` to restore the previous warn-and-continue behavior while tuning. After deploying, monitor `exitCode=1` in the ECS event log on first boot. **ECS recommendation:** configure a `restartPolicy` with `restartAttempts ≤ 3` and a `restartWindow` to prevent infinite restart loops under sustained VRAM pressure. Note: a future improvement would use exit code 2 for prewarm strict failures (vs code 1 for other crashes) to enable distinct CloudWatch alarm routing.
+- **x_headers log field key rename after PR #77** — The `x_headers` JSON log field changed key format from hyphenated (`x-request-id`) to underscored (`x_request_id`). Any CloudWatch Insights queries or SIEM filters referencing `x_headers."x-*"` (hyphenated) must be updated to `x_headers."x_*"` (underscore) after deploying PR #77. HTTP header forwarding behavior is unaffected; only the emitted log field keys changed.

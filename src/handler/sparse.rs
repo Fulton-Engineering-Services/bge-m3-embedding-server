@@ -39,15 +39,7 @@ use crate::state::AppState;
 #[allow(clippy::cast_possible_truncation)]
 #[tracing::instrument(
     skip(state, req, headers),
-    fields(
-        batch_size,
-        chunks,
-        max_chunk_seq,
-        tokenize_ms,
-        inference_ms,
-        total_ms,
-        x_headers = tracing::field::Empty
-    )
+    fields(batch_size, chunks, max_chunk_seq, tokenize_ms, inference_ms, total_ms,)
 )]
 pub async fn sparse_embeddings(
     State(state): State<Arc<AppState>>,
@@ -56,12 +48,6 @@ pub async fn sparse_embeddings(
 ) -> Result<Json<SparseResponse>, AppError> {
     check_ready(&state)?;
     let x_headers = collect_x_headers(&headers);
-    if !x_headers.is_empty() {
-        tracing::Span::current().record(
-            "x_headers",
-            tracing::field::display(serde_json::to_string(&x_headers).unwrap_or_default()),
-        );
-    }
     let texts = req.input.0;
     validate_input(&texts, state.max_batch)?;
     let batch_size = texts.len();
@@ -83,6 +69,8 @@ pub async fn sparse_embeddings(
         .record("tokenize_ms", embed_stats.tokenize_ms)
         .record("inference_ms", embed_stats.inference_ms)
         .record("total_ms", total_ms);
+    let x_headers_val =
+        (!x_headers.is_empty()).then(|| serde_json::to_string(&x_headers).unwrap_or_default());
     tracing::info!(
         route = "sparse",
         batch_size,
@@ -92,6 +80,7 @@ pub async fn sparse_embeddings(
         tokenize_ms = embed_stats.tokenize_ms,
         inference_ms = embed_stats.inference_ms,
         total_ms,
+        x_headers = x_headers_val,
         "embedding request complete"
     );
 
