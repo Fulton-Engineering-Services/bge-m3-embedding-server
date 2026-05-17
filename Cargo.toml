@@ -8,7 +8,7 @@ repository = "https://github.com/Fulton-Engineering-Services/bge-m3-embedding-se
 readme = "README.md"
 keywords = ["embeddings", "bge-m3", "axum", "nlp", "onnxruntime"]
 categories = ["web-programming::http-server"]
-rust-version = "1.88"
+rust-version = "1.95"
 
 [lib]
 name = "bge_m3_embedding_server"

@@ -557,7 +557,7 @@ mod tests {
     async fn wait_for_workers_returns_immediately_when_already_zero() {
         let live = Arc::new(AtomicUsize::new(0));
         let start = std::time::Instant::now();
-        wait_for_workers_to_exit(&live, Duration::from_secs(60)).await;
+        wait_for_workers_to_exit(&live, Duration::from_mins(1)).await;
         assert!(
             start.elapsed() < Duration::from_millis(200),
             "wait should return immediately when live_workers is already zero; \
@@ -578,7 +578,7 @@ mod tests {
         });
 
         let start = std::time::Instant::now();
-        wait_for_workers_to_exit(&live, Duration::from_secs(60)).await;
+        wait_for_workers_to_exit(&live, Duration::from_mins(1)).await;
         let elapsed = start.elapsed();
         drainer.await.unwrap();
 
