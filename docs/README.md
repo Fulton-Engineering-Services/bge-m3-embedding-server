@@ -15,3 +15,4 @@ Design documentation for `bge-m3-embedding-server`.
 | [Performance](performance.md) | MLAS vs CoreML benchmarks, CoreML workspace analysis, embedding quality, memory footprint, RAM reduction options |
 | [Model Variants](model-variants.md) | FP32 vs FP16 precision evaluation, quantized model table, production recommendation |
 | [macOS Deployment](deployment.md) | install-bge-m3-apple.sh, LaunchAgent configuration, service management |
+| [TLS Feature Guide](tls.md) | Optional native HTTPS via Rustls — build flag, cert provisioning, bge-router trust, health checks, troubleshooting |
