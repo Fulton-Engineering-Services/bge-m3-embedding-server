@@ -7,6 +7,7 @@
 # WARNING: do NOT deploy this image against a production EFS cache shared
 # by a multi-SM ASG. See src/embedder/trt_cache_gc.rs for hazard details.
 ARG CACHE_GC_FEATURES=""
+ARG EXTRA_FEATURES=""
 
 # ── Builder stage ─────────────────────────────────────────────────────────────
 # Use the CUDA devel image so nvcc and CUDA headers are present at build time.
@@ -68,15 +69,16 @@ WORKDIR /app
 # source paths at manifest parse time, even though cargo build --release skips
 # bench compilation.
 ARG CACHE_GC_FEATURES
+ARG EXTRA_FEATURES
 COPY Cargo.toml Cargo.lock build.rs ./
 RUN mkdir src && echo "fn main(){}" > src/main.rs && touch src/lib.rs \
     && mkdir -p benches/coreml && touch benches/embeddings.rs benches/coreml/main.rs \
-    && cargo build --release --features "cuda,tensorrt ${CACHE_GC_FEATURES}" \
+    && cargo build --release --features "cuda,tensorrt ${CACHE_GC_FEATURES} ${EXTRA_FEATURES}" \
     && rm -rf src benches
 
 COPY src ./src
 COPY benches ./benches
-RUN touch src/main.rs && cargo build --release --features "cuda,tensorrt ${CACHE_GC_FEATURES}"
+RUN touch src/main.rs && cargo build --release --features "cuda,tensorrt ${CACHE_GC_FEATURES} ${EXTRA_FEATURES}"
 
 # ── Runtime stage ──────────────────────────────────────────────────────────────
 # Only the CUDA runtime libs are needed at inference time — not the full devel

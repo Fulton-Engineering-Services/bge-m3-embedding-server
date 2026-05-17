@@ -2,7 +2,7 @@ FROM ubuntu:24.04@sha256:c4a8d5503dfb2a3eb8ab5f807da5bc69a85730fb49b5cfca2330194
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-       curl ca-certificates build-essential pkg-config libssl-dev python3 \
+       curl ca-certificates build-essential pkg-config libssl-dev python3 cmake \
     && rm -rf /var/lib/apt/lists/*
 
 # Download rustup-init, verify the official SHA-256 sidecar, then install.
@@ -38,6 +38,8 @@ RUN case "$TARGETARCH" in \
     && rm /tmp/ort.tar.lzma2
 ENV ORT_LIB_LOCATION=/opt/ort
 
+ARG EXTRA_FEATURES=""
+
 WORKDIR /app
 
 # Cache dependency compilation by building a dummy binary first.
@@ -46,12 +48,12 @@ WORKDIR /app
 COPY Cargo.toml Cargo.lock build.rs ./
 RUN mkdir src && echo "fn main(){}" > src/main.rs && touch src/lib.rs \
     && mkdir -p benches/coreml && touch benches/embeddings.rs benches/coreml/main.rs \
-    && cargo build --release \
+    && cargo build --release ${EXTRA_FEATURES:+--features "$EXTRA_FEATURES"} \
     && rm -rf src benches
 
 COPY src ./src
 COPY benches ./benches
-RUN touch src/main.rs && cargo build --release
+RUN touch src/main.rs && cargo build --release ${EXTRA_FEATURES:+--features "$EXTRA_FEATURES"}
 
 FROM ubuntu:24.04@sha256:c4a8d5503dfb2a3eb8ab5f807da5bc69a85730fb49b5cfca2330194ebcc41c7b
 RUN apt-get update \
