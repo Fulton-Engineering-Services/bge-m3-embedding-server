@@ -71,10 +71,17 @@ RUN groupadd --gid 10002 bge \
 RUN mkdir -p /tls && chown bge:bge /tls
 
 COPY --from=builder /app/target/release/bge-m3-embedding-server /usr/local/bin/
+# Dual-mode HEALTHCHECK wrapper: chooses HTTPS vs HTTP based on the runtime
+# env vars (BGE_M3_TLS_CERT_PATH + BGE_M3_TLS_KEY_PATH) the server itself
+# uses to decide its listener mode. Same Dockerfile works for both
+# `EXTRA_FEATURES=""` (HTTP) and `EXTRA_FEATURES=tls` (HTTPS) builds.
+COPY healthcheck.sh /usr/local/bin/healthcheck.sh
+RUN chmod +x /usr/local/bin/healthcheck.sh
+
 USER bge
 
-HEALTHCHECK --interval=10s --timeout=3s --start-period=120s --retries=3 \
-    CMD curl --fail --silent http://localhost:8081/health || exit 1
+HEALTHCHECK --interval=10s --timeout=5s --start-period=5s --retries=3 \
+    CMD ["/usr/local/bin/healthcheck.sh"]
 
 EXPOSE 8081
 CMD ["bge-m3-embedding-server"]
