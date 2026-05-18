@@ -137,6 +137,28 @@ pub async fn run() -> anyhow::Result<()> {
         "bge-m3-embedding-server build info"
     );
 
+    // Install a rustls crypto provider before any rustls user (hf-hub's
+    // reqwest::Client, axum-server's RustlsConfig, etc.) is constructed.
+    //
+    // rustls 0.23+ refuses to auto-select when more than one provider is
+    // visible in the dep graph; bge-m3-embedding-server pulls rustls through
+    // two paths:
+    //   - `hf-hub` → reqwest (rustls-tls)        → defaults to aws-lc-rs
+    //   - `axum-server` (tls-rustls feature)     → defaults to ring (via
+    //                                                 tokio-rustls)
+    // Both are present in the compiled binary, so rustls cannot pick. Without
+    // an explicit install, the process panics during worker model load (first
+    // hf-hub fetch) with: "Could not automatically determine the process-level
+    // CryptoProvider".
+    //
+    // `.ok()` lets us re-enter from tests where a provider may already be set.
+    #[cfg(feature = "tls")]
+    {
+        rustls::crypto::aws_lc_rs::default_provider()
+            .install_default()
+            .ok();
+    }
+
     let cfg = Config::from_env()?;
 
     let disable_probe_cache = std::env::var("BGE_M3_DISABLE_PROBE_CACHE")
