@@ -63,6 +63,13 @@ RUN apt-get update \
 RUN groupadd --gid 10002 bge \
     && useradd --uid 10002 --gid bge --no-create-home --shell /sbin/nologin bge
 
+# Pre-create /tls owned by bge so the TLS entrypoint preamble (which runs after
+# `USER bge` and does `mkdir -p /tls && printf '%s\n' "$LOCKBOX_TLS_CA_CERT" > /tls/ca.crt`)
+# can write the CA cert + leaf cert without root. Without this, `mkdir /tls`
+# fails with `Permission denied` because the root filesystem is not writable by
+# non-root users.
+RUN mkdir -p /tls && chown bge:bge /tls
+
 COPY --from=builder /app/target/release/bge-m3-embedding-server /usr/local/bin/
 USER bge
 
