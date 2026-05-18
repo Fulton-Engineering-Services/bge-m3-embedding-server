@@ -107,6 +107,11 @@ RUN apt-get update \
 RUN groupadd --gid 10002 bge \
     && useradd --uid 10002 --gid bge --no-create-home --shell /sbin/nologin bge
 
+# Pre-create /tls owned by bge so the TLS entrypoint preamble (which runs after
+# `USER bge` and does `mkdir -p /tls && printf '%s\n' "$LOCKBOX_TLS_CA_CERT" > /tls/ca.crt`)
+# can write the CA cert + leaf cert without root.
+RUN mkdir -p /tls && chown bge:bge /tls
+
 # Copy libonnxruntime.so.1.24.2 and all ORT provider shared libraries into
 # /usr/local/bin/ — the same directory as the application binary.
 #
