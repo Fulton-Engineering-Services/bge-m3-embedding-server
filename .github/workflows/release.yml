@@ -229,99 +229,24 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
-  # ── Merge multi-arch manifest + tag + release ──────────────────────────
-  release:
-    name: Release
-    needs: [version, build]
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-      packages: write
-      id-token: write   # required for cosign OIDC keyless signing
-    steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
-        with:
-          fetch-depth: 0
-
-      - name: Download digests
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
-        with:
-          path: /tmp/digests
-          pattern: digests-*
-          merge-multiple: true
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd  # v4.0.0
-
-      - name: Log in to GHCR
-        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121  # v4.1.0
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Create multi-arch manifest and push tags
-        working-directory: /tmp/digests
-        run: |
-          IMAGE="${{ env.REGISTRY }}/${{ needs.version.outputs.repo }}"
-          VERSION="${{ needs.version.outputs.version }}"
-          docker buildx imagetools create \
-            -t "$IMAGE:$VERSION" \
-            -t "$IMAGE:latest" \
-            $(printf "$IMAGE@sha256:%s " *)
-
-      # ── Image signing + SBOM ──────────────────────────────────────────
-      - name: Install cosign
-        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6  # v4.1.2
-
-      - name: Sign container image
-        env:
-          IMAGE: ${{ env.REGISTRY }}/${{ needs.version.outputs.repo }}
-          VERSION: ${{ needs.version.outputs.version }}
-        run: |
-          DIGEST=$(docker buildx imagetools inspect "$IMAGE:$VERSION" --format '{{.Manifest.Digest}}')
-          cosign sign --yes "$IMAGE@$DIGEST"
-
-      - name: Generate SBOM
-        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610  # v0.24.0
-        with:
-          image: ${{ env.REGISTRY }}/${{ needs.version.outputs.repo }}:${{ needs.version.outputs.version }}
-          artifact-name: sbom-${{ needs.version.outputs.version }}.spdx.json
-          output-file: /tmp/sbom-${{ needs.version.outputs.version }}.spdx.json
-
-      # ── Git tag + GitHub Release ──────────────────────────────────────
-      - name: Create git tag
-        run: |
-          git tag "${{ needs.version.outputs.tag }}"
-          git push origin "${{ needs.version.outputs.tag }}"
-
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda  # v3
-        with:
-          tag_name: ${{ needs.version.outputs.tag }}
-          name: Release ${{ needs.version.outputs.tag }}
-          generate_release_notes: true
-          make_latest: true
-          files: /tmp/sbom-${{ needs.version.outputs.version }}.spdx.json
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-  # ── CUDA image manifest tags ───────────────────────────────────────────────
-  # Single amd64 image — no multi-arch manifest needed for GPU builds.
-  merge-cuda:
-    name: Tag CUDA image
-    needs: [version, build-cuda, release]
-    runs-on: ubuntu-latest
+  build-tls:
+    name: Build TLS (${{ matrix.platform }})
+    needs: [version]
+    if: needs.version.outputs.exists == 'false'
     permissions:
       contents: read
       packages: write
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            platform: linux/amd64
+          - runner: ubuntu-24.04-arm
+            platform: linux/arm64
+    runs-on: ${{ matrix.runner }}
     steps:
-      - name: Download CUDA digest
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
-        with:
-          path: /tmp/digests-cuda
-          pattern: digests-cuda-amd64
-          merge-multiple: true
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd  # v4.0.0
@@ -333,15 +258,85 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Create CUDA image manifest and push tags
-        working-directory: /tmp/digests-cuda
+      - name: Build and push TLS image by digest
+        id: build-tls
+        uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f  # v7.1.0
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          build-args: EXTRA_FEATURES=tls
+          outputs: type=image,name=${{ env.REGISTRY }}/${{ needs.version.outputs.repo }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=${{ matrix.platform }}-tls
+          cache-to: type=gha,scope=${{ matrix.platform }}-tls,mode=max
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.version=${{ needs.version.outputs.version }}-tls
+            org.opencontainers.image.revision=${{ github.sha }}
+
+      - name: Export TLS digest
         run: |
-          IMAGE="${{ env.REGISTRY }}/${{ needs.version.outputs.repo }}"
-          VERSION="${{ needs.version.outputs.version }}"
-          docker buildx imagetools create \
-            -t "$IMAGE:${VERSION}-cuda" \
-            -t "$IMAGE:latest-cuda" \
-            $(printf "$IMAGE@sha256:%s " *)
+          mkdir -p /tmp/digests-tls
+          digest="${{ steps.build-tls.outputs.digest }}"
+          touch "/tmp/digests-tls/${digest#sha256:}"
+
+      - name: Upload TLS digest
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: digests-tls-${{ matrix.platform == 'linux/amd64' && 'amd64' || 'arm64' }}
+          path: /tmp/digests-tls/*
+          if-no-files-found: error
+          retention-days: 1
+
+  build-cuda-tls:
+    name: Build CUDA TLS image (amd64)
+    needs: [version]
+    if: needs.version.outputs.exists == 'false'
+    permissions:
+      contents: read
+      packages: write
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd  # v4.0.0
+
+      - name: Log in to GHCR
+        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121  # v4.1.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push CUDA TLS image by digest
+        id: build-cuda-tls
+        uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f  # v7.1.0
+        with:
+          context: .
+          file: Dockerfile.cuda
+          platforms: linux/amd64
+          build-args: EXTRA_FEATURES=tls
+          outputs: type=image,name=${{ env.REGISTRY }}/${{ needs.version.outputs.repo }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=linux/amd64-cuda-tls
+          cache-to: type=gha,scope=linux/amd64-cuda-tls,mode=max
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.version=${{ needs.version.outputs.version }}-cuda-tls
+            org.opencontainers.image.revision=${{ github.sha }}
+
+      - name: Export CUDA TLS digest
+        run: |
+          mkdir -p /tmp/digests-cuda-tls
+          digest="${{ steps.build-cuda-tls.outputs.digest }}"
+          touch "/tmp/digests-cuda-tls/${digest#sha256:}"
+
+      - name: Upload CUDA TLS digest
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: digests-cuda-tls-amd64
+          path: /tmp/digests-cuda-tls/*
+          if-no-files-found: error
+          retention-days: 1
 
   # ── CUDA cache-gc maintenance image (parallel with build-cuda) ─────────────
   # Identical to build-cuda but compiled with --build-arg CACHE_GC_FEATURES=cache-gc.
@@ -398,21 +393,67 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
-  merge-cuda-cache-gc:
-    name: Tag CUDA cache-gc image
-    needs: [version, build-cuda-cache-gc, release]
+  # ── Merge manifests, sign, SBOM, tag + release (all in one job) ───────
+  # All signing, SBOM generation, and the GH Release are consolidated here
+  # so the release is created once with all assets attached — required because
+  # immutable releases (GitHub ruleset) block post-creation asset uploads (HTTP 422).
+  release:
+    name: Release
+    needs: [version, build, build-tls, build-cuda, build-cuda-tls, build-cuda-cache-gc]
     runs-on: ubuntu-latest
     permissions:
-      contents: read
+      contents: write
       packages: write
+      id-token: write   # required for cosign OIDC keyless signing
     steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          fetch-depth: 0
+
+      # ── Download all digests ──────────────────────────────────────────
+      - name: Download CPU digests (amd64)
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+        with:
+          name: digests-amd64
+          path: /tmp/digests
+
+      - name: Download CPU digests (arm64)
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+        with:
+          name: digests-arm64
+          path: /tmp/digests
+
+      - name: Download TLS digests (amd64)
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+        with:
+          name: digests-tls-amd64
+          path: /tmp/digests-tls
+
+      - name: Download TLS digests (arm64)
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+        with:
+          name: digests-tls-arm64
+          path: /tmp/digests-tls
+
+      - name: Download CUDA digest
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+        with:
+          name: digests-cuda-amd64
+          path: /tmp/digests-cuda
+
+      - name: Download CUDA TLS digest
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+        with:
+          name: digests-cuda-tls-amd64
+          path: /tmp/digests-cuda-tls
+
       - name: Download CUDA cache-gc digest
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
         with:
+          name: digests-cuda-cache-gc-amd64
           path: /tmp/digests-cuda-cache-gc
-          pattern: digests-cuda-cache-gc-amd64
-          merge-multiple: true
 
+      # ── Registry login + Buildx + cosign ─────────────────────────────
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd  # v4.0.0
 
@@ -423,6 +464,116 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Install cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6  # v4.1.2
+
+      # ── CPU image ─────────────────────────────────────────────────────
+      - name: Create CPU multi-arch manifest and push tags
+        working-directory: /tmp/digests
+        run: |
+          IMAGE="${{ env.REGISTRY }}/${{ needs.version.outputs.repo }}"
+          VERSION="${{ needs.version.outputs.version }}"
+          docker buildx imagetools create \
+            -t "$IMAGE:$VERSION" \
+            -t "$IMAGE:latest" \
+            $(printf "$IMAGE@sha256:%s " *)
+
+      - name: Sign CPU container image
+        env:
+          IMAGE: ${{ env.REGISTRY }}/${{ needs.version.outputs.repo }}
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          DIGEST=$(docker buildx imagetools inspect "$IMAGE:$VERSION" --format '{{.Manifest.Digest}}')
+          cosign sign --yes "$IMAGE@$DIGEST"
+
+      - name: Generate CPU SBOM
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610  # v0.24.0
+        with:
+          image: ${{ env.REGISTRY }}/${{ needs.version.outputs.repo }}:${{ needs.version.outputs.version }}
+          artifact-name: sbom-${{ needs.version.outputs.version }}.spdx.json
+          output-file: /tmp/sbom-${{ needs.version.outputs.version }}.spdx.json
+
+      # ── TLS image ─────────────────────────────────────────────────────
+      - name: Create TLS multi-arch manifest and push tags
+        working-directory: /tmp/digests-tls
+        run: |
+          IMAGE="${{ env.REGISTRY }}/${{ needs.version.outputs.repo }}"
+          VERSION="${{ needs.version.outputs.version }}"
+          docker buildx imagetools create \
+            -t "$IMAGE:${VERSION}-tls" \
+            -t "$IMAGE:latest-tls" \
+            $(printf "$IMAGE@sha256:%s " *)
+
+      - name: Sign TLS container image
+        env:
+          IMAGE: ${{ env.REGISTRY }}/${{ needs.version.outputs.repo }}
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          DIGEST=$(docker buildx imagetools inspect "$IMAGE:${VERSION}-tls" --format '{{.Manifest.Digest}}')
+          cosign sign --yes "$IMAGE@$DIGEST"
+
+      - name: Generate TLS SBOM
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610  # v0.24.0
+        with:
+          image: ${{ env.REGISTRY }}/${{ needs.version.outputs.repo }}:${{ needs.version.outputs.version }}-tls
+          artifact-name: sbom-${{ needs.version.outputs.version }}-tls.spdx.json
+          output-file: /tmp/sbom-${{ needs.version.outputs.version }}-tls.spdx.json
+
+      # ── CUDA image ────────────────────────────────────────────────────
+      - name: Create CUDA image manifest and push tags
+        working-directory: /tmp/digests-cuda
+        run: |
+          IMAGE="${{ env.REGISTRY }}/${{ needs.version.outputs.repo }}"
+          VERSION="${{ needs.version.outputs.version }}"
+          docker buildx imagetools create \
+            -t "$IMAGE:${VERSION}-cuda" \
+            -t "$IMAGE:latest-cuda" \
+            $(printf "$IMAGE@sha256:%s " *)
+
+      - name: Sign CUDA container image
+        env:
+          IMAGE: ${{ env.REGISTRY }}/${{ needs.version.outputs.repo }}
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          DIGEST=$(docker buildx imagetools inspect "$IMAGE:${VERSION}-cuda" --format '{{.Manifest.Digest}}')
+          cosign sign --yes "$IMAGE@$DIGEST"
+
+      - name: Generate CUDA SBOM
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610  # v0.24.0
+        with:
+          image: ${{ env.REGISTRY }}/${{ needs.version.outputs.repo }}:${{ needs.version.outputs.version }}-cuda
+          artifact-name: sbom-${{ needs.version.outputs.version }}-cuda.spdx.json
+          output-file: /tmp/sbom-${{ needs.version.outputs.version }}-cuda.spdx.json
+
+      # ── CUDA TLS image ────────────────────────────────────────────────
+      - name: Create CUDA TLS image manifest and push tags
+        working-directory: /tmp/digests-cuda-tls
+        run: |
+          IMAGE="${{ env.REGISTRY }}/${{ needs.version.outputs.repo }}"
+          VERSION="${{ needs.version.outputs.version }}"
+          docker buildx imagetools create \
+            -t "$IMAGE:${VERSION}-cuda-tls" \
+            -t "$IMAGE:latest-cuda-tls" \
+            $(printf "$IMAGE@sha256:%s " *)
+
+      - name: Sign CUDA TLS container image
+        env:
+          IMAGE: ${{ env.REGISTRY }}/${{ needs.version.outputs.repo }}
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          DIGEST=$(docker buildx imagetools inspect "$IMAGE:${VERSION}-cuda-tls" --format '{{.Manifest.Digest}}')
+          cosign sign --yes "$IMAGE@$DIGEST"
+
+      - name: Generate CUDA TLS SBOM
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610  # v0.24.0
+        with:
+          image: ${{ env.REGISTRY }}/${{ needs.version.outputs.repo }}:${{ needs.version.outputs.version }}-cuda-tls
+          artifact-name: sbom-${{ needs.version.outputs.version }}-cuda-tls.spdx.json
+          output-file: /tmp/sbom-${{ needs.version.outputs.version }}-cuda-tls.spdx.json
+
+      # ── CUDA cache-gc image ───────────────────────────────────────────
+      # WARNING: only deploy this image in a controlled maintenance window against
+      # a homogeneous ASG — see Dockerfile.cuda and trt_cache_gc.rs for hazards.
       - name: Create CUDA cache-gc image manifest and push tags
         working-directory: /tmp/digests-cuda-cache-gc
         run: |
@@ -432,3 +583,40 @@ jobs:
             -t "$IMAGE:${VERSION}-cuda-cache-gc" \
             -t "$IMAGE:latest-cuda-cache-gc" \
             $(printf "$IMAGE@sha256:%s " *)
+
+      - name: Sign CUDA cache-gc container image
+        env:
+          IMAGE: ${{ env.REGISTRY }}/${{ needs.version.outputs.repo }}
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          DIGEST=$(docker buildx imagetools inspect "$IMAGE:${VERSION}-cuda-cache-gc" --format '{{.Manifest.Digest}}')
+          cosign sign --yes "$IMAGE@$DIGEST"
+
+      - name: Generate CUDA cache-gc SBOM
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610  # v0.24.0
+        with:
+          image: ${{ env.REGISTRY }}/${{ needs.version.outputs.repo }}:${{ needs.version.outputs.version }}-cuda-cache-gc
+          artifact-name: sbom-${{ needs.version.outputs.version }}-cuda-cache-gc.spdx.json
+          output-file: /tmp/sbom-${{ needs.version.outputs.version }}-cuda-cache-gc.spdx.json
+
+      # ── Git tag + GitHub Release ──────────────────────────────────────
+      - name: Create git tag
+        run: |
+          git tag "${{ needs.version.outputs.tag }}"
+          git push origin "${{ needs.version.outputs.tag }}"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda  # v3
+        with:
+          tag_name: ${{ needs.version.outputs.tag }}
+          name: Release ${{ needs.version.outputs.tag }}
+          generate_release_notes: true
+          make_latest: true
+          files: |
+            /tmp/sbom-${{ needs.version.outputs.version }}.spdx.json
+            /tmp/sbom-${{ needs.version.outputs.version }}-tls.spdx.json
+            /tmp/sbom-${{ needs.version.outputs.version }}-cuda.spdx.json
+            /tmp/sbom-${{ needs.version.outputs.version }}-cuda-tls.spdx.json
+            /tmp/sbom-${{ needs.version.outputs.version }}-cuda-cache-gc.spdx.json
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

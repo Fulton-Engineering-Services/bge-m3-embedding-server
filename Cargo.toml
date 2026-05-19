@@ -1,6 +1,6 @@
 [package]
 name = "bge-m3-embedding-server"
-version = "1.3.0"
+version = "1.4.0"
 edition = "2021"
 license = "Apache-2.0"
 description = "Axum HTTP server serving BGE-M3 dense and sparse embeddings via ONNX Runtime"
@@ -20,6 +20,13 @@ path = "src/main.rs"
 
 [dependencies]
 axum = "0.8"
+axum-server = { version = "0.8", features = ["tls-rustls"], optional = true }
+# Direct dep so production code can call
+# `rustls::crypto::aws_lc_rs::default_provider().install_default()` in `run()`
+# before any rustls user (hf-hub's reqwest, axum-server's RustlsConfig) is built.
+# Gated by the `tls` feature — the `cpu` (non-TLS) build path does not need it.
+# See the panic-fix block at the top of `run()` in `src/lib.rs`.
+rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs"], optional = true }
 indexmap = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "time"] }
 serde = { version = "1", features = ["derive"] }
@@ -93,6 +100,16 @@ tensorrt = ["ort/cuda", "ort/tensorrt", "nvml"]
 ## (or the README section "Stale-SM Cache GC") for the full hazard model.
 cache-gc = []
 
+## Enable optional native TLS via axum-server + tokio-rustls.
+## When `BGE_M3_TLS_CERT_PATH` and `BGE_M3_TLS_KEY_PATH` are both set at
+## runtime, the server binds HTTPS instead of HTTP. When either is absent,
+## the server falls back to plain HTTP.
+##
+## Also pulls in `rustls` directly so `run()` can install the aws-lc-rs
+## CryptoProvider before any rustls user (hf-hub's reqwest, axum-server's
+## RustlsConfig) is constructed — see the panic-fix block in `src/lib.rs`.
+tls = ["dep:axum-server", "dep:rustls"]
+
 [dev-dependencies]
 tokio = { version = "1", features = ["test-util"] }
 tower = { version = "0.5", features = ["util"] }
@@ -101,6 +118,8 @@ proptest = "1"
 criterion = { version = "0.8", features = ["html_reports"] }
 sha2 = "0.11"
 tempfile = "3"
+rcgen = "0.13"
+rustls = { version = "0.23", features = ["aws-lc-rs"] }
 
 [[bench]]
 name = "embeddings"

@@ -2,7 +2,7 @@ FROM ubuntu:24.04@sha256:c4a8d5503dfb2a3eb8ab5f807da5bc69a85730fb49b5cfca2330194
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-       curl ca-certificates build-essential pkg-config libssl-dev python3 \
+       curl ca-certificates build-essential pkg-config libssl-dev python3 cmake \
     && rm -rf /var/lib/apt/lists/*
 
 # Download rustup-init, verify the official SHA-256 sidecar, then install.
@@ -38,6 +38,8 @@ RUN case "$TARGETARCH" in \
     && rm /tmp/ort.tar.lzma2
 ENV ORT_LIB_LOCATION=/opt/ort
 
+ARG EXTRA_FEATURES=""
+
 WORKDIR /app
 
 # Cache dependency compilation by building a dummy binary first.
@@ -46,12 +48,12 @@ WORKDIR /app
 COPY Cargo.toml Cargo.lock build.rs ./
 RUN mkdir src && echo "fn main(){}" > src/main.rs && touch src/lib.rs \
     && mkdir -p benches/coreml && touch benches/embeddings.rs benches/coreml/main.rs \
-    && cargo build --release \
+    && cargo build --release ${EXTRA_FEATURES:+--features "$EXTRA_FEATURES"} \
     && rm -rf src benches
 
 COPY src ./src
 COPY benches ./benches
-RUN touch src/main.rs && cargo build --release
+RUN touch src/main.rs && cargo build --release ${EXTRA_FEATURES:+--features "$EXTRA_FEATURES"}
 
 FROM ubuntu:24.04@sha256:c4a8d5503dfb2a3eb8ab5f807da5bc69a85730fb49b5cfca2330194ebcc41c7b
 RUN apt-get update \
@@ -61,11 +63,25 @@ RUN apt-get update \
 RUN groupadd --gid 10002 bge \
     && useradd --uid 10002 --gid bge --no-create-home --shell /sbin/nologin bge
 
+# Pre-create /tls owned by bge so the TLS entrypoint preamble (which runs after
+# `USER bge` and does `mkdir -p /tls && printf '%s\n' "$LOCKBOX_TLS_CA_CERT" > /tls/ca.crt`)
+# can write the CA cert + leaf cert without root. Without this, `mkdir /tls`
+# fails with `Permission denied` because the root filesystem is not writable by
+# non-root users.
+RUN mkdir -p /tls && chown bge:bge /tls
+
 COPY --from=builder /app/target/release/bge-m3-embedding-server /usr/local/bin/
+# Dual-mode HEALTHCHECK wrapper: chooses HTTPS vs HTTP based on the runtime
+# env vars (BGE_M3_TLS_CERT_PATH + BGE_M3_TLS_KEY_PATH) the server itself
+# uses to decide its listener mode. Same Dockerfile works for both
+# `EXTRA_FEATURES=""` (HTTP) and `EXTRA_FEATURES=tls` (HTTPS) builds.
+COPY healthcheck.sh /usr/local/bin/healthcheck.sh
+RUN chmod +x /usr/local/bin/healthcheck.sh
+
 USER bge
 
-HEALTHCHECK --interval=10s --timeout=3s --start-period=120s --retries=3 \
-    CMD curl --fail --silent http://localhost:8081/health || exit 1
+HEALTHCHECK --interval=10s --timeout=5s --start-period=5s --retries=3 \
+    CMD ["/usr/local/bin/healthcheck.sh"]
 
 EXPOSE 8081
 CMD ["bge-m3-embedding-server"]

@@ -7,6 +7,7 @@
 # WARNING: do NOT deploy this image against a production EFS cache shared
 # by a multi-SM ASG. See src/embedder/trt_cache_gc.rs for hazard details.
 ARG CACHE_GC_FEATURES=""
+ARG EXTRA_FEATURES=""
 
 # ── Builder stage ─────────────────────────────────────────────────────────────
 # Use the CUDA devel image so nvcc and CUDA headers are present at build time.
@@ -68,15 +69,16 @@ WORKDIR /app
 # source paths at manifest parse time, even though cargo build --release skips
 # bench compilation.
 ARG CACHE_GC_FEATURES
+ARG EXTRA_FEATURES
 COPY Cargo.toml Cargo.lock build.rs ./
 RUN mkdir src && echo "fn main(){}" > src/main.rs && touch src/lib.rs \
     && mkdir -p benches/coreml && touch benches/embeddings.rs benches/coreml/main.rs \
-    && cargo build --release --features "cuda,tensorrt ${CACHE_GC_FEATURES}" \
+    && cargo build --release --features "cuda,tensorrt ${CACHE_GC_FEATURES} ${EXTRA_FEATURES}" \
     && rm -rf src benches
 
 COPY src ./src
 COPY benches ./benches
-RUN touch src/main.rs && cargo build --release --features "cuda,tensorrt ${CACHE_GC_FEATURES}"
+RUN touch src/main.rs && cargo build --release --features "cuda,tensorrt ${CACHE_GC_FEATURES} ${EXTRA_FEATURES}"
 
 # ── Runtime stage ──────────────────────────────────────────────────────────────
 # Only the CUDA runtime libs are needed at inference time — not the full devel
@@ -104,6 +106,11 @@ RUN apt-get update \
 # UID/GID must match EFS model-cache access point in Codekeeper CDK (10002).
 RUN groupadd --gid 10002 bge \
     && useradd --uid 10002 --gid bge --no-create-home --shell /sbin/nologin bge
+
+# Pre-create /tls owned by bge so the TLS entrypoint preamble (which runs after
+# `USER bge` and does `mkdir -p /tls && printf '%s\n' "$LOCKBOX_TLS_CA_CERT" > /tls/ca.crt`)
+# can write the CA cert + leaf cert without root.
+RUN mkdir -p /tls && chown bge:bge /tls
 
 # Copy libonnxruntime.so.1.24.2 and all ORT provider shared libraries into
 # /usr/local/bin/ — the same directory as the application binary.
@@ -138,10 +145,17 @@ RUN ln -s libonnxruntime.so.1.24.2 /usr/local/bin/libonnxruntime.so.1
 RUN echo '/usr/local/bin' > /etc/ld.so.conf.d/onnxruntime.conf && ldconfig
 
 COPY --from=builder /app/target/release/bge-m3-embedding-server /usr/local/bin/
+# Dual-mode HEALTHCHECK wrapper: chooses HTTPS vs HTTP based on the runtime
+# env vars (BGE_M3_TLS_CERT_PATH + BGE_M3_TLS_KEY_PATH) the server itself
+# uses to decide its listener mode. Same Dockerfile.cuda works for both
+# `EXTRA_FEATURES=""` (HTTP) and `EXTRA_FEATURES=tls` (HTTPS) builds.
+COPY healthcheck.sh /usr/local/bin/healthcheck.sh
+RUN chmod +x /usr/local/bin/healthcheck.sh
+
 USER bge
 
-HEALTHCHECK --interval=10s --timeout=3s --start-period=120s --retries=3 \
-    CMD curl --fail --silent http://localhost:8081/health || exit 1
+HEALTHCHECK --interval=10s --timeout=5s --start-period=5s --retries=3 \
+    CMD ["/usr/local/bin/healthcheck.sh"]
 
 EXPOSE 8081
 # Absolute path keeps the CMD cwd-invariant and is good practice regardless of

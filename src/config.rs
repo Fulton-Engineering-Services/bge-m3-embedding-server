@@ -151,6 +151,16 @@ pub struct Config {
     /// Set with `BGE_M3_BIND`. Defaults to `0.0.0.0:8081`.
     /// The `0.0.0.0` default is intentional for Docker container deployments.
     pub bind_addr: String,
+    /// Path to the TLS certificate PEM file.
+    ///
+    /// Set with `BGE_M3_TLS_CERT_PATH`. When set together with
+    /// `BGE_M3_TLS_KEY_PATH` and the `tls` Cargo feature is compiled in,
+    /// the server binds HTTPS instead of HTTP.
+    pub tls_cert_path: Option<std::path::PathBuf>,
+    /// Path to the TLS private key PEM file.
+    ///
+    /// Set with `BGE_M3_TLS_KEY_PATH`.
+    pub tls_key_path: Option<std::path::PathBuf>,
     /// Number of embedding worker threads to spawn.
     ///
     /// Set with `BGE_M3_WORKERS`. Defaults to `2`. Minimum effective value is `1`.
@@ -410,9 +420,36 @@ impl Config {
     /// Creates a [`Config`] by reading environment variables.
     ///
     /// Unrecognized or missing variables fall back to their defaults.
-    #[must_use]
-    pub fn from_env() -> Self {
-        Self::from_lookup(|key| env::var(key).ok())
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when exactly one of `BGE_M3_TLS_CERT_PATH` /
+    /// `BGE_M3_TLS_KEY_PATH` is set: a half-configured TLS pair would cause
+    /// the server to silently fall back to plain HTTP rather than fail loudly.
+    pub fn from_env() -> anyhow::Result<Self> {
+        let cfg = Self::from_lookup(|key| env::var(key).ok());
+        cfg.validate()?;
+        Ok(cfg)
+    }
+
+    /// Validates configuration invariants that cannot be enforced by the
+    /// type system alone.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when exactly one of `tls_cert_path` / `tls_key_path` is
+    /// `Some`. Both must be present or both must be absent.
+    pub(crate) fn validate(&self) -> anyhow::Result<()> {
+        match (&self.tls_cert_path, &self.tls_key_path) {
+            (Some(_), None) | (None, Some(_)) => {
+                anyhow::bail!(
+                    "TLS misconfiguration: BGE_M3_TLS_CERT_PATH and \
+                     BGE_M3_TLS_KEY_PATH must both be set or both be absent"
+                );
+            }
+            _ => {}
+        }
+        Ok(())
     }
 
     #[allow(clippy::too_many_lines)]
@@ -604,6 +641,9 @@ impl Config {
             .and_then(|v| v.parse::<usize>().ok())
             .unwrap_or(33_554_432);
 
+        let tls_cert_path = lookup("BGE_M3_TLS_CERT_PATH").map(std::path::PathBuf::from);
+        let tls_key_path = lookup("BGE_M3_TLS_KEY_PATH").map(std::path::PathBuf::from);
+
         let warmup_only = lookup("BGE_M3_WARMUP_ONLY")
             .is_some_and(|v| matches!(v.as_str(), "1" | "true" | "yes"));
 
@@ -637,6 +677,8 @@ impl Config {
         Self {
             cache_dir: lookup("BGE_M3_CACHE_DIR").unwrap_or_else(|| "/cache".to_string()),
             bind_addr: lookup("BGE_M3_BIND").unwrap_or_else(|| "0.0.0.0:8081".to_string()),
+            tls_cert_path,
+            tls_key_path,
             workers,
             intra_threads,
             max_batch,

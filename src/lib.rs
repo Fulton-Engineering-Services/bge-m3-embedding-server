@@ -137,7 +137,29 @@ pub async fn run() -> anyhow::Result<()> {
         "bge-m3-embedding-server build info"
     );
 
-    let cfg = Config::from_env();
+    // Install a rustls crypto provider before any rustls user (hf-hub's
+    // reqwest::Client, axum-server's RustlsConfig, etc.) is constructed.
+    //
+    // rustls 0.23+ refuses to auto-select when more than one provider is
+    // visible in the dep graph; bge-m3-embedding-server pulls rustls through
+    // two paths:
+    //   - `hf-hub` → reqwest (rustls-tls)        → defaults to aws-lc-rs
+    //   - `axum-server` (tls-rustls feature)     → defaults to ring (via
+    //                                                 tokio-rustls)
+    // Both are present in the compiled binary, so rustls cannot pick. Without
+    // an explicit install, the process panics during worker model load (first
+    // hf-hub fetch) with: "Could not automatically determine the process-level
+    // CryptoProvider".
+    //
+    // `.ok()` lets us re-enter from tests where a provider may already be set.
+    #[cfg(feature = "tls")]
+    {
+        rustls::crypto::aws_lc_rs::default_provider()
+            .install_default()
+            .ok();
+    }
+
+    let cfg = Config::from_env()?;
 
     let disable_probe_cache = std::env::var("BGE_M3_DISABLE_PROBE_CACHE")
         .is_ok_and(|v| matches!(v.as_str(), "1" | "true" | "yes"));
@@ -391,9 +413,6 @@ pub async fn run() -> anyhow::Result<()> {
 
     let app = build_router(Arc::clone(&state), cfg.max_body_bytes);
 
-    let listener = tokio::net::TcpListener::bind(&cfg.bind_addr).await?;
-    info!(bind = %cfg.bind_addr, "Listening");
-
     let state_for_readiness = Arc::clone(&state);
     let cfg_max_seq = cfg.max_seq_length;
     let cfg_workers = cfg.workers;
@@ -452,6 +471,34 @@ pub async fn run() -> anyhow::Result<()> {
         });
     }
 
+    #[cfg(feature = "tls")]
+    if let (Some(cert), Some(key)) = (cfg.tls_cert_path.as_ref(), cfg.tls_key_path.as_ref()) {
+        use axum_server::tls_rustls::RustlsConfig;
+        use axum_server::Handle;
+        let tls_config = RustlsConfig::from_pem_file(cert, key)
+            .await
+            .map_err(|e| anyhow::anyhow!("TLS config error: {e}"))?;
+        let addr: std::net::SocketAddr = cfg
+            .bind_addr
+            .parse()
+            .map_err(|e| anyhow::anyhow!("invalid bind addr: {e}"))?;
+        info!(bind = %cfg.bind_addr, mode = "tls", "Listening");
+        let handle = Handle::new();
+        let h = handle.clone();
+        tokio::spawn(async move {
+            tokio::signal::ctrl_c().await.ok();
+            tracing::info!("TLS shutdown signal received, draining connections");
+            h.graceful_shutdown(Some(std::time::Duration::from_secs(30)));
+        });
+        axum_server::bind_rustls(addr, tls_config)
+            .handle(handle)
+            .serve(app.into_make_service())
+            .await?;
+        return Ok(());
+    }
+
+    let listener = tokio::net::TcpListener::bind(&cfg.bind_addr).await?;
+    info!(bind = %cfg.bind_addr, mode = "plain", "Listening");
     axum::serve(listener, app).await?;
     Ok(())
 }
@@ -564,6 +611,69 @@ mod tests {
             live.load(Ordering::Acquire),
             3,
             "live counter must be untouched after timeout"
+        );
+    }
+
+    // ─── TLS cert-loading path ────────────────────────────────────────────
+    //
+    // The axum_server::bind_rustls(...).serve(...) call requires an actual
+    // listening socket and cannot be integration-tested here. These tests
+    // exercise the RustlsConfig::from_pem_file path that precedes it,
+    // covering the cert-loading and error-mapping logic in `run()`.
+
+    /// `RustlsConfig::from_pem_file` succeeds when given valid PEM files
+    /// produced by rcgen.  This covers the happy-path cert-loading lines in
+    /// the `#[cfg(feature = "tls")]` bind block inside `run()`.
+    #[cfg(feature = "tls")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn tls_rustls_config_loads_valid_pem_files() {
+        use axum_server::tls_rustls::RustlsConfig;
+        use rcgen::{generate_simple_self_signed, CertifiedKey};
+
+        // Both aws-lc-rs and ring are in the dep tree; install aws-lc-rs
+        // explicitly so rustls 0.23 does not panic with an "ambiguous
+        // provider" error before we even read the PEM files.
+        rustls::crypto::aws_lc_rs::default_provider()
+            .install_default()
+            .ok();
+
+        let CertifiedKey { cert, key_pair } =
+            generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let cert_pem = cert.pem();
+        let key_pem = key_pair.serialize_pem();
+
+        let cert_file = tempfile::NamedTempFile::new().unwrap();
+        let key_file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(cert_file.path(), &cert_pem).unwrap();
+        std::fs::write(key_file.path(), &key_pem).unwrap();
+
+        let result = RustlsConfig::from_pem_file(cert_file.path(), key_file.path()).await;
+        assert!(
+            result.is_ok(),
+            "RustlsConfig::from_pem_file must succeed with valid PEM files"
+        );
+    }
+
+    /// `RustlsConfig::from_pem_file` returns an error when the cert file does
+    /// not exist.  This covers the `.map_err(|e| anyhow::anyhow!(...))` arm
+    /// in the TLS bind block.
+    #[cfg(feature = "tls")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn tls_rustls_config_errors_on_missing_cert_file() {
+        use axum_server::tls_rustls::RustlsConfig;
+
+        rustls::crypto::aws_lc_rs::default_provider()
+            .install_default()
+            .ok();
+
+        let result = RustlsConfig::from_pem_file(
+            "/nonexistent/path/server.crt",
+            "/nonexistent/path/server.key",
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "RustlsConfig::from_pem_file must return Err for missing files"
         );
     }
 }
