@@ -138,33 +138,17 @@ fn is_trt_jit_oom(e: &anyhow::Error) -> bool {
 /// `live_workers`. ECS replaces the task once all workers have exited,
 /// resetting the CUDA driver state.
 ///
-/// # Production evidence (2026-05-22, task `a81a2c44e13b4b1cbd71263fb1279ca5`)
-///
-/// `lockbox-bge-m3-gpu-baseline` running image `1.5.7-cuda-tls` entered its
-/// request loop at 19:28:54 UTC, served 4 successful batch=1 dense embeds, and
-/// then received a `/v1/embeddings:both` call that bin-packed to a `(2, _)`
-/// chunk at 19:32:52 UTC. The deployed warmup grid was batch=1 only, so TRT
-/// JIT-compiled the dual-output graph for batch=2. The autotuner's first
-/// tactic for the fused `value/MatMul + LayerNorm` foreign-node requested
-/// **1,116,691,496,960 bytes (~1 TiB)** from the CUDA allocator (TRT's
-/// `trt_max_workspace_bytes=10 GiB` cap does NOT bound autotuner tactic
-/// scratch — this is a TRT EP limitation), the allocator returned
-/// `Error Code 1`, the autotuner exhausted its candidate tactics, and the
-/// engine builder emitted exactly the bare error string this function
-/// matches:
-///
-/// > `TensorRT EP failed to create engine from network`
-///
-/// `is_trt_engine_build_fatal` returned `true`, the worker exited at
-/// 19:32:57.822 UTC, `WorkerGuard` decremented `live_workers` to 0, and
-/// the pool served 503s until ECS replaced the task. Without this function
-/// the worker would have stayed alive in a broken state — the original
-/// pre-PR-89 behaviour.
-///
-/// This confirms that the unqualified `failed to create engine from network`
-/// pattern (no `workspace` / `alloc` / `memory` qualifier) is fatal in
-/// production. Keep this function's pattern set minimal and explicit; do not
-/// fold it into `is_trt_jit_oom`.
+/// The unqualified `failed to create engine from network` pattern is included
+/// without an OOM qualifier because it has been observed in practice as the
+/// terminal error after the TRT autotuner exhausts its tactic candidates —
+/// typically because of a pathological scratch-buffer allocation request that
+/// the CUDA allocator cannot satisfy. The TRT EP's `trt_max_workspace_bytes`
+/// option does not bound autotuner tactic scratch, so a per-tactic allocation
+/// of many gigabytes (or even terabytes) on a fused multi-precision foreign
+/// node is reachable for shapes outside the pre-warmed engine cache. Once
+/// this pattern fires, the CUDA context is considered unrecoverable for the
+/// lifetime of the process; keep this function's pattern set minimal and
+/// explicit and do not fold it into `is_trt_jit_oom`.
 fn is_trt_engine_build_fatal(e: &anyhow::Error) -> bool {
     let lowercase = format!("{e}").to_lowercase();
     lowercase.contains("failed to build engine")

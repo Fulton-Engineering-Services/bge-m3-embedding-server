@@ -25,10 +25,6 @@ use super::helpers::lookup_from;
 /// The default warmup grid is `{1, 2, 4, 8, 16, 32} × {128, 512, 2048, 8192}` in
 /// batch-major order so the smallest batches (which dominate real router
 /// traffic) compile first.
-///
-/// Batch=2 and batch=8 rows added 2026-05-22 after the production
-/// `lockbox-bge-m3-gpu-baseline` task crashed on a batch=2 JIT compile that
-/// the original 16-shape grid did not cover.
 fn default_warmup_grid() -> Vec<(usize, usize)> {
     vec![
         (1, 128),
@@ -132,10 +128,10 @@ fn trt_warmup_shapes_default_grid_is_batch_major() {
 
 #[test]
 fn trt_warmup_shapes_default_grid_covers_small_batches() {
-    // Regression guard: the 2026-05-22 incident proved batch=2 and batch=8
-    // are first-class router shapes (bin-pack of small `/v1/embeddings:both`
-    // requests). Removing either row from the default grid would re-open the
-    // JIT-during-inference window that triggered the 1 TiB allocation bug.
+    // Regression guard: batch=2 and batch=8 are first-class router shapes
+    // (bin-pack of small `/v1/embeddings:both` requests). Removing either row
+    // from the default grid would re-open the JIT-during-inference window
+    // that pathological TRT autotuner allocations can exploit.
     let defaults = default_warmup_grid();
     for b in [1usize, 2, 4, 8, 16, 32] {
         assert!(
@@ -170,8 +166,9 @@ fn coverage_helper_accepts_default_grid() {
     warn_if_small_batch_coverage_missing(&default_warmup_grid());
 }
 
-/// The exact production misconfiguration from the 2026-05-22 incident:
-/// batch=1 only. Should be flagged as missing batch=2 coverage.
+/// A batch=1-only grid (a common but dangerous override seen on
+/// minimally-configured deployments) must be flagged as missing batch=2
+/// coverage.
 #[test]
 fn coverage_helper_flags_batch_1_only_grid() {
     let batch_1_only = vec![(1, 128), (1, 512), (1, 2048), (1, 8192)];

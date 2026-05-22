@@ -734,28 +734,22 @@ impl Config {
 /// grid composed in batch-major order.
 ///
 /// Batch is the outer dimension so the smallest batches (which dominate
-/// real router traffic — `chunks = 1–4 × max_chunk_seq`) are fully compiled
-/// first; larger batches that are mostly observed during bulk re-indexing
-/// fill in afterwards. Within each batch the sequence dimension grows
-/// monotonically so the cheap `_ × 128` shape comes before the expensive
-/// `_ × 8192` shape — operators watching `/health` see progress quickly.
+/// real router traffic — single-text and two-text requests are the most
+/// common pattern for both ad-hoc queries and bulk indexers) are fully
+/// compiled first; larger batches typical of bulk re-indexing fill in
+/// afterwards. Within each batch the sequence dimension grows monotonically
+/// so the cheap `_ × 128` shape comes before the expensive `_ × 8192` shape —
+/// operators watching `/health` see progress quickly.
 ///
-/// Production observation (2026-05 codekeeper investigation): real router
-/// traffic shows `chunks = 1–2 × max_chunk_seq` up to ~6 000 token positions.
-/// Previously-unseen shapes triggered in-band engine compilation in the middle
-/// of a real request, producing 56–356 s `inference_ms` values.
-///
-/// **Batch=2 and batch=8 added 2026-05-22** after the `lockbox-bge-m3-gpu-baseline`
-/// task (`a81a2c44…`) crashed within 4 minutes of entering its request loop. A
-/// `/v1/embeddings:both` call bin-packed to a `(2, _)` chunk; that shape was
-/// missing from both the deployed override AND this default grid. TRT
-/// JIT-compiled the dual-output graph for batch=2 and the autotuner issued a
-/// pathological **1,116,691,496,960-byte (~1 TiB)** allocation request —
-/// `IBuilder::buildSerializedNetwork: Error Code 10 → failed to create engine
-/// from network`. `is_trt_engine_build_fatal` correctly tripped and the worker
-/// exited, but the cluster was unavailable until ECS replaced the task. Adding
-/// `(2, _)` and `(8, _)` rows closes the gap between batch=1 and batch=4 where
-/// the most common router pack-sizes land.
+/// Previously-unseen shapes trigger in-band engine compilation in the middle
+/// of a real request, producing tens-to-hundreds-of-seconds `inference_ms`
+/// values. In the worst case, TRT JIT for the dual-output
+/// `/v1/embeddings:both` graph at unseen small-batch shapes can request
+/// pathological autotuner allocations (multiple terabytes on a fused
+/// `LayerNorm` + `MatMul` foreign-node) that the CUDA allocator cannot
+/// satisfy, producing a fatal `failed to create engine from network` error.
+/// Including `(1, _)`, `(2, _)`, `(4, _)`, and `(8, _)` rows closes the JIT
+/// window for the common router pack-sizes.
 ///
 /// This 24-shape grid covers the full realistic shape space so every router
 /// request hits a pre-compiled engine.
@@ -826,19 +820,12 @@ pub(crate) fn parse_trt_warmup_shapes(raw: Option<String>) -> Vec<(usize, usize)
 ///
 /// Concretely, real `/v1/embeddings`, `/v1/sparse-embeddings`, and
 /// `/v1/embeddings:both` calls produce chunk batches of 1–2 (single-text or
-/// two-text requests are the dominant traffic pattern for both the codekeeper
-/// indexer and ad-hoc admin queries). When the warmup grid omits both batch=1
-/// and batch=2, the first such request triggers in-band TRT JIT compilation,
-/// which on the `:both` route has been observed to trigger pathological
-/// autotuner allocation requests (up to ~1 TiB on a 46 GB GPU) and a fatal
-/// `failed to create engine from network` error.
-///
-/// **Production evidence:** `lockbox-bge-m3-gpu-baseline` task `a81a2c44…` on
-/// 2026-05-22 deployed with `BGE_M3_TRT_WARMUP_SHAPES=1x128,1x512,1x2048,1x8192`
-/// (batch=1 only). The first batch=2 `/v1/embeddings:both` request after the
-/// task entered its request loop hit the TRT autotuner bug above; the worker
-/// exited via `is_trt_engine_build_fatal` and the task served only 503s until
-/// it was manually replaced.
+/// two-text requests are the dominant traffic pattern for both ad-hoc queries
+/// and bulk indexers). When the warmup grid omits both batch=1 and batch=2,
+/// the first such request triggers in-band TRT JIT compilation, which on the
+/// `:both` route has been observed to trigger pathological autotuner
+/// allocation requests (multiple terabytes) and a fatal `failed to create
+/// engine from network` error.
 ///
 /// Greppable tag: `trt_warmup_shape_coverage_gap`. Operators are not blocked
 /// from deploying a batch-1-only grid (e.g. local dev workstations) — the
@@ -859,9 +846,9 @@ pub(crate) fn warn_if_small_batch_coverage_missing(shapes: &[(usize, usize)]) {
              real router traffic routinely bin-packs to these shapes and the \
              first such request will trigger in-band TRT JIT, which can \
              produce a pathological autotuner allocation failure on the \
-             /v1/embeddings:both route (2026-05-22 incident). Add `1x…` and \
-             `2x…` rows to BGE_M3_TRT_WARMUP_SHAPES, or unset it to use the \
-             default 24-shape grid."
+             /v1/embeddings:both route. Add `1x…` and `2x…` rows to \
+             BGE_M3_TRT_WARMUP_SHAPES, or unset it to use the default \
+             24-shape grid."
         );
     }
 }
