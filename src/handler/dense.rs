@@ -45,6 +45,7 @@ use crate::state::AppState;
         max_chunk_seq,
         tokenize_ms,
         inference_ms,
+        queue_wait_ms,
         total_ms,
     )
 )]
@@ -73,6 +74,8 @@ pub async fn dense_embeddings(
         .await
         .expect("request semaphore is never closed");
 
+    let queue_wait_ms = u64::try_from(t0.elapsed().as_millis()).unwrap_or(u64::MAX);
+
     let (embeddings, embed_stats) = state.pool.dense(texts).await?;
 
     let total_ms = u64::try_from(t0.elapsed().as_millis()).unwrap_or(u64::MAX);
@@ -81,6 +84,7 @@ pub async fn dense_embeddings(
         .record("max_chunk_seq", embed_stats.max_chunk_seq)
         .record("tokenize_ms", embed_stats.tokenize_ms)
         .record("inference_ms", embed_stats.inference_ms)
+        .record("queue_wait_ms", queue_wait_ms)
         .record("total_ms", total_ms);
     // x_headers (normalized: hyphens → underscores) are emitted at event level so
     // they appear under $.fields.x_headers in JSON logs and are accessible to
@@ -95,8 +99,13 @@ pub async fn dense_embeddings(
         chunks = embed_stats.chunks,
         max_chunk_seq = embed_stats.max_chunk_seq,
         total_token_positions = embed_stats.total_token_positions,
+        seq_len_min = embed_stats.seq_len_min,
+        seq_len_max = embed_stats.seq_len_max,
+        seq_len_mean = embed_stats.seq_len_mean,
+        seq_len_p95 = embed_stats.seq_len_p95,
         tokenize_ms = embed_stats.tokenize_ms,
         inference_ms = embed_stats.inference_ms,
+        queue_wait_ms,
         total_ms,
         x_headers = x_headers_val,
         "embedding request complete"
