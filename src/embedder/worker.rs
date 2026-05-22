@@ -112,6 +112,37 @@ fn is_trt_jit_oom(e: &anyhow::Error) -> bool {
                 || lowercase.contains("tactic")))
 }
 
+/// Returns `true` when an ORT error string indicates a TRT engine build
+/// failure severe enough that the worker should exit rather than retry.
+///
+/// Patterns matched:
+///
+/// 1. **`failed to build engine`** — top-level TRT engine build failure,
+///    typically produced by `IBuilder::buildSerializedNetwork` on a corrupted
+///    CUDA context or builder network state.
+/// 2. **`failed to create engine from network`** — TRT network-level
+///    builder failure (distinct from the per-kernel `failed to create engine`
+///    OOM messages that `is_trt_jit_oom` already catches). This pattern
+///    indicates the TRT engine builder itself is in an unrecoverable state;
+///    halving the workspace and retrying will not help.
+///
+/// Unlike [`is_trt_jit_oom`], these patterns are matched **without** an
+/// additional qualifier because they refer to different failure modes.
+/// `failed to create engine from network` is always fatal regardless of
+/// the surrounding context. `failed to build engine` may overlap with the
+/// OOM retry patterns; we detect it here only when `is_trt_jit_oom` has
+/// already returned `false` (and the retry was therefore skipped).
+///
+/// When this function returns `true` from within `run_worker`, the worker
+/// exits immediately (returns `Err`), causing `WorkerGuard` to decrement
+/// `live_workers`. ECS replaces the task once all workers have exited,
+/// resetting the CUDA driver state.
+fn is_trt_engine_build_fatal(e: &anyhow::Error) -> bool {
+    let lowercase = format!("{e}").to_lowercase();
+    lowercase.contains("failed to build engine")
+        || lowercase.contains("failed to create engine from network")
+}
+
 /// Wraps an embed call with the standard TRT JIT-OOM retry-once-with-halved-budget
 /// pattern.
 ///
@@ -358,6 +389,18 @@ pub struct WorkerConfig {
     /// `false` to preserve pre-fix behaviour (WARN only).
     pub prewarm_strict: bool,
 
+    /// Consecutive-failure threshold for the per-worker inference circuit
+    /// breaker.
+    ///
+    /// When a worker accumulates this many consecutive errors from an
+    /// inference call (`embed_dense`, `embed_sparse`, or `embed_both`), it
+    /// drops its ORT session (cleaning the CUDA arena), decrements
+    /// `loaded_workers`, and waits for the next request to trigger a model
+    /// reload. The counter resets to zero on any successful inference.
+    ///
+    /// Sourced from `BGE_M3_CIRCUIT_BREAKER_THRESHOLD`; defaults to `5`.
+    pub circuit_breaker_threshold: usize,
+
     /// **Destructive** stale-SM TRT engine cache GC flag.
     ///
     /// Only present when the `cache-gc` Cargo feature is compiled in.
@@ -438,6 +481,24 @@ fn log_if_abandoned_mid_flight<T>(
         "request abandoned by client during inference (work discarded; \
          ORT session.run() cannot be interrupted mid-call)"
     );
+}
+
+/// Outcome of a single inference call in the worker request loop.
+///
+/// Used to communicate circuit-breaker and fatal-exit decisions out of the
+/// nested borrow scope (where `session`/`tokenizer` live) into the outer
+/// scope where `models` can be safely mutated.
+#[derive(Default)]
+enum InferenceOutcome {
+    /// Inference succeeded; reset the consecutive-failure counter.
+    #[default]
+    Ok,
+    /// Inference failed; increment the consecutive-failure counter.
+    Failure,
+    /// Fatal TRT engine build error; worker should exit immediately.
+    TrtFatal,
+    /// Consecutive-failure threshold reached; unload models and reset counter.
+    CircuitBreak,
 }
 
 /// Runs one probe batch: tokenize texts, build padded arrays, call `session.run()`,
@@ -800,6 +861,14 @@ pub(super) fn run_worker(
         .as_ref()
         .map(tokio::sync::broadcast::Sender::subscribe);
 
+    // Per-worker consecutive-failure counter for the inference circuit breaker.
+    // Incremented on every inference Err; reset to 0 on every inference Ok.
+    // When it reaches `config.circuit_breaker_threshold` the worker unloads
+    // its models (drops the ORT session, clears the CUDA arena) and decrements
+    // `loaded_workers`. The standard idle-reload path handles model recovery on
+    // the next incoming request.
+    let mut consecutive_failures: u64 = 0;
+
     info!("Worker {id} entering request loop");
     loop {
         // Drain peer engine-ready notifications and run trt_prewarm for any
@@ -912,194 +981,374 @@ pub(super) fn run_worker(
                     }
                 }
 
-                let (session, tokenizer) =
-                    models.as_mut().expect("models loaded after reload check");
+                // Flags for circuit-breaker and fatal-exit decisions; set
+                // inside the borrow scope of `session`/`tokenizer` and acted
+                // on AFTER that scope ends so `models` can be safely mutated.
+                // `InferenceOutcome::TrtFatal` triggers a worker exit.
+                // `InferenceOutcome::CircuitBreak` unloads the ORT session.
+                let outcome: InferenceOutcome;
+                let skip_to_next: bool;
 
-                match request {
-                    EmbedRequest::Dense { texts, reply } => {
-                        // Pre-dispatch abandonment check: the router's hedged
-                        // race or the original HTTP client may have already
-                        // disconnected while this request sat in the worker
-                        // queue. ORT `session.run()` is a blocking C call that
-                        // cannot be interrupted mid-MatMul (see CLAUDE.md
-                        // "client disconnect" gotcha), so the only opportunity
-                        // we have to save work is BEFORE inference starts. The
-                        // post-inference check below is observability only.
-                        if reply.is_closed() {
-                            tracing::warn!(
-                                worker_id = id,
-                                route = "dense",
-                                batch_size = texts.len(),
-                                "request abandoned by client before dispatch — skipping inference"
-                            );
-                            continue;
-                        }
-                        let t_inference = std::time::Instant::now();
-                        let cm_guard = config.cost_model.load();
-                        let result = embed_with_trt_retry(
-                            |cm| embed_dense(session, tokenizer, &texts, cm, config.model_variant),
-                            &cm_guard,
-                            id,
-                            "dense",
-                        )
-                        .map_err(|e| anyhow::anyhow!("Dense embed error: {e}"));
-                        let inference_ms = t_inference.elapsed().as_millis();
-                        if let Ok((_, ref stats)) = result {
-                            if let Some(shape) = log_inference_complete(
-                                stats,
-                                id,
-                                "dense",
-                                config.jit_suspect_tx.as_ref(),
-                                config.engine_propagation_tx.as_ref(),
-                                texts.len(),
-                            ) {
-                                warmed_local.insert(shape);
-                            }
-                            tracing::info!(
-                                worker_id = id,
-                                chunks = stats.chunks,
-                                max_chunk_seq = stats.max_chunk_seq,
-                                total_token_positions = stats.total_token_positions,
-                                seq_len_min = stats.seq_len_min,
-                                seq_len_max = stats.seq_len_max,
-                                seq_len_mean = stats.seq_len_mean,
-                                seq_len_p95 = stats.seq_len_p95,
-                                tokenize_ms = stats.tokenize_ms,
-                                inference_ms = stats.inference_ms,
-                                "worker: dense embed complete"
-                            );
-                        }
-                        log_if_abandoned_mid_flight(&reply, "dense", id, &result, inference_ms);
-                        let _ = reply.send(result);
-                    }
-                    EmbedRequest::Sparse { texts, reply } => {
-                        if reply.is_closed() {
-                            tracing::warn!(
-                                worker_id = id,
-                                route = "sparse",
-                                batch_size = texts.len(),
-                                "request abandoned by client before dispatch — skipping inference"
-                            );
-                            continue;
-                        }
-                        let t_inference = std::time::Instant::now();
-                        let cm_guard = config.cost_model.load();
-                        let result = embed_with_trt_retry(
-                            |cm| embed_sparse(session, tokenizer, &texts, cm, config.model_variant),
-                            &cm_guard,
-                            id,
-                            "sparse",
-                        )
-                        .map_err(|e| anyhow::anyhow!("Sparse embed error: {e}"));
-                        let inference_ms = t_inference.elapsed().as_millis();
-                        if let Ok((_, ref stats)) = result {
-                            if let Some(shape) = log_inference_complete(
-                                stats,
-                                id,
-                                "sparse",
-                                config.jit_suspect_tx.as_ref(),
-                                config.engine_propagation_tx.as_ref(),
-                                texts.len(),
-                            ) {
-                                warmed_local.insert(shape);
-                            }
-                            tracing::info!(
-                                worker_id = id,
-                                chunks = stats.chunks,
-                                max_chunk_seq = stats.max_chunk_seq,
-                                total_token_positions = stats.total_token_positions,
-                                seq_len_min = stats.seq_len_min,
-                                seq_len_max = stats.seq_len_max,
-                                seq_len_mean = stats.seq_len_mean,
-                                seq_len_p95 = stats.seq_len_p95,
-                                tokenize_ms = stats.tokenize_ms,
-                                inference_ms = stats.inference_ms,
-                                "worker: sparse embed complete"
-                            );
-                        }
-                        log_if_abandoned_mid_flight(&reply, "sparse", id, &result, inference_ms);
-                        let _ = reply.send(result);
-                    }
-                    EmbedRequest::Both { texts, reply } => {
-                        if reply.is_closed() {
-                            tracing::warn!(
-                                worker_id = id,
-                                route = "both",
-                                batch_size = texts.len(),
-                                "request abandoned by client before dispatch — skipping inference"
-                            );
-                            continue;
-                        }
-                        let t_inference = std::time::Instant::now();
-                        let cm_guard = config.cost_model.load();
-                        let result = embed_with_trt_retry(
-                            |cm| embed_both(session, tokenizer, &texts, cm, config.model_variant),
-                            &cm_guard,
-                            id,
-                            "both",
-                        )
-                        .map_err(|e| anyhow::anyhow!("Dual embed error: {e}"));
-                        let inference_ms = t_inference.elapsed().as_millis();
-                        if let Ok((_, ref stats)) = result {
-                            if let Some(shape) = log_inference_complete(
-                                stats,
-                                id,
-                                "both",
-                                config.jit_suspect_tx.as_ref(),
-                                config.engine_propagation_tx.as_ref(),
-                                texts.len(),
-                            ) {
-                                warmed_local.insert(shape);
-                            }
-                            tracing::info!(
-                                worker_id = id,
-                                chunks = stats.chunks,
-                                max_chunk_seq = stats.max_chunk_seq,
-                                total_token_positions = stats.total_token_positions,
-                                seq_len_min = stats.seq_len_min,
-                                seq_len_max = stats.seq_len_max,
-                                seq_len_mean = stats.seq_len_mean,
-                                seq_len_p95 = stats.seq_len_p95,
-                                tokenize_ms = stats.tokenize_ms,
-                                inference_ms = stats.inference_ms,
-                                "worker: both embed complete"
-                            );
-                        }
-                        log_if_abandoned_mid_flight(&reply, "both", id, &result, inference_ms);
-                        let _ = reply.send(result);
-                    }
-                    EmbedRequest::Probe { texts, reply } => {
-                        // Probe: tokenize once without padding, run dense inference
-                        // on a single flat batch at the chunk's natural max_seq.
-                        // Probes are internal — no client-disconnect path applies.
-                        let result = run_probe_batch(session, tokenizer, &texts);
-                        let _ = reply.send(result);
-                    }
-                    EmbedRequest::AdaptiveWarmup { batch, seq, ack } => {
-                        // Run trt_prewarm for a single shape so the TRT EP
-                        // compiles and caches the engine during an idle window.
-                        // On CPU/CUDA EP this is a cheap no-op (returns Ok(0)).
-                        let result: anyhow::Result<u64> = if config.ep == EpSelection::TensorRt {
-                            let shape = vec![(batch, seq)];
-                            let stats = trt_prewarm(
-                                session,
-                                &shape,
-                                id,
-                                &cache_dir,
-                                detected_sm.as_deref(),
-                            );
-                            if stats.warmed > 0 || stats.fully_cached {
-                                Ok(stats.total_compile_ms)
+                {
+                    let (session, tokenizer) =
+                        models.as_mut().expect("models loaded after reload check");
+
+                    // `skip_to_next` signals that the arm called `continue` — we
+                    // replicate pre-dispatch abandonment skips without an actual
+                    // `continue` (which can't cross a block boundary).
+                    let mut inner_skip = false;
+                    let mut inner_outcome = InferenceOutcome::Ok;
+
+                    match request {
+                        EmbedRequest::Dense { texts, reply } => {
+                            // Pre-dispatch abandonment check: the router's hedged
+                            // race or the original HTTP client may have already
+                            // disconnected while this request sat in the worker
+                            // queue. ORT `session.run()` is a blocking C call that
+                            // cannot be interrupted mid-MatMul (see CLAUDE.md
+                            // "client disconnect" gotcha), so the only opportunity
+                            // we have to save work is BEFORE inference starts. The
+                            // post-inference check below is observability only.
+                            if reply.is_closed() {
+                                tracing::warn!(
+                                    worker_id = id,
+                                    route = "dense",
+                                    batch_size = texts.len(),
+                                    "request abandoned by client before dispatch — skipping inference"
+                                );
+                                inner_skip = true;
                             } else {
-                                Err(anyhow::anyhow!(
-                                    "adaptive warmup: no shapes warmed for \
+                                let t_inference = std::time::Instant::now();
+                                let cm_guard = config.cost_model.load();
+                                let result = embed_with_trt_retry(
+                                    |cm| {
+                                        embed_dense(
+                                            session,
+                                            tokenizer,
+                                            &texts,
+                                            cm,
+                                            config.model_variant,
+                                        )
+                                    },
+                                    &cm_guard,
+                                    id,
+                                    "dense",
+                                )
+                                .map_err(|e| anyhow::anyhow!("Dense embed error: {e}"));
+                                let inference_ms = t_inference.elapsed().as_millis();
+                                let trt_fatal =
+                                    result.as_ref().err().is_some_and(is_trt_engine_build_fatal);
+                                let is_err = result.is_err();
+                                if let Ok((_, ref stats)) = result {
+                                    if let Some(shape) = log_inference_complete(
+                                        stats,
+                                        id,
+                                        "dense",
+                                        config.jit_suspect_tx.as_ref(),
+                                        config.engine_propagation_tx.as_ref(),
+                                        texts.len(),
+                                    ) {
+                                        warmed_local.insert(shape);
+                                    }
+                                    tracing::info!(
+                                        worker_id = id,
+                                        chunks = stats.chunks,
+                                        max_chunk_seq = stats.max_chunk_seq,
+                                        total_token_positions = stats.total_token_positions,
+                                        seq_len_min = stats.seq_len_min,
+                                        seq_len_max = stats.seq_len_max,
+                                        seq_len_mean = stats.seq_len_mean,
+                                        seq_len_p95 = stats.seq_len_p95,
+                                        tokenize_ms = stats.tokenize_ms,
+                                        inference_ms = stats.inference_ms,
+                                        "worker: dense embed complete"
+                                    );
+                                }
+                                if trt_fatal {
+                                    tracing::error!(
+                                        worker_id = id,
+                                        route = "dense",
+                                        consecutive_failures = consecutive_failures + 1,
+                                        "trt_fatal_engine_build: unrecoverable TRT state; \
+                                 worker exiting to reset CUDA arena"
+                                    );
+                                    inner_outcome = InferenceOutcome::TrtFatal;
+                                } else if is_err {
+                                    let next_failures = consecutive_failures + 1;
+                                    if next_failures
+                                        >= u64::try_from(config.circuit_breaker_threshold)
+                                            .unwrap_or(u64::MAX)
+                                    {
+                                        tracing::error!(
+                                            worker_id = id,
+                                            route = "dense",
+                                            consecutive_failures = next_failures,
+                                            threshold = config.circuit_breaker_threshold,
+                                            "circuit_breaker_tripped: unloading models to reset \
+                                     CUDA arena; worker will reload on next request"
+                                        );
+                                        inner_outcome = InferenceOutcome::CircuitBreak;
+                                    } else {
+                                        inner_outcome = InferenceOutcome::Failure;
+                                    }
+                                }
+                                log_if_abandoned_mid_flight(
+                                    &reply,
+                                    "dense",
+                                    id,
+                                    &result,
+                                    inference_ms,
+                                );
+                                let _ = reply.send(result);
+                            } // end else (not abandoned)
+                        }
+                        EmbedRequest::Sparse { texts, reply } => {
+                            if reply.is_closed() {
+                                tracing::warn!(
+                                    worker_id = id,
+                                    route = "sparse",
+                                    batch_size = texts.len(),
+                                    "request abandoned by client before dispatch — skipping inference"
+                                );
+                                inner_skip = true;
+                            } else {
+                                let t_inference = std::time::Instant::now();
+                                let cm_guard = config.cost_model.load();
+                                let result = embed_with_trt_retry(
+                                    |cm| {
+                                        embed_sparse(
+                                            session,
+                                            tokenizer,
+                                            &texts,
+                                            cm,
+                                            config.model_variant,
+                                        )
+                                    },
+                                    &cm_guard,
+                                    id,
+                                    "sparse",
+                                )
+                                .map_err(|e| anyhow::anyhow!("Sparse embed error: {e}"));
+                                let inference_ms = t_inference.elapsed().as_millis();
+                                let trt_fatal =
+                                    result.as_ref().err().is_some_and(is_trt_engine_build_fatal);
+                                let is_err = result.is_err();
+                                if let Ok((_, ref stats)) = result {
+                                    if let Some(shape) = log_inference_complete(
+                                        stats,
+                                        id,
+                                        "sparse",
+                                        config.jit_suspect_tx.as_ref(),
+                                        config.engine_propagation_tx.as_ref(),
+                                        texts.len(),
+                                    ) {
+                                        warmed_local.insert(shape);
+                                    }
+                                    tracing::info!(
+                                        worker_id = id,
+                                        chunks = stats.chunks,
+                                        max_chunk_seq = stats.max_chunk_seq,
+                                        total_token_positions = stats.total_token_positions,
+                                        seq_len_min = stats.seq_len_min,
+                                        seq_len_max = stats.seq_len_max,
+                                        seq_len_mean = stats.seq_len_mean,
+                                        seq_len_p95 = stats.seq_len_p95,
+                                        tokenize_ms = stats.tokenize_ms,
+                                        inference_ms = stats.inference_ms,
+                                        "worker: sparse embed complete"
+                                    );
+                                }
+                                if trt_fatal {
+                                    tracing::error!(
+                                        worker_id = id,
+                                        route = "sparse",
+                                        consecutive_failures = consecutive_failures + 1,
+                                        "trt_fatal_engine_build: unrecoverable TRT state; \
+                                 worker exiting to reset CUDA arena"
+                                    );
+                                    inner_outcome = InferenceOutcome::TrtFatal;
+                                } else if is_err {
+                                    let next_failures = consecutive_failures + 1;
+                                    if next_failures
+                                        >= u64::try_from(config.circuit_breaker_threshold)
+                                            .unwrap_or(u64::MAX)
+                                    {
+                                        tracing::error!(
+                                            worker_id = id,
+                                            route = "sparse",
+                                            consecutive_failures = next_failures,
+                                            threshold = config.circuit_breaker_threshold,
+                                            "circuit_breaker_tripped: unloading models to reset \
+                                     CUDA arena; worker will reload on next request"
+                                        );
+                                        inner_outcome = InferenceOutcome::CircuitBreak;
+                                    } else {
+                                        inner_outcome = InferenceOutcome::Failure;
+                                    }
+                                }
+                                log_if_abandoned_mid_flight(
+                                    &reply,
+                                    "sparse",
+                                    id,
+                                    &result,
+                                    inference_ms,
+                                );
+                                let _ = reply.send(result);
+                            } // end else (not abandoned)
+                        }
+                        EmbedRequest::Both { texts, reply } => {
+                            if reply.is_closed() {
+                                tracing::warn!(
+                                    worker_id = id,
+                                    route = "both",
+                                    batch_size = texts.len(),
+                                    "request abandoned by client before dispatch — skipping inference"
+                                );
+                                inner_skip = true;
+                            } else {
+                                let t_inference = std::time::Instant::now();
+                                let cm_guard = config.cost_model.load();
+                                let result = embed_with_trt_retry(
+                                    |cm| {
+                                        embed_both(
+                                            session,
+                                            tokenizer,
+                                            &texts,
+                                            cm,
+                                            config.model_variant,
+                                        )
+                                    },
+                                    &cm_guard,
+                                    id,
+                                    "both",
+                                )
+                                .map_err(|e| anyhow::anyhow!("Dual embed error: {e}"));
+                                let inference_ms = t_inference.elapsed().as_millis();
+                                let trt_fatal =
+                                    result.as_ref().err().is_some_and(is_trt_engine_build_fatal);
+                                let is_err = result.is_err();
+                                if let Ok((_, ref stats)) = result {
+                                    if let Some(shape) = log_inference_complete(
+                                        stats,
+                                        id,
+                                        "both",
+                                        config.jit_suspect_tx.as_ref(),
+                                        config.engine_propagation_tx.as_ref(),
+                                        texts.len(),
+                                    ) {
+                                        warmed_local.insert(shape);
+                                    }
+                                    tracing::info!(
+                                        worker_id = id,
+                                        chunks = stats.chunks,
+                                        max_chunk_seq = stats.max_chunk_seq,
+                                        total_token_positions = stats.total_token_positions,
+                                        seq_len_min = stats.seq_len_min,
+                                        seq_len_max = stats.seq_len_max,
+                                        seq_len_mean = stats.seq_len_mean,
+                                        seq_len_p95 = stats.seq_len_p95,
+                                        tokenize_ms = stats.tokenize_ms,
+                                        inference_ms = stats.inference_ms,
+                                        "worker: both embed complete"
+                                    );
+                                }
+                                if trt_fatal {
+                                    tracing::error!(
+                                        worker_id = id,
+                                        route = "both",
+                                        consecutive_failures = consecutive_failures + 1,
+                                        "trt_fatal_engine_build: unrecoverable TRT state; \
+                                 worker exiting to reset CUDA arena"
+                                    );
+                                    inner_outcome = InferenceOutcome::TrtFatal;
+                                } else if is_err {
+                                    let next_failures = consecutive_failures + 1;
+                                    if next_failures
+                                        >= u64::try_from(config.circuit_breaker_threshold)
+                                            .unwrap_or(u64::MAX)
+                                    {
+                                        tracing::error!(
+                                            worker_id = id,
+                                            route = "both",
+                                            consecutive_failures = next_failures,
+                                            threshold = config.circuit_breaker_threshold,
+                                            "circuit_breaker_tripped: unloading models to reset \
+                                     CUDA arena; worker will reload on next request"
+                                        );
+                                        inner_outcome = InferenceOutcome::CircuitBreak;
+                                    } else {
+                                        inner_outcome = InferenceOutcome::Failure;
+                                    }
+                                }
+                                log_if_abandoned_mid_flight(
+                                    &reply,
+                                    "both",
+                                    id,
+                                    &result,
+                                    inference_ms,
+                                );
+                                let _ = reply.send(result);
+                            } // end else (not abandoned)
+                        }
+                        EmbedRequest::Probe { texts, reply } => {
+                            // Probe: tokenize once without padding, run dense inference
+                            // on a single flat batch at the chunk's natural max_seq.
+                            // Probes are internal — no client-disconnect path applies.
+                            let result = run_probe_batch(session, tokenizer, &texts);
+                            let _ = reply.send(result);
+                        }
+                        EmbedRequest::AdaptiveWarmup { batch, seq, ack } => {
+                            // Run trt_prewarm for a single shape so the TRT EP
+                            // compiles and caches the engine during an idle window.
+                            // On CPU/CUDA EP this is a cheap no-op (returns Ok(0)).
+                            let result: anyhow::Result<u64> = if config.ep == EpSelection::TensorRt
+                            {
+                                let shape = vec![(batch, seq)];
+                                let stats = trt_prewarm(
+                                    session,
+                                    &shape,
+                                    id,
+                                    &cache_dir,
+                                    detected_sm.as_deref(),
+                                );
+                                if stats.warmed > 0 || stats.fully_cached {
+                                    Ok(stats.total_compile_ms)
+                                } else {
+                                    Err(anyhow::anyhow!(
+                                        "adaptive warmup: no shapes warmed for \
                                      ({batch}, {seq}) on worker {id}"
-                                ))
-                            }
-                        } else {
-                            Ok(0)
-                        };
-                        let _ = ack.send(result);
+                                    ))
+                                }
+                            } else {
+                                Ok(0)
+                            };
+                            let _ = ack.send(result);
+                        }
+                    } // end match request
+                    outcome = inner_outcome;
+                    skip_to_next = inner_skip;
+                } // end borrow scope — session and tokenizer dropped here
+
+                // --- Post-inference actions (models reborrow is now safe) ---
+                if skip_to_next {
+                    continue;
+                }
+                match outcome {
+                    InferenceOutcome::Ok => {
+                        consecutive_failures = 0;
+                    }
+                    InferenceOutcome::Failure => {
+                        consecutive_failures += 1;
+                    }
+                    InferenceOutcome::TrtFatal => {
+                        return Err(anyhow::anyhow!(
+                            "Worker {id} hit fatal TRT engine build error; exiting"
+                        ));
+                    }
+                    InferenceOutcome::CircuitBreak => {
+                        consecutive_failures = 0;
+                        models = None;
+                        loaded_workers.fetch_sub(1, Ordering::AcqRel);
                     }
                 }
             }

@@ -388,6 +388,20 @@ pub struct Config {
     /// that exceed the default limit (HTTP 413 Content Too Large).
     pub max_body_bytes: usize,
 
+    /// Number of consecutive inference failures that trips the per-worker
+    /// circuit breaker.
+    ///
+    /// Set with `BGE_M3_CIRCUIT_BREAKER_THRESHOLD`. Defaults to `5`.
+    ///
+    /// When a worker returns N consecutive errors from `embed_dense`,
+    /// `embed_sparse`, or `embed_both`, it unloads its ORT session (dropping
+    /// the CUDA arena) and decrements `loaded_workers`. `/health` transitions
+    /// to `idle` (200) when `loaded_workers == 0` and `fail` (503) when
+    /// `live_workers == 0`. On the next incoming request the worker reloads
+    /// from the on-disk model cache, resetting the counter. This limits blast
+    /// radius from a broken GPU state to ~5 requests before self-healing.
+    pub circuit_breaker_threshold: usize,
+
     /// When `true`, scan the TRT engine cache at worker startup and
     /// **destructively delete** plan files whose `_smXX` suffix does not
     /// match the current device. Sourced from `BGE_M3_TRT_CACHE_GC_ENABLED`,
@@ -641,6 +655,11 @@ impl Config {
             .and_then(|v| v.parse::<usize>().ok())
             .unwrap_or(33_554_432);
 
+        let circuit_breaker_threshold = lookup("BGE_M3_CIRCUIT_BREAKER_THRESHOLD")
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(5)
+            .max(1);
+
         let tls_cert_path = lookup("BGE_M3_TLS_CERT_PATH").map(std::path::PathBuf::from);
         let tls_key_path = lookup("BGE_M3_TLS_KEY_PATH").map(std::path::PathBuf::from);
 
@@ -699,6 +718,7 @@ impl Config {
             gpu_count,
             trt_warmup_shapes,
             max_body_bytes,
+            circuit_breaker_threshold,
             warmup_only,
             prewarm_strict,
             #[cfg(feature = "cache-gc")]

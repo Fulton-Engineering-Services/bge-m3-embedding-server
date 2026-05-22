@@ -52,7 +52,7 @@ pub(super) struct RouteAwareSpan;
 impl<B> MakeSpan<B> for RouteAwareSpan {
     fn make_span(&mut self, request: &axum::http::Request<B>) -> tracing::Span {
         let path = request.uri().path();
-        let is_noisy = matches!(path, "/health" | "/v1/models");
+        let is_noisy = matches!(path, "/health" | "/health/deep" | "/v1/models");
         let method = request.method().as_str();
         if is_noisy {
             tracing::debug_span!(
@@ -91,6 +91,7 @@ pub fn build_router(state: Arc<AppState>, max_body_bytes: usize) -> Router {
         .route("/v1/embeddings%3aboth", post(handler::both_embeddings))
         .route("/v1/models", get(handler::models))
         .route("/health", get(handler::health))
+        .route("/health/deep", get(handler::health_deep))
         .layer(DefaultBodyLimit::max(max_body_bytes))
         .layer(PropagateRequestIdLayer::x_request_id())
         .layer(

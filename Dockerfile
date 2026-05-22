@@ -80,7 +80,7 @@ RUN chmod +x /usr/local/bin/healthcheck.sh
 
 USER bge
 
-HEALTHCHECK --interval=10s --timeout=5s --start-period=5s --retries=3 \
+HEALTHCHECK --interval=10s --timeout=15s --start-period=5s --retries=3 \
     CMD ["/usr/local/bin/healthcheck.sh"]
 
 EXPOSE 8081

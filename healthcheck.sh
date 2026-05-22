@@ -16,8 +16,8 @@
 
 set -eu
 
-URL_PATH="/health"
-TIMEOUT=4
+URL_PATH="/health/deep"
+TIMEOUT=12
 HOST="127.0.0.1:8081"
 
 if [ -n "${BGE_M3_TLS_CERT_PATH:-}" ] && [ -n "${BGE_M3_TLS_KEY_PATH:-}" ]; then

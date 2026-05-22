@@ -31,7 +31,7 @@ mod sparse;
 
 pub use both::both_embeddings;
 pub use dense::dense_embeddings;
-pub use health::health;
+pub use health::{health, health_deep};
 pub use models::models;
 pub use sparse::sparse_embeddings;
 

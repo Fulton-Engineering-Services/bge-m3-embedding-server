@@ -249,6 +249,7 @@ pub async fn run() -> anyhow::Result<()> {
             jit_suspect_tx,
             engine_propagation_tx,
             prewarm_strict: cfg.prewarm_strict,
+            circuit_breaker_threshold: cfg.circuit_breaker_threshold,
             #[cfg(feature = "cache-gc")]
             trt_cache_gc_enabled: cfg.trt_cache_gc_enabled,
         },
