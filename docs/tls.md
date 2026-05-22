@@ -86,7 +86,10 @@ and binding plain HTTP when HTTPS was expected.
 
 The CDK entrypoint preamble for the ECS task definition generates a short-lived leaf
 certificate from the shared internal CA stored in Secrets Manager (e.g.
-`TLS_CA_JSON` or equivalent in your deployment).
+`TLS_CA_JSON` or equivalent in your deployment). The CA secret should contain
+PEM-encoded `ca.crt` and `ca.key` fields; the entrypoint preamble extracts
+them and passes the CA certificate to the container as the `TLS_CA_CERT`
+environment variable before writing `/tls/ca.crt`.
 The preamble runs `openssl` at container startup and writes the cert and key to a shared
 `tmpfs` volume:
 

@@ -330,13 +330,14 @@ pub struct Config {
     /// var override path is the canonical way to keep cold-start tractable on
     /// workstations.
     ///
-    /// Default: a 2D `{1, 4, 16, 32} × {128, 512, 2048, 8192}` grid composed
-    /// in batch-major order so the smallest batches finish first and the
-    /// most common router shapes (`chunks = 1–2 × max_chunk_seq up to ~6000`)
-    /// hit a pre-compiled engine on the very first real request. The expensive
-    /// `_ × 8192` shapes compile last (~30–170 s each) — total cold-cache
-    /// compile budget is roughly 6–12 minutes on first deploy. Subsequent
-    /// starts on the same EC2 instance reuse cached engine files (seconds).
+    /// Default: a 2D `{1, 2, 4, 8, 16, 32} × {128, 512, 2048, 8192}` grid
+    /// (24 shapes) composed in batch-major order so the smallest batches finish
+    /// first and the most common router shapes (single-text and two-text
+    /// requests) hit a pre-compiled engine on the very first real request. The
+    /// expensive `_ × 8192` shapes compile last (~30–170 s each) — total
+    /// cold-cache compile budget is roughly 9–18 minutes on first deploy.
+    /// Subsequent starts on the same EC2 instance reuse cached engine files
+    /// (seconds).
     ///
     /// Each shape may take 30–170 s to compile on the first run; the worker
     /// signals ready only after all shapes finish, so `/health` returns `503`
@@ -473,6 +474,11 @@ impl Config {
     /// `None` to fall back to the default for that setting. Used by
     /// [`Config::from_env`] with the real environment and in tests with a
     /// closure over a `HashMap`.
+    ///
+    /// **Side effect**: when `BGE_M3_EP=tensorrt`, emits a `WARN` via
+    /// `tracing` if the resolved `trt_warmup_shapes` grid does not cover
+    /// batch=1 or batch=2. Tests that construct a `Config` with TRT EP and a
+    /// partial grid will see this log output.
     pub(crate) fn from_lookup<F: Fn(&str) -> Option<String>>(lookup: F) -> Self {
         let workers = lookup("BGE_M3_WORKERS")
             .and_then(|v| v.parse::<usize>().ok())
@@ -842,11 +848,11 @@ pub(crate) fn warn_if_small_batch_coverage_missing(shapes: &[(usize, usize)]) {
             covers_batch_2,
             configured_batches = ?batches,
             shape_count = shapes.len(),
-            "BGE_M3_TRT_WARMUP_SHAPES does not cover batch=1 AND batch=2 — \
-             real router traffic routinely bin-packs to these shapes and the \
-             first such request will trigger in-band TRT JIT, which can \
-             produce a pathological autotuner allocation failure on the \
-             /v1/embeddings:both route. Add `1x…` and `2x…` rows to \
+            "BGE_M3_TRT_WARMUP_SHAPES is missing coverage for batch=1 or \
+             batch=2 (or both) — real router traffic routinely bin-packs to \
+             these shapes and the first such request will trigger in-band TRT \
+             JIT, which can produce a pathological autotuner allocation failure \
+             on the /v1/embeddings:both route. Add `1x…` and `2x…` rows to \
              BGE_M3_TRT_WARMUP_SHAPES, or unset it to use the default \
              24-shape grid."
         );
