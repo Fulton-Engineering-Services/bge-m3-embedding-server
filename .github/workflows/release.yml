@@ -122,18 +122,35 @@ jobs:
           fi
 
   # ── Docker build (native runners, parallel) ──────────────────────────
-  # CUDA jobs use org larger runner label `bge-cuda-4core-linux-x64` (runner group
-  # bge-cuda-4core, 4 vCPU / 150 GB, linux-x64). Dockerfile.cuda is amd64-only.
-  build-cuda:
-    name: Build CUDA image (amd64)
+  # CUDA + TensorRT images (cuda-devel builder + TRT runtime .so's) exceed
+  # ubuntu-latest disk during layer export when run in parallel. Build all three
+  # variants sequentially on one runner, free disk before Buildx, and prune local
+  # Buildx state between variants to avoid ENOSPC during layer export.
+  #
+  # Dispatch to the org larger-runner pool (bge-cuda-4core-linux-x64) is currently
+  # broken — runner shows Ready but jobs queue forever with runner_group_id=null.
+  # Open GitHub Support ticket pending. Reverted to standard ubuntu-latest +
+  # free-disk-space until that is resolved.
+  build-cuda-images:
+    name: Build CUDA images (amd64)
     needs: [version]
     if: needs.version.outputs.exists == 'false'
     permissions:
       contents: read
       packages: write
-    runs-on: bge-cuda-4core-linux-x64
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be  # v1.3.1
+        with:
+          tool-cache: false
+          android: true
+          dotnet: true
+          haskell: true
+          docker-images: true
+          swap-storage: true
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd  # v4.0.0
@@ -171,6 +188,74 @@ jobs:
         with:
           name: digests-cuda-amd64
           path: /tmp/digests-cuda/*
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Prune local Buildx cache before CUDA TLS
+        run: docker buildx prune -af
+
+      - name: Build and push CUDA TLS image by digest
+        id: build-cuda-tls
+        uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f  # v7.1.0
+        with:
+          context: .
+          file: Dockerfile.cuda
+          platforms: linux/amd64
+          build-args: EXTRA_FEATURES=tls
+          outputs: type=image,name=${{ env.REGISTRY }}/${{ needs.version.outputs.repo }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=linux/amd64-cuda-tls
+          cache-to: type=gha,scope=linux/amd64-cuda-tls,mode=max
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.version=${{ needs.version.outputs.version }}-cuda-tls
+            org.opencontainers.image.revision=${{ github.sha }}
+
+      - name: Export CUDA TLS digest
+        run: |
+          mkdir -p /tmp/digests-cuda-tls
+          digest="${{ steps.build-cuda-tls.outputs.digest }}"
+          touch "/tmp/digests-cuda-tls/${digest#sha256:}"
+
+      - name: Upload CUDA TLS digest
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: digests-cuda-tls-amd64
+          path: /tmp/digests-cuda-tls/*
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Prune local Buildx cache before CUDA cache-gc
+        run: docker buildx prune -af
+
+      # WARNING: only deploy the cache-gc image in a controlled maintenance window
+      # against a homogeneous ASG — see Dockerfile.cuda and trt_cache_gc.rs.
+      - name: Build and push CUDA cache-gc image by digest
+        id: build-cuda-cache-gc
+        uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f  # v7.1.0
+        with:
+          context: .
+          file: Dockerfile.cuda
+          platforms: linux/amd64
+          build-args: CACHE_GC_FEATURES=cache-gc
+          outputs: type=image,name=${{ env.REGISTRY }}/${{ needs.version.outputs.repo }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=linux/amd64-cuda-cache-gc
+          cache-to: type=gha,scope=linux/amd64-cuda-cache-gc,mode=max
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.version=${{ needs.version.outputs.version }}-cuda-cache-gc
+            org.opencontainers.image.revision=${{ github.sha }}
+
+      - name: Export CUDA cache-gc digest
+        run: |
+          mkdir -p /tmp/digests-cuda-cache-gc
+          digest="${{ steps.build-cuda-cache-gc.outputs.digest }}"
+          touch "/tmp/digests-cuda-cache-gc/${digest#sha256:}"
+
+      - name: Upload CUDA cache-gc digest
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: digests-cuda-cache-gc-amd64
+          path: /tmp/digests-cuda-cache-gc/*
           if-no-files-found: error
           retention-days: 1
 
@@ -289,119 +374,13 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
-  build-cuda-tls:
-    name: Build CUDA TLS image (amd64)
-    needs: [version]
-    if: needs.version.outputs.exists == 'false'
-    permissions:
-      contents: read
-      packages: write
-    runs-on: bge-cuda-4core-linux-x64
-    steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd  # v4.0.0
-
-      - name: Log in to GHCR
-        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121  # v4.1.0
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Build and push CUDA TLS image by digest
-        id: build-cuda-tls
-        uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f  # v7.1.0
-        with:
-          context: .
-          file: Dockerfile.cuda
-          platforms: linux/amd64
-          build-args: EXTRA_FEATURES=tls
-          outputs: type=image,name=${{ env.REGISTRY }}/${{ needs.version.outputs.repo }},push-by-digest=true,name-canonical=true,push=true
-          cache-from: type=gha,scope=linux/amd64-cuda-tls
-          cache-to: type=gha,scope=linux/amd64-cuda-tls,mode=max
-          labels: |
-            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
-            org.opencontainers.image.version=${{ needs.version.outputs.version }}-cuda-tls
-            org.opencontainers.image.revision=${{ github.sha }}
-
-      - name: Export CUDA TLS digest
-        run: |
-          mkdir -p /tmp/digests-cuda-tls
-          digest="${{ steps.build-cuda-tls.outputs.digest }}"
-          touch "/tmp/digests-cuda-tls/${digest#sha256:}"
-
-      - name: Upload CUDA TLS digest
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
-        with:
-          name: digests-cuda-tls-amd64
-          path: /tmp/digests-cuda-tls/*
-          if-no-files-found: error
-          retention-days: 1
-
-  # ── CUDA cache-gc maintenance image (parallel with build-cuda) ─────────────
-  # Identical to build-cuda but compiled with --build-arg CACHE_GC_FEATURES=cache-gc.
-  # WARNING: only run this image in a controlled maintenance window against
-  # a homogeneous ASG — see Dockerfile.cuda and trt_cache_gc.rs for hazards.
-  build-cuda-cache-gc:
-    name: Build CUDA cache-gc image (amd64)
-    needs: [version]
-    if: needs.version.outputs.exists == 'false'
-    permissions:
-      contents: read
-      packages: write
-    runs-on: bge-cuda-4core-linux-x64
-    steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd  # v4.0.0
-
-      - name: Log in to GHCR
-        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121  # v4.1.0
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Build and push CUDA cache-gc image by digest
-        id: build-cuda-cache-gc
-        uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f  # v7.1.0
-        with:
-          context: .
-          file: Dockerfile.cuda
-          platforms: linux/amd64
-          build-args: CACHE_GC_FEATURES=cache-gc
-          outputs: type=image,name=${{ env.REGISTRY }}/${{ needs.version.outputs.repo }},push-by-digest=true,name-canonical=true,push=true
-          cache-from: type=gha,scope=linux/amd64-cuda-cache-gc
-          cache-to: type=gha,scope=linux/amd64-cuda-cache-gc,mode=max
-          labels: |
-            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
-            org.opencontainers.image.version=${{ needs.version.outputs.version }}-cuda-cache-gc
-            org.opencontainers.image.revision=${{ github.sha }}
-
-      - name: Export CUDA cache-gc digest
-        run: |
-          mkdir -p /tmp/digests-cuda-cache-gc
-          digest="${{ steps.build-cuda-cache-gc.outputs.digest }}"
-          touch "/tmp/digests-cuda-cache-gc/${digest#sha256:}"
-
-      - name: Upload CUDA cache-gc digest
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
-        with:
-          name: digests-cuda-cache-gc-amd64
-          path: /tmp/digests-cuda-cache-gc/*
-          if-no-files-found: error
-          retention-days: 1
-
   # ── Merge manifests, sign, SBOM, tag + release (all in one job) ───────
   # All signing, SBOM generation, and the GH Release are consolidated here
   # so the release is created once with all assets attached — required because
   # immutable releases (GitHub ruleset) block post-creation asset uploads (HTTP 422).
   release:
     name: Release
-    needs: [version, build, build-tls, build-cuda, build-cuda-tls, build-cuda-cache-gc]
+    needs: [version, build, build-tls, build-cuda-images]
     runs-on: ubuntu-latest
     permissions:
       contents: write
