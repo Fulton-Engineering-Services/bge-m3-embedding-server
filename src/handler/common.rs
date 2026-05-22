@@ -60,7 +60,7 @@ impl fmt::Display for XHeaders {
 /// Header names are normalized: lowercase (axum guarantees this) and hyphens
 /// replaced with underscores so each key is a valid JSON identifier and can
 /// be referenced by log-processing tools that use JSON path notation
-/// (e.g. `x-codekeeper-project` → key `x_codekeeper_project`).
+/// (e.g. `x-example-project` → key `x_example_project`).
 /// Headers with non-UTF-8 values are silently skipped.
 pub(super) fn collect_x_headers(headers: &HeaderMap) -> XHeaders {
     let mut map = BTreeMap::new();

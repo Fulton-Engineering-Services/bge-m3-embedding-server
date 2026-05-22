@@ -62,9 +62,8 @@ fn is_trt_jit_oom_does_not_match_empty() {
 // --- is_trt_jit_oom: "failed to create engine" branch ---
 //
 // These cover the TRT EP build-time failure family observed in production
-// on 2026-05-16 (request id fcc45087-2fcc-4539-9f76-f40dc0c0ec4a, batch_size
-// 256, prompt_tokens 12904, route /v1/embeddings:both). The application-level
-// error string is:
+// on large fused-route requests (high batch and token counts). The
+// application-level error string is:
 //
 //     Dual embed error: Non-zero status code returned while running
 //     TRTKernel_graph_main_graph_<hash>_0 node. Name:'...' Status Message:
@@ -74,8 +73,7 @@ fn is_trt_jit_oom_does_not_match_empty() {
 // workspace/allocation/memory/tactic qualifier so retries don't waste a full
 // inference budget on genuinely unsupported graphs.
 
-/// Verbatim production error (2026-05-16, request id
-/// fcc45087-2fcc-4539-9f76-f40dc0c0ec4a) with a `workspace` qualifier
+/// Representative production error with a `workspace` qualifier
 /// appended (simulating the case where ORT propagates the TRT logger output
 /// into the outer error string). MUST classify as retryable JIT-OOM.
 #[test]

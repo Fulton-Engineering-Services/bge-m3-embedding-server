@@ -1,6 +1,6 @@
 [package]
 name = "bge-m3-embedding-server"
-version = "1.5.7"
+version = "1.5.8"
 edition = "2024"
 license = "Apache-2.0"
 description = "Axum HTTP server serving BGE-M3 dense and sparse embeddings via ONNX Runtime"
@@ -37,8 +37,8 @@ arc-swap = "1"
 ## "Couldn't register" / "An error occurred when attempting to register" lines
 ## and the C-side `tracing_logger` callback — actually fire. Without it, ORT
 ## registration failures are completely silent, which masked the
-## `nvrtx`-prebuilt / standard-TRT-EP-missing failure that produced the
-## 2026-05 codekeeper outage. Greppable in CloudWatch via `target=ort` events.
+## `nvrtx`-prebuilt / standard-TRT-EP-missing failure that produced a prior
+## production outage. Greppable in CloudWatch via `target=ort` events.
 ort = { version = "=2.0.0-rc.12", features = ["coreml", "ndarray", "std", "api-24", "tracing"], default-features = false }
 hf-hub = "0.5"
 tokenizers = { version = "0.23", default-features = false, features = ["onig"] }

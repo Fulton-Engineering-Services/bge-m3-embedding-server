@@ -330,13 +330,14 @@ pub struct Config {
     /// var override path is the canonical way to keep cold-start tractable on
     /// workstations.
     ///
-    /// Default: a 2D `{1, 4, 16, 32} × {128, 512, 2048, 8192}` grid composed
-    /// in batch-major order so the smallest batches finish first and the
-    /// most common router shapes (`chunks = 1–2 × max_chunk_seq up to ~6000`)
-    /// hit a pre-compiled engine on the very first real request. The expensive
-    /// `_ × 8192` shapes compile last (~30–170 s each) — total cold-cache
-    /// compile budget is roughly 6–12 minutes on first deploy. Subsequent
-    /// starts on the same EC2 instance reuse cached engine files (seconds).
+    /// Default: a 2D `{1, 2, 4, 8, 16, 32} × {128, 512, 2048, 8192}` grid
+    /// (24 shapes) composed in batch-major order so the smallest batches finish
+    /// first and the most common router shapes (single-text and two-text
+    /// requests) hit a pre-compiled engine on the very first real request. The
+    /// expensive `_ × 8192` shapes compile last (~30–170 s each) — total
+    /// cold-cache compile budget is roughly 9–18 minutes on first deploy.
+    /// Subsequent starts on the same EC2 instance reuse cached engine files
+    /// (seconds).
     ///
     /// Each shape may take 30–170 s to compile on the first run; the worker
     /// signals ready only after all shapes finish, so `/health` returns `503`
@@ -372,8 +373,8 @@ pub struct Config {
     ///
     /// Set with `BGE_M3_PREWARM_STRICT`. Defaults to `true`.
     ///
-    /// The 2026-05 codekeeper outage motivated this default: every worker
-    /// on a 4× Blackwell task hit a TRT autotuner workspace OOM mid-build
+    /// A production incident motivated this default: every worker
+    /// on a multi-GPU Blackwell task hit a TRT autotuner workspace OOM mid-build
     /// (`IBuilder::buildSerializedNetwork: Error Code 10`), the postcondition
     /// logged a WARN, `/health` returned `200 ok`, and the task served HTTP
     /// 500 traffic on the same shape that failed prewarm. Strict-mode would
@@ -473,6 +474,11 @@ impl Config {
     /// `None` to fall back to the default for that setting. Used by
     /// [`Config::from_env`] with the real environment and in tests with a
     /// closure over a `HashMap`.
+    ///
+    /// **Side effect**: when `BGE_M3_EP=tensorrt`, emits a `WARN` via
+    /// `tracing` if the resolved `trt_warmup_shapes` grid does not cover
+    /// batch=1 or batch=2. Tests that construct a `Config` with TRT EP and a
+    /// partial grid will see this log output.
     pub(crate) fn from_lookup<F: Fn(&str) -> Option<String>>(lookup: F) -> Self {
         let workers = lookup("BGE_M3_WORKERS")
             .and_then(|v| v.parse::<usize>().ok())
@@ -650,6 +656,9 @@ impl Config {
         );
 
         let trt_warmup_shapes = parse_trt_warmup_shapes(lookup("BGE_M3_TRT_WARMUP_SHAPES"));
+        if ep == EpSelection::TensorRt {
+            warn_if_small_batch_coverage_missing(&trt_warmup_shapes);
+        }
 
         let max_body_bytes = lookup("BGE_M3_MAX_BODY_BYTES")
             .and_then(|v| v.parse::<usize>().ok())
@@ -727,31 +736,46 @@ impl Config {
     }
 }
 
-/// Default TRT warmup shapes: a 2D `{1, 4, 16, 32} × {128, 512, 2048, 8192}`
+/// Default TRT warmup shapes: a 2D `{1, 2, 4, 8, 16, 32} × {128, 512, 2048, 8192}`
 /// grid composed in batch-major order.
 ///
 /// Batch is the outer dimension so the smallest batches (which dominate
-/// real router traffic — `chunks = 1–2 × max_chunk_seq`) are fully compiled
-/// first; larger batches that are mostly observed during bulk re-indexing
-/// fill in afterwards. Within each batch the sequence dimension grows
-/// monotonically so the cheap `_ × 128` shape comes before the expensive
-/// `_ × 8192` shape — operators watching `/health` see progress quickly.
+/// real router traffic — single-text and two-text requests are the most
+/// common pattern for both ad-hoc queries and bulk indexers) are fully
+/// compiled first; larger batches typical of bulk re-indexing fill in
+/// afterwards. Within each batch the sequence dimension grows monotonically
+/// so the cheap `_ × 128` shape comes before the expensive `_ × 8192` shape —
+/// operators watching `/health` see progress quickly.
 ///
-/// Production observation (2026-05 codekeeper investigation): real router
-/// traffic shows `chunks = 1–2 × max_chunk_seq` up to ~6 000 token positions.
-/// Previously-unseen shapes triggered in-band engine compilation in the middle
-/// of a real request, producing 56–356 s `inference_ms` values. This 16-shape
-/// grid covers the full realistic shape space so every router request hits
-/// a pre-compiled engine.
+/// Previously-unseen shapes trigger in-band engine compilation in the middle
+/// of a real request, producing tens-to-hundreds-of-seconds `inference_ms`
+/// values. In the worst case, TRT JIT for the dual-output
+/// `/v1/embeddings:both` graph at unseen small-batch shapes can request
+/// pathological autotuner allocations (multiple terabytes on a fused
+/// `LayerNorm` + `MatMul` foreign-node) that the CUDA allocator cannot
+/// satisfy, producing a fatal `failed to create engine from network` error.
+/// Including `(1, _)`, `(2, _)`, `(4, _)`, and `(8, _)` rows closes the JIT
+/// window for the common router pack-sizes.
+///
+/// This 24-shape grid covers the full realistic shape space so every router
+/// request hits a pre-compiled engine.
 const DEFAULT_TRT_WARMUP_SHAPES: &[(usize, usize)] = &[
     (1, 128),
     (1, 512),
     (1, 2048),
     (1, 8192),
+    (2, 128),
+    (2, 512),
+    (2, 2048),
+    (2, 8192),
     (4, 128),
     (4, 512),
     (4, 2048),
     (4, 8192),
+    (8, 128),
+    (8, 512),
+    (8, 2048),
+    (8, 8192),
     (16, 128),
     (16, 512),
     (16, 2048),
@@ -794,6 +818,44 @@ pub(crate) fn parse_trt_warmup_shapes(raw: Option<String>) -> Vec<(usize, usize)
         DEFAULT_TRT_WARMUP_SHAPES.to_vec()
     } else {
         parsed
+    }
+}
+
+/// Emits a startup `WARN` when the resolved warmup shape grid does not cover
+/// the small-batch shapes that real router traffic routinely bin-packs to.
+///
+/// Concretely, real `/v1/embeddings`, `/v1/sparse-embeddings`, and
+/// `/v1/embeddings:both` calls produce chunk batches of 1–2 (single-text or
+/// two-text requests are the dominant traffic pattern for both ad-hoc queries
+/// and bulk indexers). When the warmup grid omits both batch=1 and batch=2,
+/// the first such request triggers in-band TRT JIT compilation, which on the
+/// `:both` route has been observed to trigger pathological autotuner
+/// allocation requests (multiple terabytes) and a fatal `failed to create
+/// engine from network` error.
+///
+/// Greppable tag: `trt_warmup_shape_coverage_gap`. Operators are not blocked
+/// from deploying a batch-1-only grid (e.g. local dev workstations) — the
+/// surface is informational so legitimate edge configurations still start.
+pub(crate) fn warn_if_small_batch_coverage_missing(shapes: &[(usize, usize)]) {
+    let covers_batch_1 = shapes.iter().any(|(b, _)| *b == 1);
+    let covers_batch_2 = shapes.iter().any(|(b, _)| *b == 2);
+    if !covers_batch_1 || !covers_batch_2 {
+        let batches: std::collections::BTreeSet<usize> = shapes.iter().map(|(b, _)| *b).collect();
+        warn!(
+            target: "bge_m3_embedding_server::trt_warmup",
+            tag = "trt_warmup_shape_coverage_gap",
+            covers_batch_1,
+            covers_batch_2,
+            configured_batches = ?batches,
+            shape_count = shapes.len(),
+            "BGE_M3_TRT_WARMUP_SHAPES is missing coverage for batch=1 or \
+             batch=2 (or both) — real router traffic routinely bin-packs to \
+             these shapes and the first such request will trigger in-band TRT \
+             JIT, which can produce a pathological autotuner allocation failure \
+             on the /v1/embeddings:both route. Add `1x…` and `2x…` rows to \
+             BGE_M3_TRT_WARMUP_SHAPES, or unset it to use the default \
+             24-shape grid."
+        );
     }
 }
 

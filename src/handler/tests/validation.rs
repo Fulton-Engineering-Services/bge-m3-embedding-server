@@ -130,7 +130,7 @@ fn collect_x_headers_no_x_prefix_produces_empty() {
 fn collect_x_headers_normalizes_hyphens_to_underscores() {
     let mut headers = axum::http::HeaderMap::new();
     headers.insert(
-        axum::http::HeaderName::from_static("x-codekeeper-project"),
+        axum::http::HeaderName::from_static("x-example-project"),
         HeaderValue::from_static("my-project"),
     );
     headers.insert(
@@ -140,7 +140,7 @@ fn collect_x_headers_normalizes_hyphens_to_underscores() {
     let result = collect_x_headers(&headers);
     // Normalized keys — safe as JSON identifiers and log-path components
     assert_eq!(
-        result.0.get("x_codekeeper_project").map(String::as_str),
+        result.0.get("x_example_project").map(String::as_str),
         Some("my-project")
     );
     assert_eq!(
@@ -148,7 +148,7 @@ fn collect_x_headers_normalizes_hyphens_to_underscores() {
         Some("abc123")
     );
     // Original hyphenated keys must NOT be present
-    assert!(!result.0.contains_key("x-codekeeper-project"));
+    assert!(!result.0.contains_key("x-example-project"));
 }
 
 #[test]

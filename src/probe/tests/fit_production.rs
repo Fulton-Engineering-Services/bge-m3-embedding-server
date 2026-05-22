@@ -78,8 +78,7 @@ fn fit_cost_model_production_scale_16_shapes_with_max_seq_8192() {
 /// from the high-seq points instead of returning None.
 #[test]
 fn fit_recovers_b_when_kernel_switch_creates_negative_a_raw() {
-    // Production data points from the rc7 task at workers=2,
-    // max_seq=8192 (CloudWatch probe sweep, 2026-05-10T06:21:47Z):
+    // Observed probe sweep data (workers=2, max_seq=8192):
     //   (1, 64)   →     ~0 MB
     //   (4, 64)   →     ~0 MB
     //   (1, 256)  →     ~0 MB

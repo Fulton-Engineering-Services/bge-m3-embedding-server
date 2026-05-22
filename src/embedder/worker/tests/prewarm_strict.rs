@@ -62,7 +62,7 @@ fn strict_enabled_cache_hit_only_does_not_fail() {
 
 #[test]
 fn strict_enabled_one_fresh_compile_with_zero_engines_fails() {
-    // The 2026-05 codekeeper outage signature: ORT TRT returned Ok(_) from
+    // Silent-persistence signature: ORT TRT returned Ok(_) from
     // session.run() (counted as fresh_compiles=1) but the .engine file was
     // never persisted to disk (engine_count_after=0). Strict mode must
     // escalate.
@@ -71,8 +71,8 @@ fn strict_enabled_one_fresh_compile_with_zero_engines_fails() {
 
 #[test]
 fn strict_enabled_many_fresh_compiles_with_zero_engines_fails() {
-    // Same pattern as the production outage at higher compile volume — the
-    // 1215 compile-success / 0 engines case. Must escalate.
+    // Same pattern at higher compile volume — many compile-success events with
+    // zero engines on disk. Must escalate.
     assert!(should_fail_readiness(1215, 0, true));
     assert!(should_fail_readiness(usize::MAX, 0, true));
 }

@@ -67,10 +67,9 @@ const CHUNK_CACHE_HIT_THRESHOLD_MS: u64 = 5_000;
 ///    matches genuine unsupported-op cases where retry is pointless).
 /// 3. **`failed to create engine` + (`workspace` | `alloc` | `memory` |
 ///    `oom` | `tactic`)** — TRT EP build-time failure observed in
-///    production on 2026-05-16 (request id
-///    `fcc45087-2fcc-4539-9f76-f40dc0c0ec4a`, route
-///    `/v1/embeddings:both`, `batch_size` 256, `prompt_tokens` 12904).
-///    The qualifier is mandatory: without it, this same family also
+///    production on large fused-route requests (e.g. `/v1/embeddings:both`
+///    with high batch and token counts). The qualifier is mandatory: without
+///    it, this same family also
 ///    covers unsupported-op and corrupted-cache cases where retrying
 ///    with a halved workspace is pointless and doubles caller-visible
 ///    latency. `alloc` subsumes `cuMemAlloc`; `memory` subsumes
@@ -78,7 +77,7 @@ const CHUNK_CACHE_HIT_THRESHOLD_MS: u64 = 5_000;
 ///
 /// # Known gap
 ///
-/// The verbatim 2026-05-16 production error string did NOT include any
+/// The verbatim production error string often does NOT include any
 /// qualifier — the TRT logger appears to emit workspace/alloc detail to a
 /// separate tracing target rather than propagating it into the outer
 /// `Status Message`. We chose **Option A** here (require a qualifier) over
@@ -137,6 +136,18 @@ fn is_trt_jit_oom(e: &anyhow::Error) -> bool {
 /// exits immediately (returns `Err`), causing `WorkerGuard` to decrement
 /// `live_workers`. ECS replaces the task once all workers have exited,
 /// resetting the CUDA driver state.
+///
+/// The unqualified `failed to create engine from network` pattern is included
+/// without an OOM qualifier because it has been observed in practice as the
+/// terminal error after the TRT autotuner exhausts its tactic candidates —
+/// typically because of a pathological scratch-buffer allocation request that
+/// the CUDA allocator cannot satisfy. The TRT EP's `trt_max_workspace_bytes`
+/// option does not bound autotuner tactic scratch, so a per-tactic allocation
+/// of many gigabytes (or even terabytes) on a fused multi-precision foreign
+/// node is reachable for shapes outside the pre-warmed engine cache. Once
+/// this pattern fires, the CUDA context is considered unrecoverable for the
+/// lifetime of the process; keep this function's pattern set minimal and
+/// explicit and do not fold it into `is_trt_jit_oom`.
 fn is_trt_engine_build_fatal(e: &anyhow::Error) -> bool {
     let lowercase = format!("{e}").to_lowercase();
     lowercase.contains("failed to build engine")
@@ -380,7 +391,7 @@ pub struct WorkerConfig {
     /// to signal ready: `run_worker` returns `Err(_)` before `ready_tx.send`,
     /// the pool's init task propagates the error, and the readiness probe in
     /// `bootstrap::readiness` triggers a hard process exit. Converts the
-    /// 2026-05 false-positive-readiness failure mode (every worker hits TRT
+    /// false-positive-readiness failure mode (every worker hits TRT
     /// `Error Code 10` mid-build, postcondition logs WARN, `/health` still
     /// returns `200 ok`, real requests then 500) into an explicit startup
     /// failure that ECS retries instead of routing traffic to.
@@ -664,8 +675,8 @@ pub(super) fn run_worker(
     // itself to plans matching this GPU. Without this, a worker on `sm120`
     // would count a stale `_sm89.engine` plan toward `cache_hit` and report
     // a misleading `engine_count_before:3` on a fresh Blackwell deploy with
-    // leftover L40S plans on the shared EFS cache — the exact 2026-05-16
-    // production failure mode. `None` (detection failed) keeps legacy
+    // leftover L40S plans on the shared EFS cache — a common heterogeneous-SM
+    // false-positive failure mode. `None` (detection failed) keeps legacy
     // unfiltered semantics so an operator missing `nvidia-smi` mid-deploy
     // does not see a hard regression.
     let detected_sm: Option<String> = if config.ep == EpSelection::TensorRt {
@@ -737,7 +748,7 @@ pub(super) fn run_worker(
         // increase, surface an ERROR. This is the in-process counterpart to
         // the postcondition check at the end of the warmup-only path in
         // lib.rs, intended to catch the silent-persistence failure mode that
-        // produced the 2026-05 codekeeper outage.
+        // produced silent-persistence startup failures in production.
         if prewarm_persistence_postcondition_failed(stats.fresh_compiles, stats.engine_count_after)
         {
             tracing::error!(
@@ -1378,8 +1389,8 @@ pub(super) fn run_worker(
 /// Strict mode (`prewarm_strict=true`) only blocks readiness when
 /// `engine_count_after == 0` — i.e. **complete zero-plan failure** where
 /// fresh compiles occurred but not a single `.engine` file landed on disk.
-/// This is the 2026-05 failure mode where every worker hit TRT autotuner OOM
-/// mid-build, leaving the cache empty and every subsequent real request
+/// This is the catastrophic failure mode where every worker hits TRT autotuner
+/// OOM mid-build, leaving the cache empty and every subsequent real request
 /// returning HTTP 500.
 ///
 /// **Partial undercounts** (e.g. 1 engine persisted out of 16 compiled) do

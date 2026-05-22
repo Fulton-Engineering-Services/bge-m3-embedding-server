@@ -59,12 +59,12 @@ FROM ubuntu:24.04@sha256:c4a8d5503dfb2a3eb8ab5f807da5bc69a85730fb49b5cfca2330194
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl libssl3t64 \
     && rm -rf /var/lib/apt/lists/*
-# UID/GID must match EFS model-cache access point in Codekeeper CDK (10002).
+# UID/GID must match your EFS model-cache access point (example: 10002).
 RUN groupadd --gid 10002 bge \
     && useradd --uid 10002 --gid bge --no-create-home --shell /sbin/nologin bge
 
 # Pre-create /tls owned by bge so the TLS entrypoint preamble (which runs after
-# `USER bge` and does `mkdir -p /tls && printf '%s\n' "$LOCKBOX_TLS_CA_CERT" > /tls/ca.crt`)
+# `USER bge` and does `mkdir -p /tls && printf '%s\n' "$TLS_CA_CERT" > /tls/ca.crt`)
 # can write the CA cert + leaf cert without root. Without this, `mkdir /tls`
 # fails with `Permission denied` because the root filesystem is not writable by
 # non-root users.
