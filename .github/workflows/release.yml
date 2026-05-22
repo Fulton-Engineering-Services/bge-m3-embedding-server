@@ -323,8 +323,8 @@ jobs:
           platforms: linux/amd64
           build-args: EXTRA_FEATURES=tls
           outputs: type=image,name=${{ env.REGISTRY }}/${{ needs.version.outputs.repo }},push-by-digest=true,name-canonical=true,push=true
-          cache-from: type=gha,scope=linux/amd64-cuda
-          cache-to: type=gha,scope=linux/amd64-cuda,mode=max
+          cache-from: type=gha,scope=linux/amd64-cuda-tls
+          cache-to: type=gha,scope=linux/amd64-cuda-tls,mode=max
           labels: |
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
             org.opencontainers.image.version=${{ needs.version.outputs.version }}-cuda-tls
@@ -380,8 +380,8 @@ jobs:
           platforms: linux/amd64
           build-args: CACHE_GC_FEATURES=cache-gc
           outputs: type=image,name=${{ env.REGISTRY }}/${{ needs.version.outputs.repo }},push-by-digest=true,name-canonical=true,push=true
-          cache-from: type=gha,scope=linux/amd64-cuda
-          cache-to: type=gha,scope=linux/amd64-cuda,mode=max
+          cache-from: type=gha,scope=linux/amd64-cuda-cache-gc
+          cache-to: type=gha,scope=linux/amd64-cuda-cache-gc,mode=max
           labels: |
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
             org.opencontainers.image.version=${{ needs.version.outputs.version }}-cuda-cache-gc
