@@ -15,7 +15,7 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
-use super::super::{Config, ModelVariant, MODEL_MAX_SEQ};
+use super::super::{Config, MODEL_MAX_SEQ, ModelVariant};
 use super::helpers::lookup_from;
 
 #[test]
@@ -29,7 +29,7 @@ fn defaults_without_env_vars() {
     assert_eq!(cfg.intra_threads, 1);
     assert_eq!(cfg.max_batch, 256);
     assert_eq!(cfg.max_seq_length, MODEL_MAX_SEQ);
-    assert_eq!(cfg.idle_timeout, Some(Duration::from_secs(300)));
+    assert_eq!(cfg.idle_timeout, Some(Duration::from_mins(5)));
     assert_eq!(cfg.model_variant, ModelVariant::Fp16);
     assert!((cfg.memory_safety_factor - 0.7).abs() < 1e-9);
     assert!(
@@ -203,5 +203,5 @@ fn custom_values_are_applied() {
     assert_eq!(cfg.bind_addr, "127.0.0.1:9090");
     assert_eq!(cfg.workers, 4);
     assert_eq!(cfg.max_batch, 128);
-    assert_eq!(cfg.idle_timeout, Some(Duration::from_secs(600)));
+    assert_eq!(cfg.idle_timeout, Some(Duration::from_mins(10)));
 }

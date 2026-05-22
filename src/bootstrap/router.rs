@@ -19,7 +19,7 @@ use std::sync::Arc;
 
 use axum::extract::DefaultBodyLimit;
 use axum::http::HeaderValue;
-use axum::{routing::get, routing::post, Router};
+use axum::{Router, routing::get, routing::post};
 use tower_http::request_id::{
     MakeRequestId, PropagateRequestIdLayer, RequestId, SetRequestIdLayer,
 };

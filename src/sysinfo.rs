@@ -177,11 +177,7 @@ fn count_nvidia_gpus_from_proc() -> Option<usize> {
         .ok()?
         .filter_map(std::result::Result::ok)
         .count();
-    if count > 0 {
-        Some(count)
-    } else {
-        None
-    }
+    if count > 0 { Some(count) } else { None }
 }
 
 /// Returns the current process's RSS (Resident Set Size) in bytes, or `None`
@@ -241,14 +237,14 @@ fn cgroup_memory() -> Option<MemoryReading> {
     // --- cgroup v1: /sys/fs/cgroup/memory/memory.limit_in_bytes ---
     if let Ok(raw) = std::fs::read_to_string("/sys/fs/cgroup/memory/memory.limit_in_bytes") {
         let trimmed = raw.trim();
-        if let Ok(bytes) = trimmed.parse::<usize>() {
-            if bytes < ONE_TIB {
-                tracing::debug!(bytes, source = "cgroup_v1", "Detected memory limit");
-                return Some(MemoryReading {
-                    available_bytes: bytes,
-                    source: MemorySource::CgroupV1,
-                });
-            }
+        if let Ok(bytes) = trimmed.parse::<usize>()
+            && bytes < ONE_TIB
+        {
+            tracing::debug!(bytes, source = "cgroup_v1", "Detected memory limit");
+            return Some(MemoryReading {
+                available_bytes: bytes,
+                source: MemorySource::CgroupV1,
+            });
         }
     }
 
@@ -300,21 +296,20 @@ pub(crate) fn cgroup_v2_walk(
         let memory_max = current.join("memory.max");
         if let Ok(raw) = std::fs::read_to_string(&memory_max) {
             let trimmed = raw.trim();
-            if trimmed != "max" {
-                if let Ok(bytes) = trimmed.parse::<usize>() {
-                    if bytes < ONE_TIB {
-                        tracing::debug!(
-                            bytes,
-                            source = "cgroup_v2",
-                            path = %memory_max.display(),
-                            "Detected memory limit"
-                        );
-                        return Some(MemoryReading {
-                            available_bytes: bytes,
-                            source: MemorySource::CgroupV2,
-                        });
-                    }
-                }
+            if trimmed != "max"
+                && let Ok(bytes) = trimmed.parse::<usize>()
+                && bytes < ONE_TIB
+            {
+                tracing::debug!(
+                    bytes,
+                    source = "cgroup_v2",
+                    path = %memory_max.display(),
+                    "Detected memory limit"
+                );
+                return Some(MemoryReading {
+                    available_bytes: bytes,
+                    source: MemorySource::CgroupV2,
+                });
             }
         }
 

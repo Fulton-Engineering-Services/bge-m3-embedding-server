@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::super::fit::{fit_cost_model, DataPoint};
+use super::super::fit::{DataPoint, fit_cost_model};
 use super::helpers::make_dp;
 
 // ---------------------------------------------------------------------------

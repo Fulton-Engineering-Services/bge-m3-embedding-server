@@ -12,9 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use axum::http::{header, HeaderValue};
+use axum::http::{HeaderValue, header};
 
-use super::super::common::{check_ready, collect_x_headers, validate_input, MAX_STRING_CHARS};
+use super::super::common::{MAX_STRING_CHARS, check_ready, collect_x_headers, validate_input};
 use super::helpers::make_state;
 use crate::error::AppError;
 

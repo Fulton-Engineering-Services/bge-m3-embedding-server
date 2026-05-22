@@ -34,8 +34,8 @@
 use std::fmt;
 
 use tracing::{Event, Subscriber};
-use tracing_subscriber::fmt::format::{FormatEvent, FormatFields, Writer};
 use tracing_subscriber::fmt::FmtContext;
+use tracing_subscriber::fmt::format::{FormatEvent, FormatFields, Writer};
 use tracing_subscriber::registry::LookupSpan;
 
 /// Compile-time service name included as the first key on every JSON log line.

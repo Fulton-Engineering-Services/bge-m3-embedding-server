@@ -15,21 +15,21 @@
 //! Blocking worker thread, request dispatch, and probe wiring.
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use anyhow::Result;
 use arc_swap::ArcSwap;
 use ort::value::TensorRef;
 use tokio::runtime::Handle;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{Mutex, mpsc};
 use tracing::{info, info_span};
 
 use super::dense::embed_dense;
 use super::dual::embed_both;
 use super::error::ort_err;
-use super::session::{load_models, GpuSessionConfig};
+use super::session::{GpuSessionConfig, load_models};
 use super::sm_detect::detect_sm_for_device;
 use super::sparse::embed_sparse;
 use super::tokenize::{build_chunk_arrays, tokenize_no_pad};
@@ -805,29 +805,27 @@ pub(super) fn run_worker(
         // Drain peer engine-ready notifications and run trt_prewarm for any
         // new shapes so the in-memory TRT profile is extended before the next
         // real request for that shape arrives (~1-3s fast disk-load vs. full JIT).
-        if config.ep == EpSelection::TensorRt {
-            if let Some(ref mut bcast_rx) = engine_propagation_rx {
-                if let Some((session, _)) = models.as_mut() {
-                    let sm = detected_sm.as_deref();
-                    drain_engine_propagation(bcast_rx, &mut warmed_local, id, |shape| {
-                        let started = std::time::Instant::now();
-                        let stats = trt_prewarm(session, &[shape], id, &cache_dir, sm);
-                        let elapsed_ms =
-                            u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
-                        tracing::info!(
-                            target: "bge_m3_embedding_server::trt_shape",
-                            worker_id = id,
-                            chunk_batch = shape.0,
-                            chunk_max_seq = shape.1,
-                            elapsed_ms,
-                            warmed = stats.warmed,
-                            fully_cached = stats.fully_cached,
-                            detected_sm = sm.unwrap_or("unfiltered"),
-                            "engine_propagation_complete"
-                        );
-                    });
-                }
-            }
+        if config.ep == EpSelection::TensorRt
+            && let Some(ref mut bcast_rx) = engine_propagation_rx
+            && let Some((session, _)) = models.as_mut()
+        {
+            let sm = detected_sm.as_deref();
+            drain_engine_propagation(bcast_rx, &mut warmed_local, id, |shape| {
+                let started = std::time::Instant::now();
+                let stats = trt_prewarm(session, &[shape], id, &cache_dir, sm);
+                let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+                tracing::info!(
+                    target: "bge_m3_embedding_server::trt_shape",
+                    worker_id = id,
+                    chunk_batch = shape.0,
+                    chunk_max_seq = shape.1,
+                    elapsed_ms,
+                    warmed = stats.warmed,
+                    fully_cached = stats.fully_cached,
+                    detected_sm = sm.unwrap_or("unfiltered"),
+                    "engine_propagation_complete"
+                );
+            });
         }
 
         let msg = if let Some(timeout) = config.idle_timeout.filter(|_| models.is_some()) {

@@ -733,9 +733,11 @@ mod tests {
         let tmp = TempDir::new().expect("tempdir");
         let dir = tmp.path().join("trt-engines");
         fs::create_dir_all(&dir).unwrap();
-        assert!(super::engine_basenames_in_dir_sorted(&dir)
-            .unwrap()
-            .is_empty());
+        assert!(
+            super::engine_basenames_in_dir_sorted(&dir)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]

@@ -93,7 +93,7 @@ async fn wait_for_quiet_window_returns_false_when_queue_busy() {
 #[test]
 fn hourly_reset_condition_does_not_fire_before_one_hour() {
     let hour_start = std::time::Instant::now();
-    let one_hour = std::time::Duration::from_secs(3600);
+    let one_hour = std::time::Duration::from_hours(1);
     let mut shapes_this_hour: u32 = 5;
 
     // Before an hour passes the counter is unchanged.
@@ -119,7 +119,7 @@ fn hourly_reset_condition_does_not_fire_before_one_hour() {
 fn hourly_reset_zeroes_counter() {
     let mut shapes_this_hour: u32 = 12;
     let mut hour_start = std::time::Instant::now();
-    let one_hour = std::time::Duration::from_secs(3600);
+    let one_hour = std::time::Duration::from_hours(1);
 
     // Pretend an hour has passed by backdating hour_start.
     hour_start -= one_hour + std::time::Duration::from_millis(1);

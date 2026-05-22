@@ -16,7 +16,7 @@
 
 use std::sync::Arc;
 
-use axum::{extract::State, response::IntoResponse, Json};
+use axum::{Json, extract::State, response::IntoResponse};
 
 use crate::models::{ModelEntry, ModelsResponse};
 use crate::state::AppState;

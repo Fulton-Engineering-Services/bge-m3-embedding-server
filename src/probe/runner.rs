@@ -21,7 +21,7 @@
 use tracing::{info, warn};
 
 use super::corpus::{load_probe_texts, synthesize_texts};
-use super::fit::{fit_cost_model, DataPoint};
+use super::fit::{DataPoint, fit_cost_model};
 use super::validate::validate_max_seq_shape;
 use crate::binpack::CostModel;
 use crate::embedder::EmbedPool;

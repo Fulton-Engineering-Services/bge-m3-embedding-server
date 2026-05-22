@@ -24,19 +24,18 @@
 pub(super) fn load_probe_texts() -> Vec<String> {
     let corpus_path =
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("benches/fixtures/corpus.json");
-    if let Ok(raw) = std::fs::read_to_string(&corpus_path) {
-        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&raw) {
-            if let Some(scenarios) = json["scenarios"].as_object() {
-                let mut texts: Vec<String> = Vec::new();
-                for scenario in scenarios.values() {
-                    if let Some(arr) = scenario["texts"].as_array() {
-                        texts.extend(arr.iter().filter_map(|v| v.as_str().map(String::from)));
-                    }
-                }
-                if !texts.is_empty() {
-                    return texts;
-                }
+    if let Ok(raw) = std::fs::read_to_string(&corpus_path)
+        && let Ok(json) = serde_json::from_str::<serde_json::Value>(&raw)
+        && let Some(scenarios) = json["scenarios"].as_object()
+    {
+        let mut texts: Vec<String> = Vec::new();
+        for scenario in scenarios.values() {
+            if let Some(arr) = scenario["texts"].as_array() {
+                texts.extend(arr.iter().filter_map(|v| v.as_str().map(String::from)));
             }
+        }
+        if !texts.is_empty() {
+            return texts;
         }
     }
     // Fallback: minimal probe text.

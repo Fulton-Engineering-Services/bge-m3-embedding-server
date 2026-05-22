@@ -16,7 +16,7 @@
 //! `CACHE_HIT_THRESHOLD_MS` compile-time assertion, and the
 //! per-shard coverage-check correctness proofs.
 
-use super::super::{coverage_check_shapes, shard_shapes, CACHE_HIT_THRESHOLD_MS};
+use super::super::{CACHE_HIT_THRESHOLD_MS, coverage_check_shapes, shard_shapes};
 
 /// Default 16-shape grid for stride-sharding and coverage-check tests.
 fn default_shapes() -> Vec<(usize, usize)> {

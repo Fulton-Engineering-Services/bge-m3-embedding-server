@@ -15,9 +15,9 @@
 //! Application-level error types that map to HTTP status codes.
 
 use axum::{
+    Json,
     http::StatusCode,
     response::{IntoResponse, Response},
-    Json,
 };
 use serde_json::json;
 use tracing::error;

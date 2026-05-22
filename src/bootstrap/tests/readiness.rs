@@ -34,10 +34,12 @@ async fn readiness_probe_fails_when_init_returns_error() {
     )
     .await;
     assert!(result.is_err());
-    assert!(result
-        .unwrap_err()
-        .to_string()
-        .contains("initialization failed"));
+    assert!(
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("initialization failed")
+    );
 }
 
 #[tokio::test]

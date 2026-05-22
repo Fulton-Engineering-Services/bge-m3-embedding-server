@@ -1,14 +1,14 @@
 [package]
 name = "bge-m3-embedding-server"
-version = "1.4.1"
-edition = "2021"
+version = "1.5.0"
+edition = "2024"
 license = "Apache-2.0"
 description = "Axum HTTP server serving BGE-M3 dense and sparse embeddings via ONNX Runtime"
 repository = "https://github.com/Fulton-Engineering-Services/bge-m3-embedding-server"
 readme = "README.md"
 keywords = ["embeddings", "bge-m3", "axum", "nlp", "onnxruntime"]
 categories = ["web-programming::http-server"]
-rust-version = "1.88"
+rust-version = "1.95"
 
 [lib]
 name = "bge_m3_embedding_server"

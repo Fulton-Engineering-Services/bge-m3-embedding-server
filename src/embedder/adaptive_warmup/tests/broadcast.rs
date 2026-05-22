@@ -18,7 +18,7 @@
 
 use tokio::sync::mpsc;
 
-use super::super::{run_adaptive_warmup_loop, AdaptiveWarmupConfig};
+use super::super::{AdaptiveWarmupConfig, run_adaptive_warmup_loop};
 use crate::embedder::pool::EmbedPool;
 
 // ─── broadcast_engine_ready integration ──────────────────────────────────────

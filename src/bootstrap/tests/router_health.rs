@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::sync::atomic::{AtomicBool, AtomicU8};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU8};
 
 use arc_swap::ArcSwap;
 use axum::body::Body;

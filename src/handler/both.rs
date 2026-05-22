@@ -17,7 +17,7 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use axum::{extract::State, http::HeaderMap, Json};
+use axum::{Json, extract::State, http::HeaderMap};
 
 use super::common::{check_ready, collect_x_headers, validate_input};
 use crate::error::AppError;

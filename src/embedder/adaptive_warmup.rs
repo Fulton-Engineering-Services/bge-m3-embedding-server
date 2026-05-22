@@ -119,7 +119,7 @@ async fn run_adaptive_warmup_loop(
         drain_rx(&mut rx, &mut pending, &warmed);
 
         // Reset hourly compile budget.
-        if hour_start.elapsed() >= Duration::from_secs(3600) {
+        if hour_start.elapsed() >= Duration::from_hours(1) {
             shapes_this_hour = 0;
             hour_start = Instant::now();
         }

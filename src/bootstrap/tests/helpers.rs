@@ -13,8 +13,8 @@
 // limitations under the License.
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU8};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU8};
 
 use arc_swap::ArcSwap;
 use tokio::sync::Semaphore;
