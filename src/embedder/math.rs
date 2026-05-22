@@ -79,3 +79,122 @@ pub(super) fn median_usize(values: &mut [usize]) -> usize {
     values.sort_unstable();
     values[values.len() / 2]
 }
+
+/// Per-batch token-length distribution statistics.
+///
+/// All lengths are measured in tokens (post-tokenization id counts), before
+/// any padding. Carried in [`super::types::EmbedStats`] and logged on every
+/// completed embed request so operators can correlate latency spikes with new
+/// `(batch_size, seq_len)` shapes hitting TRT engine compile paths.
+#[derive(Debug, Clone, Copy, Default)]
+pub(super) struct SeqLenDistribution {
+    /// Minimum token sequence length in the batch.
+    pub min: usize,
+    /// Maximum token sequence length in the batch.
+    pub max: usize,
+    /// Mean token sequence length (integer, truncated toward zero).
+    pub mean: usize,
+    /// 95th-percentile token sequence length.
+    ///
+    /// Index is `(n * 95) / 100` on a sorted copy — a conservative floor
+    /// that never exceeds `n - 1`.  For a batch of 64 texts this maps to
+    /// index 60, meaning the 61st-shortest sequence.
+    pub p95: usize,
+}
+
+/// Computes min, max, mean, and p95 token-length statistics for an embed batch.
+///
+/// Returns a zeroed [`SeqLenDistribution`] for an empty slice.  Allocates a
+/// temporary sorted copy of `lens`; batch sizes are ≤ 256 so this is cheap.
+pub(super) fn seq_len_distribution(lens: &[usize]) -> SeqLenDistribution {
+    if lens.is_empty() {
+        return SeqLenDistribution::default();
+    }
+    let min = *lens.iter().min().expect("non-empty");
+    let max = *lens.iter().max().expect("non-empty");
+    let mean = lens.iter().sum::<usize>() / lens.len();
+    let mut sorted = lens.to_vec();
+    sorted.sort_unstable();
+    let p95_idx = (sorted.len() * 95) / 100;
+    let p95 = sorted[p95_idx.min(sorted.len() - 1)];
+    SeqLenDistribution {
+        min,
+        max,
+        mean,
+        p95,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::seq_len_distribution;
+
+    #[test]
+    fn single_element() {
+        let d = seq_len_distribution(&[42]);
+        assert_eq!(d.min, 42);
+        assert_eq!(d.max, 42);
+        assert_eq!(d.mean, 42);
+        assert_eq!(d.p95, 42);
+    }
+
+    #[test]
+    fn empty_returns_zeros() {
+        let d = seq_len_distribution(&[]);
+        assert_eq!(d.min, 0);
+        assert_eq!(d.max, 0);
+        assert_eq!(d.mean, 0);
+        assert_eq!(d.p95, 0);
+    }
+
+    #[test]
+    fn uniform_batch() {
+        let lens: Vec<usize> = vec![100; 64];
+        let d = seq_len_distribution(&lens);
+        assert_eq!(d.min, 100);
+        assert_eq!(d.max, 100);
+        assert_eq!(d.mean, 100);
+        assert_eq!(d.p95, 100);
+    }
+
+    #[test]
+    fn ascending_sequence_p95() {
+        // lens = [1, 2, ..., 100]. Sorted same order.
+        // p95_idx = (100 * 95) / 100 = 95 → sorted[95] = 96.
+        let lens: Vec<usize> = (1..=100).collect();
+        let d = seq_len_distribution(&lens);
+        assert_eq!(d.min, 1);
+        assert_eq!(d.max, 100);
+        assert_eq!(d.mean, 50); // sum=5050, /100 = 50 (integer)
+        assert_eq!(d.p95, 96);
+    }
+
+    #[test]
+    fn two_elements() {
+        // p95_idx = (2 * 95) / 100 = 1, so sorted[1] = max.
+        let d = seq_len_distribution(&[10, 200]);
+        assert_eq!(d.min, 10);
+        assert_eq!(d.max, 200);
+        assert_eq!(d.mean, 105);
+        assert_eq!(d.p95, 200);
+    }
+
+    #[test]
+    fn p95_does_not_panic_on_small_batches() {
+        // For n in 1..20 verify p95_idx stays within bounds.
+        for n in 1usize..=20 {
+            let lens: Vec<usize> = (1..=n).collect();
+            let d = seq_len_distribution(&lens);
+            // p95 must be between min and max inclusive.
+            assert!(d.p95 >= d.min, "p95 < min for n={n}");
+            assert!(d.p95 <= d.max, "p95 > max for n={n}");
+        }
+    }
+
+    #[test]
+    fn mean_truncated() {
+        // sum=5, len=2 → 5/2=2 (integer truncation).
+        let d = seq_len_distribution(&[2, 3]);
+        assert_eq!(d.mean, 2);
+    }
+}

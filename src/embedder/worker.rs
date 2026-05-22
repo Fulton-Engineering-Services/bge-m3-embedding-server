@@ -962,6 +962,10 @@ pub(super) fn run_worker(
                                 chunks = stats.chunks,
                                 max_chunk_seq = stats.max_chunk_seq,
                                 total_token_positions = stats.total_token_positions,
+                                seq_len_min = stats.seq_len_min,
+                                seq_len_max = stats.seq_len_max,
+                                seq_len_mean = stats.seq_len_mean,
+                                seq_len_p95 = stats.seq_len_p95,
                                 tokenize_ms = stats.tokenize_ms,
                                 inference_ms = stats.inference_ms,
                                 "worker: dense embed complete"
@@ -1006,6 +1010,10 @@ pub(super) fn run_worker(
                                 chunks = stats.chunks,
                                 max_chunk_seq = stats.max_chunk_seq,
                                 total_token_positions = stats.total_token_positions,
+                                seq_len_min = stats.seq_len_min,
+                                seq_len_max = stats.seq_len_max,
+                                seq_len_mean = stats.seq_len_mean,
+                                seq_len_p95 = stats.seq_len_p95,
                                 tokenize_ms = stats.tokenize_ms,
                                 inference_ms = stats.inference_ms,
                                 "worker: sparse embed complete"
@@ -1050,6 +1058,10 @@ pub(super) fn run_worker(
                                 chunks = stats.chunks,
                                 max_chunk_seq = stats.max_chunk_seq,
                                 total_token_positions = stats.total_token_positions,
+                                seq_len_min = stats.seq_len_min,
+                                seq_len_max = stats.seq_len_max,
+                                seq_len_mean = stats.seq_len_mean,
+                                seq_len_p95 = stats.seq_len_p95,
                                 tokenize_ms = stats.tokenize_ms,
                                 inference_ms = stats.inference_ms,
                                 "worker: both embed complete"

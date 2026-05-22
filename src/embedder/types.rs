@@ -56,6 +56,16 @@ pub struct EmbedStats {
     pub tokenize_ms: u64,
     /// Total time spent in ORT `session.run()` across all chunks (milliseconds).
     pub inference_ms: u64,
+    /// Minimum token sequence length across all inputs in the batch.
+    pub seq_len_min: usize,
+    /// Maximum token sequence length across all inputs in the batch.
+    pub seq_len_max: usize,
+    /// Mean token sequence length across all inputs (integer, truncated).
+    pub seq_len_mean: usize,
+    /// 95th-percentile token sequence length across all inputs in the batch.
+    ///
+    /// Index is `(n * 95) / 100` on a sorted copy of the per-input lengths.
+    pub seq_len_p95: usize,
 }
 
 pub(crate) enum EmbedRequest {

@@ -18,7 +18,7 @@ use anyhow::Result;
 use ort::value::TensorRef;
 
 use super::error::ort_err;
-use super::math::{sparse_maxpool, sparse_project};
+use super::math::{seq_len_distribution, sparse_maxpool, sparse_project};
 use super::tokenize::{build_chunk_arrays, tokenize_no_pad};
 use super::types::{EmbedStats, SparseEmbedding};
 use crate::binpack::{bin_pack, CostModel};
@@ -44,6 +44,7 @@ pub(super) fn embed_sparse(
     let seq_lens: Vec<usize> = encodings.iter().map(|e| e.get_ids().len()).collect();
     let tokenize_ms = u64::try_from(tokenize_start.elapsed().as_millis()).unwrap_or(u64::MAX);
 
+    let seq_dist = seq_len_distribution(&seq_lens);
     let total_token_positions: usize = seq_lens.iter().sum();
     let chunks = bin_pack(&seq_lens, cost_model);
 
@@ -131,6 +132,10 @@ pub(super) fn embed_sparse(
         total_token_positions,
         tokenize_ms,
         inference_ms,
+        seq_len_min: seq_dist.min,
+        seq_len_max: seq_dist.max,
+        seq_len_mean: seq_dist.mean,
+        seq_len_p95: seq_dist.p95,
     };
 
     Ok((
