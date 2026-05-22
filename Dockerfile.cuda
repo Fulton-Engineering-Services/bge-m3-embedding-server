@@ -103,12 +103,12 @@ RUN apt-get update \
        libnvinfer10 libnvinfer-plugin10 libnvonnxparsers10 \
     && rm -rf /var/lib/apt/lists/*
 
-# UID/GID must match EFS model-cache access point in Codekeeper CDK (10002).
+# UID/GID must match your EFS model-cache access point (example: 10002).
 RUN groupadd --gid 10002 bge \
     && useradd --uid 10002 --gid bge --no-create-home --shell /sbin/nologin bge
 
 # Pre-create /tls owned by bge so the TLS entrypoint preamble (which runs after
-# `USER bge` and does `mkdir -p /tls && printf '%s\n' "$LOCKBOX_TLS_CA_CERT" > /tls/ca.crt`)
+# `USER bge` and does `mkdir -p /tls && printf '%s\n' "$TLS_CA_CERT" > /tls/ca.crt`)
 # can write the CA cert + leaf cert without root.
 RUN mkdir -p /tls && chown bge:bge /tls
 

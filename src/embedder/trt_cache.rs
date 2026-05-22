@@ -14,7 +14,7 @@
 
 //! `TensorRT` engine cache path construction, inspection, and durability.
 //!
-//! Why a dedicated module? Investigation of the 2026-05 codekeeper outage
+//! Why a dedicated module? Investigation of a production incident
 //! showed two consecutive cold starts producing identical 172 s recompile
 //! times for `1×8192` — the `{cache_dir}/trt-engines/` directory on EFS was
 //! NOT being reused between container restarts. The most plausible root cause
@@ -444,8 +444,8 @@ pub(crate) fn engine_basenames_in_dir_sorted(engine_dir: &Path) -> std::io::Resu
 /// matches are listed (and counted); when `None`, every `.engine` file is
 /// listed. Emits a sibling `engine_basename_total_count` field so operators
 /// reading `CloudWatch` can see the heterogeneous-SM picture at a glance —
-/// e.g. `matching=0, total=3` is the exact failure mode behind the
-/// 2026-05-16 codekeeper outage on Blackwell with stale L40S plans.
+/// e.g. `matching=0, total=3` is the exact failure mode behind a
+/// heterogeneous-SM cache on Blackwell with stale L40S plans.
 ///
 /// ONNX Runtime's `TensorRT` EP names engine caches from the fused subgraph
 /// id and precision (`TensorrtExecutionProvider_TRTKernel_…_fp16_smXX.engine`),
@@ -774,8 +774,8 @@ mod tests {
         assert!(super::engine_basenames_in_dir_sorted(&missing).is_err());
     }
 
-    /// Models the production failure shape from the 2026-05 codekeeper
-    /// outage: the engine cache directory exists (created via
+    /// Models the production failure shape where the engine cache directory
+    /// exists (created via
     /// `ensure_and_inspect` on every container start) but the prewarm
     /// loop emitted "compile success" without TRT actually writing any
     /// `.engine` files. `ensure_and_inspect` must return
@@ -918,8 +918,8 @@ mod tests {
     }
 
     /// CRITICAL regression guard: requesting `sm12` MUST NOT match a
-    /// `_sm120.engine` plan. The 2026-05-16 outage hinged on accidentally
-    /// counting Blackwell plans as "the cache is warm for sm12" or vice
+    /// `_sm120.engine` plan. A prior heterogeneous-cache bug hinged on
+    /// accidentally counting Blackwell plans as "the cache is warm for sm12" or vice
     /// versa. Anchoring on `_sm{XX}.engine` is the only safe match shape.
     #[test]
     fn matches_sm_suffix_rejects_prefix_collision() {
@@ -956,7 +956,7 @@ mod tests {
 
     // ─── engine_files_for_sm (heterogeneous-cache filtering) ──────────────
 
-    /// **The exact production scenario** from the 2026-05-16 codekeeper outage.
+    /// **The exact heterogeneous-cache scenario** observed in production.
     /// Cache contains plans for three SMs (`sm86`, `sm89`, `sm120`); a worker
     /// on a Blackwell GPU (`sm120`) asks for its own SM and must see exactly
     /// one entry — not three. The pre-fix bookkeeping counted all three and

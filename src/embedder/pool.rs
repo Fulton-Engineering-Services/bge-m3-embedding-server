@@ -264,7 +264,7 @@ impl EmbedPool {
                 // then spawn the next. This ensures each worker's RSS delta
                 // (pre/post load_models) reflects only that worker's ORT session
                 // allocation — not the cumulative effect of other workers loading
-                // in parallel. Parallel loading caused the 2026-05-09 measurement
+                // in parallel. Parallel loading caused an RSS measurement
                 // contamination bug: all followers read post_load_rss after most
                 // other sessions had already mmap'd, producing an inflated
                 // rss_delta ≈ N × model_size and driving per_worker_workspace to 0.

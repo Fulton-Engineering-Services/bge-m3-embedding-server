@@ -372,8 +372,8 @@ pub struct Config {
     ///
     /// Set with `BGE_M3_PREWARM_STRICT`. Defaults to `true`.
     ///
-    /// The 2026-05 codekeeper outage motivated this default: every worker
-    /// on a 4× Blackwell task hit a TRT autotuner workspace OOM mid-build
+    /// A production incident motivated this default: every worker
+    /// on a multi-GPU Blackwell task hit a TRT autotuner workspace OOM mid-build
     /// (`IBuilder::buildSerializedNetwork: Error Code 10`), the postcondition
     /// logged a WARN, `/health` returned `200 ok`, and the task served HTTP
     /// 500 traffic on the same shape that failed prewarm. Strict-mode would

@@ -14,7 +14,7 @@ This page is structured diagnose-first, fix-second. Each section starts with a s
 | `a_bytes_per_token` | ${\sim}18\,432$ | Fitted linear coefficient (FFN term). |
 | `b_bytes_per_token_sq` | ${\sim}6.2$ | Fitted quadratic coefficient (attention term). |
 | `max_workspace_bytes` | ${\sim}2.0\,\text{GB}$ | Per-worker bin-packing budget derived from available memory. |
-| `model_rss_bytes_per_worker` | ${\sim}1\,100\,000\,000$ | Peak RSS delta measured by each worker during `load_models()`. Was 0 before the 2026-05-09 fix. |
+| `model_rss_bytes_per_worker` | ${\sim}1\,100\,000\,000$ | Peak RSS delta measured by each worker during `load_models()`. Was 0 before sequential worker loading was enforced. |
 | `worst_case_peak_bytes` | ${\sim}21.5\,\text{GB}$ | $N \times \text{workspace} + N \times \text{model-rss} + \text{OS-HEADROOM}$. Must be below `available_bytes`. |
 | `utilization_pct` | ${\sim}74\%$ | $\text{worst-case-peak} / \text{available} \times 100$. A `WARN` fires at startup if $> 90\%$. |
 

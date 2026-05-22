@@ -18,7 +18,7 @@
 //!
 //! * [`prewarm_persistence_postcondition_failed`] — **fatal** ERROR signal.
 //!   Catches the catastrophic fresh-compiles → 0 engines on disk pattern
-//!   that produced the 2026-05 codekeeper outage.
+//!   that produced silent-persistence startup failures in production.
 //! * [`prewarm_persistence_suspicious_undercount`] — **non-fatal** WARN
 //!   signal. Retained for future extension; currently silent whenever
 //!   `engine_count_after > 0` (see inline note).
@@ -41,7 +41,7 @@
 //!
 //! The only actionable signal is `engine_count_after == 0`: the TRT EP
 //! reported `Ok(_)` from `session.run()` yet wrote no engine file at all.
-//! That is the exact failure mode from the 2026-05 outage.
+//! That is the exact failure mode from that incident class.
 
 /// Decides whether a single worker's prewarm postcondition is violated.
 ///
@@ -49,8 +49,9 @@
 /// **fresh compile** (`succeeded && !cache_hit`) but the on-disk `.engine`
 /// file count is still zero, the TRT EP almost certainly emitted `Ok(_)`
 /// from `session.run()` without actually persisting the engine plan.  This
-/// is the silent-persistence failure mode behind the 2026-05 codekeeper
-/// outage (1215 compile-success events / 0 engines on disk).
+/// is the silent-persistence failure mode where the TRT EP reports compile
+/// success but writes no engine files (many compile-success events / 0 engines
+/// on disk).
 ///
 /// Returning `true` should produce an `ERROR` log so operators see the
 /// failure in `CloudWatch` immediately.  Non-fresh-compile shards (cache hits

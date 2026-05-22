@@ -117,8 +117,8 @@ pub async fn health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
 /// submits a real `embed_dense` call through the worker pool and exercises
 /// the full tokenize → ORT `session.run()` → projection path, including
 /// `TensorRT` engine dispatch on GPU builds. It is the strongest available
-/// liveness signal because it catches the silent-failure mode observed in
-/// the 2026-05 incident: `/health` returned `200 ok` while every real
+/// liveness signal because it catches the silent-failure mode where
+/// `/health` returned `200 ok` while every real
 /// embedding request returned `500` due to a broken TRT CUDA context.
 ///
 /// # Response codes

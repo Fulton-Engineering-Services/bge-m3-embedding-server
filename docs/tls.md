@@ -85,7 +85,8 @@ and binding plain HTTP when HTTPS was expected.
 ### AWS ECS with shared internal CA (production)
 
 The CDK entrypoint preamble for the ECS task definition generates a short-lived leaf
-certificate from the shared internal CA stored in Secrets Manager as `LOCKBOX_TLS_CA_JSON`.
+certificate from the shared internal CA stored in Secrets Manager (e.g.
+`TLS_CA_JSON` or equivalent in your deployment).
 The preamble runs `openssl` at container startup and writes the cert and key to a shared
 `tmpfs` volume:
 

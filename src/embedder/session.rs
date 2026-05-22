@@ -119,7 +119,7 @@ pub(super) fn execution_providers(
             // path to a hard error. ORT's `apply_execution_providers` defaults
             // `error_on_failure = false`, which means a failed registration
             // (e.g. `libonnxruntime_providers_tensorrt.so` missing from the
-            // image — the 2026-05 codekeeper outage root cause) is logged as
+            // image — a common silent-CPU-fallback root cause) is logged as
             // a `WARN`/`ERROR` via the `ort` crate's internal tracing macros
             // and the loop falls back to CPU/MLAS without surfacing the
             // failure. With this set, `Session::builder().with_execution_providers(...)`

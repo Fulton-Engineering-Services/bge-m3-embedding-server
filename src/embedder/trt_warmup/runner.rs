@@ -50,8 +50,8 @@ pub(super) struct ShapeRunResult {
 /// Snapshots `.engine` file count before and after the run. When a shape
 /// reports a fresh compile (not a cache hit) but the on-disk count does not
 /// increase, emits a `WARN` so operators can catch the
-/// "compile-success-without-persistence" failure mode that produced the
-/// 2026-05 codekeeper outage (TRT EP silently failing to write engine plan
+/// "compile-success-without-persistence" failure mode observed in production
+/// (TRT EP silently failing to write engine plan
 /// files even though `session.run()` returned `Ok(_)`).
 ///
 /// `sm` selects which engine plans count toward the before/after snapshots:
@@ -118,7 +118,7 @@ pub(super) fn run_warmup_shape(
 
             // A non-cache-hit run that reports `Ok(_)` from session.run() but
             // leaves the on-disk `.engine` count at zero is the silent failure
-            // mode behind the 2026-05 codekeeper outage.
+            // mode behind silent-persistence startup failures in production.
             //
             // NOTE: The condition is `engine_count_after == 0`, NOT
             // `!engine_count_increased`. ORT's TRT EP writes one profile-based
