@@ -122,6 +122,8 @@ jobs:
           fi
 
   # ── Docker build (native runners, parallel) ──────────────────────────
+  # CUDA jobs use org larger runner label `bge-cuda-4core-linux-x64` (runner group
+  # bge-cuda-4core, 4 vCPU / 150 GB, linux-x64). Dockerfile.cuda is amd64-only.
   build-cuda:
     name: Build CUDA image (amd64)
     needs: [version]
@@ -129,7 +131,7 @@ jobs:
     permissions:
       contents: read
       packages: write
-    runs-on: ubuntu-latest
+    runs-on: bge-cuda-4core-linux-x64
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
 
@@ -294,7 +296,7 @@ jobs:
     permissions:
       contents: read
       packages: write
-    runs-on: ubuntu-latest
+    runs-on: bge-cuda-4core-linux-x64
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
 
@@ -317,8 +319,8 @@ jobs:
           platforms: linux/amd64
           build-args: EXTRA_FEATURES=tls
           outputs: type=image,name=${{ env.REGISTRY }}/${{ needs.version.outputs.repo }},push-by-digest=true,name-canonical=true,push=true
-          cache-from: type=gha,scope=linux/amd64-cuda-tls
-          cache-to: type=gha,scope=linux/amd64-cuda-tls,mode=max
+          cache-from: type=gha,scope=linux/amd64-cuda
+          cache-to: type=gha,scope=linux/amd64-cuda,mode=max
           labels: |
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
             org.opencontainers.image.version=${{ needs.version.outputs.version }}-cuda-tls
@@ -349,7 +351,7 @@ jobs:
     permissions:
       contents: read
       packages: write
-    runs-on: ubuntu-latest
+    runs-on: bge-cuda-4core-linux-x64
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
 
@@ -372,8 +374,8 @@ jobs:
           platforms: linux/amd64
           build-args: CACHE_GC_FEATURES=cache-gc
           outputs: type=image,name=${{ env.REGISTRY }}/${{ needs.version.outputs.repo }},push-by-digest=true,name-canonical=true,push=true
-          cache-from: type=gha,scope=linux/amd64-cuda-cache-gc
-          cache-to: type=gha,scope=linux/amd64-cuda-cache-gc,mode=max
+          cache-from: type=gha,scope=linux/amd64-cuda
+          cache-to: type=gha,scope=linux/amd64-cuda,mode=max
           labels: |
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
             org.opencontainers.image.version=${{ needs.version.outputs.version }}-cuda-cache-gc
