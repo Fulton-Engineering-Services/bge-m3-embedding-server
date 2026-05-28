@@ -134,7 +134,7 @@ pub async fn health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
 /// Point both `ECS healthCheck.command` and the ALB target-group health check
 /// at `/health/deep`. The 30-second inference timeout ensures the health check
 /// never hangs indefinitely; keep the ECS `healthCheckGracePeriodSeconds`
-/// large enough to cover TRT cold-start (≥ 10 800 s for a full 16-shape grid).
+/// large enough to cover TRT cold-start (≥ 10 800 s for a full 24-shape grid).
 pub async fn health_deep(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     if !state.ready.load(Ordering::Acquire) {
         return (

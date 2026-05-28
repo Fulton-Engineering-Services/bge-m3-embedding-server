@@ -36,7 +36,7 @@
 //! warmup grid.  On subsequent container starts, every warmup
 //! `session.run()` is a cache hit and finishes in ≤ 3 s.
 //!
-//! Rather than paying 16 × 1–3 s = 16–48 s of redundant cache-hit loads,
+//! Rather than paying 24 × 1–3 s = 24–72 s of redundant cache-hit loads,
 //! `trt_prewarm` runs at most **4 "dimensional-extreme" shapes** (the shapes
 //! that exercise the minimum and maximum of each input dimension
 //! independently) and measures wall-clock time.  If all extremes complete
@@ -196,7 +196,7 @@ pub(super) fn coverage_check_shapes(shapes: &[(usize, usize)]) -> Vec<(usize, us
 ///
 /// **Why stride and not contiguous blocks?**\
 /// The default warmup grid is ordered batch-major:
-/// `{1,4,16,32} × {128,512,2048,8192}`. Each consecutive group of four shapes
+/// `{1,2,4,8,16,32} × {128,512,2048,8192}`. Each consecutive group of four shapes
 /// belongs to one batch size, and within a group the sequence length grows
 /// monotonically. Stride assignment therefore spreads the work so each GPU
 /// receives one shape from each batch group at a different sequence length.
@@ -204,7 +204,7 @@ pub(super) fn coverage_check_shapes(shapes: &[(usize, usize)]) -> Vec<(usize, us
 /// (e.g. with 4 workers, worker 3 gets all 8192-seq shapes, which compile in
 /// parallel with the cheaper shapes on workers 0–2). Total wall-clock time is
 /// approximately the serial compile time for worker 3's four shapes, compared
-/// to the serial time for all 16 — a rough 4× speedup on 4 GPUs.
+/// to the serial time for all 24 - a rough 4× speedup on 4 GPUs.
 ///
 /// Returns all shapes unchanged when `worker_count ≤ 1`.
 pub(super) fn shard_shapes(

@@ -19,8 +19,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Linux without an NVIDIA driver. Used to clamp `BGE_M3_WORKERS` and to pin each worker to a
   distinct CUDA device (`device_id = worker_index % gpu_count`).
 - `BGE_M3_TRT_WARMUP_SHAPES` environment variable — pre-compiles TensorRT engine files for a
-  configurable set of `(batch, seq)` shapes during worker startup. Default is a 16-shape 2D
-  grid `{1, 4, 16, 32} × {128, 512, 2048, 8192}` in batch-major order. Multi-worker runs
+  configurable set of `(batch, seq)` shapes during worker startup. Default is a 24-shape 2D
+  grid `{1, 2, 4, 8, 16, 32} × {128, 512, 2048, 8192}` in batch-major order. Multi-worker runs
   automatically stride-partition the grid so each GPU compiles a disjoint subset in parallel,
   reducing cold-compile wall-clock time roughly proportionally to GPU count.
 - `BGE_M3_WARMUP_ONLY` environment variable — when `1`, the server initialises normally,
@@ -40,7 +40,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - TRT warm-cache fast path — `trt_prewarm` runs at most 4 dimensional-extreme `(batch, seq)`
   shapes (one per `min_batch`, `max_batch`, `min_seq`, `max_seq`); if all four are under
   `CACHE_HIT_THRESHOLD_MS = 5000 ms` the remaining warmup shapes are skipped as `fully_cached:
-  true`, eliminating ~16–48 s of redundant cache-hit loads on every warm restart. Zero false
+  true`, eliminating ~24–72 s of redundant cache-hit loads on every warm restart. Zero false
   positives: an in-range hit on all four extremes mathematically guarantees every shard shape is
   within the cached profile range.
 - NVML-backed GPU heartbeat (GPU builds only) — one additional `INFO` log event per CUDA device

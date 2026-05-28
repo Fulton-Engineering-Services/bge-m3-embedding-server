@@ -10,7 +10,7 @@ cargo nextest run --all-features --no-tests=warn
 cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 cargo deny check          # supply chain audit
-hawkeye check             # license headers (.rs files only)
+hawkeye check             # license headers (Rust src/tests/benches/examples + tools/**/*.py)
 
 # Equivalence tests (requires model download)
 BGE_M3_EQUIVALENCE_TEST=1 BGE_M3_CACHE_DIR=/tmp/bge-m3-cache \
@@ -67,7 +67,7 @@ Add `BGE_M3_DISABLE_AUTO_BUDGET=1` to skip the 2-minute Linux startup probe duri
 | `BGE_M3_ADAPTIVE_WARMUP_QUIET_SECS` | `3` | Seconds of full idle (queue empty, all workers free) required before the adaptive loop fires a warmup compile. `0` returns immediately (no sleep before first idle check). |
 | `BGE_M3_ADAPTIVE_WARMUP_MAX_SHAPES_PER_HOUR` | `12` | Per-process cap on adaptive warmup compiles per hour. Prevents pathological traffic from compiling indefinitely. |
 | `BGE_M3_ENGINE_PROPAGATION_ENABLED` | matches `adaptive_warmup_enabled` | Broadcast `(batch, seq)` shape notifications to peer workers after a new TRT engine plan is written to EFS. Peers run `trt_prewarm` for a ~1-3s fast disk-load instead of full JIT. Disable for debugging (keeps adaptive warmup active). |
-| `BGE_M3_TRT_WARMUP_SHAPES` | 16-shape grid | Comma-separated `BxL` shapes for TRT engine pre-compilation. Shrink to `1x128` on workstations. |
+| `BGE_M3_TRT_WARMUP_SHAPES` | 24-shape grid | Comma-separated `BxL` shapes for TRT engine pre-compilation. Shrink to `1x128` on workstations. |
 | `BGE_M3_WARMUP_ONLY` | `0` | Exit after TRT engine compilation — use as an ECS init container to pre-populate the engine cache. |
 
 ### TRT Operational
@@ -137,8 +137,13 @@ docker run --rm --gpus all -p 8081:8081 -v /path/to/cache:/cache \
   -e BGE_M3_EP=cuda bge-m3-embedding-server:cuda
 ```
 
-Port `8081`. Dockerfile `HEALTHCHECK` polls `/health` every 10 s with a 120 s start period.
-Releases: `<version>`/`latest` (CPU multi-arch) and `<version>-cuda`/`latest-cuda` (CUDA amd64) on GHCR.
+Port `8081`. Both Dockerfiles' `HEALTHCHECK` runs `healthcheck.sh` (which probes `/health/deep`) every 10 s with a 15 s timeout, a 5 s start period, and 3 retries. The 120 s/3 s figures are obsolete; TRT cold-start is covered by ECS `healthCheckGracePeriodSeconds`, not the Docker start period.
+Releases on GHCR (`ghcr.io/fulton-engineering-services/bge-m3-embedding-server`), all cosign-signed (keyless OIDC) with attached SBOMs. Five image variants:
+- `<version>`/`latest` - CPU, multi-arch (linux/amd64 + linux/arm64), built from `Dockerfile`
+- `<version>-tls`/`latest-tls` - CPU + TLS (`EXTRA_FEATURES=tls`), multi-arch
+- `<version>-cuda`/`latest-cuda` - CUDA + TensorRT, linux/amd64 only, built from `Dockerfile.cuda`
+- `<version>-cuda-tls`/`latest-cuda-tls` - CUDA + TLS, linux/amd64 only
+- `<version>-cuda-cache-gc`/`latest-cuda-cache-gc` - CUDA + `cache-gc` feature, linux/amd64 only; maintenance-window use only (never deploy against a shared multi-SM EFS cache)
 
 ## Releasing
 

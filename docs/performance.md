@@ -537,7 +537,7 @@ or `BGE_M3_EP=tensorrt`. The production Docker image for GPU deployments uses th
 | Startup probe | Yes (Linux) | No (macOS) | **Bypassed** | **Bypassed** |
 | Workspace budget | Probe-derived (`max_workspace_bytes`) | macOS conservative defaults | `BGE_M3_GPU_VRAM_BUDGET_BYTES` (default 10 GiB) | Same |
 | Engine caching | Probe cache JSON | CoreML `.mlmodelc` | N/A | TRT engine files (`{cache_dir}/trt-engines/`) plus a TRT timing cache at `{cache_dir}/trt-timing` |
-| First-inference cold start | Normal | CoreML compilation (~15 s) | Normal | **~90–180 min first deploy on an L4 (default 16-shape `{1,4,16,32}×{128,512,2048,8192}` grid compile); seconds thereafter (engine cache hit, fsynced per shape). Multi-GPU init containers shard the warmup grid across workers via stride partition (~N× faster cold compile). Use `BGE_M3_WARMUP_ONLY=1` as an ECS init container to decouple compilation from service startup — see [README: ECS Init Container Pattern](../README.md#ecs-init-container-pattern-tensorrt).** |
+| First-inference cold start | Normal | CoreML compilation (~15 s) | Normal | **~135–270 min first deploy on an L4 (default 24-shape `{1,2,4,8,16,32}×{128,512,2048,8192}` grid compile); seconds thereafter (engine cache hit, fsynced per shape). Multi-GPU init containers shard the warmup grid across workers via stride partition (~N× faster cold compile). Use `BGE_M3_WARMUP_ONLY=1` as an ECS init container to decouple compilation from service startup - see [README: ECS Init Container Pattern](../README.md#ecs-init-container-pattern-tensorrt).** |
 
 **Why workers = `BGE_M3_GPU_COUNT` for GPU EPs:** Each worker is pinned to a distinct CUDA device
 (`device_id = worker_index % gpu_count`). On a single-GPU instance the default `BGE_M3_GPU_COUNT=1`

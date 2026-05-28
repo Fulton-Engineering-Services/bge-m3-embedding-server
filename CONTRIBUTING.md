@@ -13,7 +13,7 @@ each commit with `git commit -s`.
 
 ### Rust toolchain
 
-Requires **Rust 1.88** or later (MSRV). Install or update via [rustup](https://rustup.rs/):
+Requires **Rust 1.95** or later (MSRV). Install or update via [rustup](https://rustup.rs/):
 
 ```bash
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
@@ -56,7 +56,7 @@ cargo nextest run --all-features --no-tests=warn
 # Supply-chain audit (licenses + advisories)
 cargo deny check
 
-# License header check (.rs files)
+# License header check (Rust src/tests/benches/examples + tools/**/*.py)
 hawkeye check
 ```
 

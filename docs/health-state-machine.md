@@ -178,19 +178,24 @@ restart is required.
 
 ## Docker HEALTHCHECK Integration
 
-The Dockerfile configures:
+Both `Dockerfile` and `Dockerfile.cuda` configure:
 
 ```dockerfile
-HEALTHCHECK --interval=10s --timeout=3s --start-period=120s --retries=3 \
-    CMD curl --fail --silent http://localhost:8081/health || exit 1
+HEALTHCHECK --interval=10s --timeout=15s --start-period=5s --retries=3 \
+    CMD ["/usr/local/bin/healthcheck.sh"]
 ```
+
+`healthcheck.sh` is a dual-mode wrapper that probes `/health/deep` (a real canary
+embed, not the lightweight `/health`) on `127.0.0.1:8081`, using HTTPS with `-k`
+when both `BGE_M3_TLS_CERT_PATH` and `BGE_M3_TLS_KEY_PATH` are set at runtime and
+plain HTTP otherwise.
 
 | Parameter | Value | Rationale |
 |-----------|-------|-----------|
-| `start-period` | 120 s | Allows time for ~2 GB model download on first run |
+| `start-period` | 5 s | Catches obvious startup crashes quickly; TRT cold start is covered by ECS `healthCheckGracePeriodSeconds`, not this window |
 | `interval` | 10 s | Frequent enough to detect worker failures quickly |
-| `timeout` | 3 s | Maximum time for a single `curl` probe |
+| `timeout` | 15 s | Maximum time for a single `/health/deep` canary probe |
 | `retries` | 3 | Tolerates brief transient failures (e.g., during model reload) |
 
 During the `start-period`, Docker ignores health check failures. After that
-window, three consecutive 503 responses mark the container as `unhealthy`.
+window, three consecutive failing responses mark the container as `unhealthy`.
