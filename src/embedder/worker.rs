@@ -29,6 +29,7 @@ use tracing::{info, info_span};
 use super::dense::embed_dense;
 use super::dual::embed_both;
 use super::error::ort_err;
+use super::jit_guard::{self, TrtJitGuard};
 use super::session::{GpuSessionConfig, load_models};
 use super::sm_detect::detect_sm_for_device;
 use super::sparse::embed_sparse;
@@ -149,9 +150,33 @@ fn is_trt_jit_oom(e: &anyhow::Error) -> bool {
 /// lifetime of the process; keep this function's pattern set minimal and
 /// explicit and do not fold it into `is_trt_jit_oom`.
 fn is_trt_engine_build_fatal(e: &anyhow::Error) -> bool {
-    let lowercase = format!("{e}").to_lowercase();
+    // `{e:#}` renders the full anyhow source chain (context + cause), so this
+    // detection still fires when the caller has wrapped the underlying ORT
+    // error with `anyhow::Error::context(...)` (as `run_worker` does, e.g.
+    // "Dual embed error: <original>"). A plain `{e}` would show only the
+    // outermost context string and miss the build-failure substring.
+    let lowercase = format!("{e:#}").to_lowercase();
     lowercase.contains("failed to build engine")
         || lowercase.contains("failed to create engine from network")
+}
+
+/// Builds the per-request in-band TRT JIT guard from the worker config and the
+/// live pool-wide warmed-sequence ceiling.
+///
+/// Returns `None` (guard disabled) on non-TRT EPs or when
+/// `BGE_M3_TRT_INBAND_JIT_GUARD=0`, so the embed call sites pass `None` and
+/// skip all guard work. The ceiling is read fresh on every request so the
+/// decision reflects the latest coverage extended by adaptive warmup or
+/// engine propagation.
+fn build_shape_guard(config: &WorkerConfig) -> Option<TrtJitGuard> {
+    if config.ep == EpSelection::TensorRt && config.trt_inband_jit_guard_enabled {
+        Some(TrtJitGuard::new(
+            config.trt_inband_jit_guard_seq,
+            config.warmed_seq_ceiling.load(Ordering::Acquire),
+        ))
+    } else {
+        None
+    }
 }
 
 /// Wraps an embed call with the standard TRT JIT-OOM retry-once-with-halved-budget
@@ -290,6 +315,27 @@ pub(super) fn drain_engine_propagation<F>(
     }
 }
 
+/// Emits a `WARN` describing an in-band TRT JIT guard refusal.
+///
+/// Greppable tag: `trt_jit_guard_refused`. A refusal means the worker
+/// protected itself from a dangerous, uncovered chunk shape that could have
+/// triggered a process-killing pathological autotuner allocation; the client
+/// receives HTTP `503` and may retry once warmup coverage extends.
+fn log_guard_rejection<T>(result: &anyhow::Result<T>, worker_id: usize, route: &'static str) {
+    if let Err(e) = result {
+        tracing::warn!(
+            target: "bge_m3_embedding_server::trt_warmup",
+            tag = "trt_jit_guard_refused",
+            worker_id,
+            route,
+            error = %e,
+            "in-band TRT JIT guard refused a dangerous, uncovered chunk shape; \
+             returning 503 instead of risking a process-killing autotuner \
+             allocation (request is retriable once warmup coverage extends)"
+        );
+    }
+}
+
 pub(super) struct WorkerGuard(pub Arc<AtomicUsize>);
 
 impl Drop for WorkerGuard {
@@ -412,6 +458,36 @@ pub struct WorkerConfig {
     /// Sourced from `BGE_M3_CIRCUIT_BREAKER_THRESHOLD`; defaults to `5`.
     pub circuit_breaker_threshold: usize,
 
+    /// Enables the in-band TRT JIT admission guard (see [`super::jit_guard`]).
+    ///
+    /// When `true` (and `ep == TensorRt`), before any chunk's `session.run()`
+    /// the worker refuses chunks whose sequence length is in the dangerous
+    /// range and is not covered by the pool's warmed engine profile, returning
+    /// an error that maps to HTTP `503` instead of risking the process-killing
+    /// pathological autotuner allocation. Sourced from
+    /// `BGE_M3_TRT_INBAND_JIT_GUARD`; defaults to `true`.
+    pub trt_inband_jit_guard_enabled: bool,
+
+    /// Sequence-length threshold (`guard_seq`) at/above which an *uncovered*
+    /// shape is refused rather than JIT-compiled in-band. Below this value a
+    /// cold in-band JIT is bounded and is allowed (letting the engine profile
+    /// grow naturally). Sourced from `BGE_M3_TRT_INBAND_JIT_GUARD_SEQ`;
+    /// defaults to `4096`. The guard is a no-op when `max_seq_length` is below
+    /// this threshold (no chunk can reach the dangerous range).
+    pub trt_inband_jit_guard_seq: usize,
+
+    /// Pool-wide ceiling: the maximum sequence length any worker has
+    /// successfully warmed (fresh compile or warm-cache hit), shared across
+    /// all workers via the `Arc<AtomicUsize>`.
+    ///
+    /// Read by the per-request [`super::jit_guard::TrtJitGuard`]; raised via
+    /// [`fetch_max`](std::sync::atomic::AtomicUsize::fetch_max) after startup
+    /// prewarm, engine-propagation prewarm, and adaptive-warmup compiles. A
+    /// successful warmup of a sequence tier by *any* worker means the engine
+    /// plan is on the shared EFS cache and every worker can fast-load it, so a
+    /// single shared ceiling is a sound pool-wide coverage signal.
+    pub warmed_seq_ceiling: Arc<AtomicUsize>,
+
     /// **Destructive** stale-SM TRT engine cache GC flag.
     ///
     /// Only present when the `cache-gc` Cargo feature is compiled in.
@@ -510,6 +586,12 @@ enum InferenceOutcome {
     TrtFatal,
     /// Consecutive-failure threshold reached; unload models and reset counter.
     CircuitBreak,
+    /// The in-band TRT JIT guard refused the request (dangerous, uncovered
+    /// shape). The worker is healthy and deliberately protected itself, so the
+    /// consecutive-failure counter is left unchanged — a refusal is neither a
+    /// success nor a GPU failure and must not contribute to tripping the
+    /// circuit breaker.
+    Rejected,
 }
 
 /// Runs one probe batch: tokenize texts, build padded arrays, call `session.run()`,
@@ -806,7 +888,26 @@ pub(super) fn run_worker(
             total = config.trt_warmup_shapes.len(),
             total_compile_ms = stats.total_compile_ms,
             total_fsync_ms = stats.total_fsync_ms,
+            max_warmed_seq = stats.max_warmed_seq,
             "TensorRT pre-warm complete"
+        );
+
+        // Raise the pool-wide in-band JIT guard ceiling to the highest
+        // sequence tier this worker successfully warmed. With seq-homogeneous
+        // sharding (worker N gets one full seq tier) the union across workers
+        // reconstructs the full grid coverage; a tier that failed on every
+        // worker leaves the ceiling below it so real requests at that tier are
+        // refused (HTTP 503) instead of triggering a process-killing in-band
+        // JIT. See `jit_guard.rs`.
+        let prev_ceiling = config
+            .warmed_seq_ceiling
+            .fetch_max(stats.max_warmed_seq, Ordering::AcqRel);
+        tracing::info!(
+            target: "bge_m3_embedding_server::trt_warmup",
+            worker_id = id,
+            max_warmed_seq = stats.max_warmed_seq,
+            warmed_seq_ceiling = prev_ceiling.max(stats.max_warmed_seq),
+            "in-band JIT guard: warmed-seq ceiling updated after prewarm"
         );
 
         // Strict-mode escalation (BGE_M3_PREWARM_STRICT): when the prewarm
@@ -890,10 +991,16 @@ pub(super) fn run_worker(
             && let Some((session, _)) = models.as_mut()
         {
             let sm = detected_sm.as_deref();
+            let ceiling = &config.warmed_seq_ceiling;
             drain_engine_propagation(bcast_rx, &mut warmed_local, id, |shape| {
                 let started = std::time::Instant::now();
                 let stats = trt_prewarm(session, &[shape], id, &cache_dir, sm);
                 let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+                if stats.warmed > 0 || stats.fully_cached {
+                    // A peer-propagated plan now covers this shape on disk and
+                    // in this worker's session: extend the guard ceiling.
+                    ceiling.fetch_max(stats.max_warmed_seq.max(shape.1), Ordering::AcqRel);
+                }
                 tracing::info!(
                     target: "bge_m3_embedding_server::trt_shape",
                     worker_id = id,
@@ -992,6 +1099,13 @@ pub(super) fn run_worker(
                     }
                 }
 
+                // In-band TRT JIT admission guard, rebuilt per request from the
+                // live pool-wide warmed-seq ceiling. `None` on non-TRT EPs or
+                // when the guard is disabled. Passed into the embed functions
+                // which refuse dangerous, uncovered chunk shapes before
+                // `session.run()` (returning a TrtJitRejection → HTTP 503).
+                let shape_guard = build_shape_guard(&config);
+
                 // Flags for circuit-breaker and fatal-exit decisions; set
                 // inside the borrow scope of `session`/`tokenizer` and acted
                 // on AFTER that scope ends so `models` can be safely mutated.
@@ -1039,14 +1153,19 @@ pub(super) fn run_worker(
                                             &texts,
                                             cm,
                                             config.model_variant,
+                                            shape_guard.as_ref(),
                                         )
                                     },
                                     &cm_guard,
                                     id,
                                     "dense",
                                 )
-                                .map_err(|e| anyhow::anyhow!("Dense embed error: {e}"));
+                                .map_err(|e| e.context("Dense embed error"));
                                 let inference_ms = t_inference.elapsed().as_millis();
+                                let guard_rejected = result
+                                    .as_ref()
+                                    .err()
+                                    .is_some_and(jit_guard::is_trt_shape_rejected);
                                 let trt_fatal =
                                     result.as_ref().err().is_some_and(is_trt_engine_build_fatal);
                                 let is_err = result.is_err();
@@ -1084,6 +1203,9 @@ pub(super) fn run_worker(
                                  worker exiting to reset CUDA arena"
                                     );
                                     inner_outcome = InferenceOutcome::TrtFatal;
+                                } else if guard_rejected {
+                                    log_guard_rejection(&result, id, "dense");
+                                    inner_outcome = InferenceOutcome::Rejected;
                                 } else if is_err {
                                     let next_failures = consecutive_failures + 1;
                                     if next_failures
@@ -1133,14 +1255,19 @@ pub(super) fn run_worker(
                                             &texts,
                                             cm,
                                             config.model_variant,
+                                            shape_guard.as_ref(),
                                         )
                                     },
                                     &cm_guard,
                                     id,
                                     "sparse",
                                 )
-                                .map_err(|e| anyhow::anyhow!("Sparse embed error: {e}"));
+                                .map_err(|e| e.context("Sparse embed error"));
                                 let inference_ms = t_inference.elapsed().as_millis();
+                                let guard_rejected = result
+                                    .as_ref()
+                                    .err()
+                                    .is_some_and(jit_guard::is_trt_shape_rejected);
                                 let trt_fatal =
                                     result.as_ref().err().is_some_and(is_trt_engine_build_fatal);
                                 let is_err = result.is_err();
@@ -1178,6 +1305,9 @@ pub(super) fn run_worker(
                                  worker exiting to reset CUDA arena"
                                     );
                                     inner_outcome = InferenceOutcome::TrtFatal;
+                                } else if guard_rejected {
+                                    log_guard_rejection(&result, id, "sparse");
+                                    inner_outcome = InferenceOutcome::Rejected;
                                 } else if is_err {
                                     let next_failures = consecutive_failures + 1;
                                     if next_failures
@@ -1227,14 +1357,19 @@ pub(super) fn run_worker(
                                             &texts,
                                             cm,
                                             config.model_variant,
+                                            shape_guard.as_ref(),
                                         )
                                     },
                                     &cm_guard,
                                     id,
                                     "both",
                                 )
-                                .map_err(|e| anyhow::anyhow!("Dual embed error: {e}"));
+                                .map_err(|e| e.context("Dual embed error"));
                                 let inference_ms = t_inference.elapsed().as_millis();
+                                let guard_rejected = result
+                                    .as_ref()
+                                    .err()
+                                    .is_some_and(jit_guard::is_trt_shape_rejected);
                                 let trt_fatal =
                                     result.as_ref().err().is_some_and(is_trt_engine_build_fatal);
                                 let is_err = result.is_err();
@@ -1272,6 +1407,9 @@ pub(super) fn run_worker(
                                  worker exiting to reset CUDA arena"
                                     );
                                     inner_outcome = InferenceOutcome::TrtFatal;
+                                } else if guard_rejected {
+                                    log_guard_rejection(&result, id, "both");
+                                    inner_outcome = InferenceOutcome::Rejected;
                                 } else if is_err {
                                     let next_failures = consecutive_failures + 1;
                                     if next_failures
@@ -1323,6 +1461,12 @@ pub(super) fn run_worker(
                                     detected_sm.as_deref(),
                                 );
                                 if stats.warmed > 0 || stats.fully_cached {
+                                    // Newly-compiled tier now has a persisted
+                                    // engine plan: extend the guard ceiling so
+                                    // real requests at this seq are admitted.
+                                    config
+                                        .warmed_seq_ceiling
+                                        .fetch_max(stats.max_warmed_seq.max(seq), Ordering::AcqRel);
                                     Ok(stats.total_compile_ms)
                                 } else {
                                     Err(anyhow::anyhow!(
@@ -1360,6 +1504,11 @@ pub(super) fn run_worker(
                         consecutive_failures = 0;
                         models = None;
                         loaded_workers.fetch_sub(1, Ordering::AcqRel);
+                    }
+                    InferenceOutcome::Rejected => {
+                        // Healthy preventive refusal: leave the consecutive
+                        // failure counter untouched so guard rejections never
+                        // trip the circuit breaker.
                     }
                 }
             }

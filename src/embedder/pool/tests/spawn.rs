@@ -39,6 +39,9 @@ async fn spawn_propagates_leader_load_failure() {
             engine_propagation_tx: None,
             prewarm_strict: true,
             circuit_breaker_threshold: 5,
+            trt_inband_jit_guard_enabled: true,
+            trt_inband_jit_guard_seq: 4096,
+            warmed_seq_ceiling: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             #[cfg(feature = "cache-gc")]
             trt_cache_gc_enabled: false,
         },
@@ -92,6 +95,9 @@ async fn gpu_ep_clamps_workers_to_gpu_count() {
             engine_propagation_tx: None,
             prewarm_strict: true,
             circuit_breaker_threshold: 5,
+            trt_inband_jit_guard_enabled: true,
+            trt_inband_jit_guard_seq: 4096,
+            warmed_seq_ceiling: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             #[cfg(feature = "cache-gc")]
             trt_cache_gc_enabled: false,
         },
@@ -152,6 +158,9 @@ async fn spawn_multi_worker_fails_fast_on_leader_failure() {
             engine_propagation_tx: None,
             prewarm_strict: true,
             circuit_breaker_threshold: 5,
+            trt_inband_jit_guard_enabled: true,
+            trt_inband_jit_guard_seq: 4096,
+            warmed_seq_ceiling: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             #[cfg(feature = "cache-gc")]
             trt_cache_gc_enabled: false,
         },

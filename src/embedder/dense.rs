@@ -18,6 +18,7 @@ use anyhow::Result;
 use ort::value::TensorRef;
 
 use super::error::ort_err;
+use super::jit_guard::{self, TrtJitGuard};
 use super::math::{normalize_l2, seq_len_distribution};
 use super::tokenize::{build_chunk_arrays, tokenize_no_pad};
 use super::types::EmbedStats;
@@ -29,6 +30,13 @@ use crate::config::ModelVariant;
 /// Tokenizes once, then uses the cost model to bin-pack into chunks that fit
 /// within the workspace budget. Results are scattered back to the original
 /// input order.
+///
+/// `guard` is the in-band TRT JIT admission guard (see
+/// [`super::jit_guard`]). When `Some`, any chunk whose sequence length is in
+/// the dangerous range and uncovered by the warmed engine profile is refused
+/// (returning [`super::jit_guard::TrtJitRejection`]) before any `session.run()`
+/// executes, so a single request fails with HTTP `503` instead of risking a
+/// process-killing pathological autotuner allocation.
 #[allow(clippy::cast_possible_truncation)]
 pub(super) fn embed_dense(
     session: &mut ort::session::Session,
@@ -36,6 +44,7 @@ pub(super) fn embed_dense(
     texts: &[String],
     cost_model: &CostModel,
     model_variant: ModelVariant,
+    guard: Option<&TrtJitGuard>,
 ) -> Result<(Vec<Vec<f32>>, EmbedStats)> {
     let tokenize_start = std::time::Instant::now();
     let encodings = tokenize_no_pad(tokenizer, texts)?;
@@ -45,6 +54,7 @@ pub(super) fn embed_dense(
     let seq_dist = seq_len_distribution(&seq_lens);
     let total_token_positions: usize = seq_lens.iter().sum();
     let chunks = bin_pack(&seq_lens, cost_model);
+    jit_guard::guard_chunks(guard, &chunks, &seq_lens).map_err(anyhow::Error::new)?;
 
     // Pre-allocate output slots (one per input text, filled below).
     let mut all_embeddings: Vec<Vec<f32>> = (0..texts.len()).map(|_| Vec::new()).collect();

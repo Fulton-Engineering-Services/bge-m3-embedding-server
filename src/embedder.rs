@@ -26,6 +26,9 @@
 //! - `dense`: dense embedding pipeline.
 //! - `sparse`: BGE-M3 SPLADE-style sparse embedding pipeline.
 //! - `dual`: paired dense + sparse embedding pipeline (one forward pass).
+//! - `jit_guard`: in-band `TensorRT` JIT admission guard that refuses chunks
+//!   whose sequence length is dangerous and uncovered by the warmed engine
+//!   profile, preventing the process-killing pathological autotuner allocation.
 //! - `trt_cache`: `TensorRT` engine-cache path construction, inspection, and
 //!   durability (fsync after compile).
 //! - `trt_cache_gc` (feature `cache-gc`, off by default): destructive
@@ -41,6 +44,7 @@ pub(crate) mod adaptive_warmup;
 mod dense;
 mod dual;
 mod error;
+pub(crate) mod jit_guard;
 mod math;
 mod model_files;
 mod pool;
