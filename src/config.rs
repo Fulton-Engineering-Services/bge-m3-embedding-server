@@ -403,6 +403,35 @@ pub struct Config {
     /// radius from a broken GPU state to ~5 requests before self-healing.
     pub circuit_breaker_threshold: usize,
 
+    /// Enables the in-band `TensorRT` JIT admission guard.
+    ///
+    /// Set with `BGE_M3_TRT_INBAND_JIT_GUARD`. Defaults to `true`.
+    ///
+    /// When enabled (and `ep == tensorrt`), the worker refuses any chunk whose
+    /// padded sequence length is at/above [`Self::trt_inband_jit_guard_seq`]
+    /// and exceeds the pool's warmed engine coverage, returning HTTP `503`
+    /// instead of issuing the `session.run()` that would trigger an in-band
+    /// TRT JIT. On the fused `/v1/embeddings:both` graph at `seq=8192` that
+    /// JIT can request a pathological autotuner allocation (tens of GiB to
+    /// multiple TiB) that crashes the worker via SIGSEGV / OOM-kill — a hard
+    /// process death no `Result`-based safety net can catch. Refusing the rare
+    /// uncovered request is strictly safer. Set to `0` to disable (restoring
+    /// the pre-guard crash-on-uncovered-large-shape behaviour).
+    pub trt_inband_jit_guard_enabled: bool,
+
+    /// Sequence-length threshold for the in-band JIT guard.
+    ///
+    /// Set with `BGE_M3_TRT_INBAND_JIT_GUARD_SEQ`. Defaults to `4096`.
+    ///
+    /// Chunks with `seq < guard_seq` are always admitted (a cold JIT at small
+    /// or medium sequence lengths is bounded and lets the engine profile grow
+    /// naturally); only `seq >= guard_seq` chunks that are *also* uncovered by
+    /// the warmed profile are refused. The default sits between the second-
+    /// highest (`2048`) and highest (`8192`) default warmup tiers, so it
+    /// targets the genuinely-pathological large-sequence region and is a
+    /// no-op for deployments whose `max_seq_length` is below it.
+    pub trt_inband_jit_guard_seq: usize,
+
     /// When `true`, scan the TRT engine cache at worker startup and
     /// **destructively delete** plan files whose `_smXX` suffix does not
     /// match the current device. Sourced from `BGE_M3_TRT_CACHE_GC_ENABLED`,
@@ -669,6 +698,19 @@ impl Config {
             .unwrap_or(5)
             .max(1);
 
+        // BGE_M3_TRT_INBAND_JIT_GUARD: default ON. Only an explicit disable
+        // token (`0`/`false`/`no`) turns it off, so fat-fingered values keep
+        // the protective behaviour.
+        let trt_inband_jit_guard_enabled = !matches!(
+            lookup("BGE_M3_TRT_INBAND_JIT_GUARD").as_deref(),
+            Some("0" | "false" | "no")
+        );
+
+        let trt_inband_jit_guard_seq = lookup("BGE_M3_TRT_INBAND_JIT_GUARD_SEQ")
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(4096)
+            .max(1);
+
         let tls_cert_path = lookup("BGE_M3_TLS_CERT_PATH").map(std::path::PathBuf::from);
         let tls_key_path = lookup("BGE_M3_TLS_KEY_PATH").map(std::path::PathBuf::from);
 
@@ -728,6 +770,8 @@ impl Config {
             trt_warmup_shapes,
             max_body_bytes,
             circuit_breaker_threshold,
+            trt_inband_jit_guard_enabled,
+            trt_inband_jit_guard_seq,
             warmup_only,
             prewarm_strict,
             #[cfg(feature = "cache-gc")]

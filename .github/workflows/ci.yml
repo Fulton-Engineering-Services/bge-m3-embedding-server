@@ -126,7 +126,7 @@ jobs:
       - name: Generate coverage
         run: cargo llvm-cov nextest --features "download-ort tls" --lcov --output-path lcov.info
       - name: Upload to Codecov
-        uses: codecov/codecov-action@57e3a136b779b570ffcdbf80b3bdc90e7fab3de2  # v5
+        uses: codecov/codecov-action@e79a6962e0d4c0c17b229090214935d2e33f8354  # v5
         with:
           files: lcov.info
           fail_ci_if_error: false
@@ -138,7 +138,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
-      - uses: EmbarkStudios/cargo-deny-action@6c8f9facfa5047ec02d8485b6bf52b587b7777d1  # v2
+      - uses: EmbarkStudios/cargo-deny-action@a531616d8ce3b9177443e48a1159bc945a099823  # v2
 
   docs:
     name: Rustdoc

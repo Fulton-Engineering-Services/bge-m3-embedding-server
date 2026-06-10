@@ -18,6 +18,7 @@ use anyhow::Result;
 use ort::value::TensorRef;
 
 use super::error::ort_err;
+use super::jit_guard::{self, TrtJitGuard};
 use super::math::{normalize_l2, seq_len_distribution, sparse_maxpool, sparse_project};
 use super::tokenize::{build_chunk_arrays, tokenize_no_pad};
 use super::types::{DualEmbedding, EmbedStats, SparseEmbedding};
@@ -35,6 +36,11 @@ use crate::config::ModelVariant;
 ///
 /// Numerically equivalent to calling [`super::dense::embed_dense`] and
 /// [`super::sparse::embed_sparse`] separately, within FP rounding tolerance.
+///
+/// `guard` is the in-band TRT JIT admission guard; see
+/// [`super::dense::embed_dense`] for the refusal semantics. This route (the
+/// fused dual-output graph at `seq=8192`) is the one most prone to the
+/// pathological autotuner allocation the guard prevents.
 #[allow(clippy::cast_possible_truncation, clippy::too_many_lines)]
 pub(super) fn embed_both(
     session: &mut ort::session::Session,
@@ -42,6 +48,7 @@ pub(super) fn embed_both(
     texts: &[String],
     cost_model: &CostModel,
     model_variant: ModelVariant,
+    guard: Option<&TrtJitGuard>,
 ) -> Result<(Vec<DualEmbedding>, EmbedStats)> {
     let (weight, bias) = crate::weights::sparse_linear();
     let weight_view = weight.view();
@@ -54,6 +61,7 @@ pub(super) fn embed_both(
     let seq_dist = seq_len_distribution(&seq_lens);
     let total_token_positions: usize = seq_lens.iter().sum();
     let chunks = bin_pack(&seq_lens, cost_model);
+    jit_guard::guard_chunks(guard, &chunks, &seq_lens).map_err(anyhow::Error::new)?;
 
     let mut all_dual: Vec<Option<DualEmbedding>> = (0..texts.len()).map(|_| None).collect();
 

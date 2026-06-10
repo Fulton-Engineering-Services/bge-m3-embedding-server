@@ -1,6 +1,6 @@
 [package]
 name = "bge-m3-embedding-server"
-version = "1.5.8"
+version = "1.5.9"
 edition = "2024"
 license = "Apache-2.0"
 description = "Axum HTTP server serving BGE-M3 dense and sparse embeddings via ONNX Runtime"
@@ -118,7 +118,7 @@ proptest = "1"
 criterion = { version = "0.8", features = ["html_reports"] }
 sha2 = "0.11"
 tempfile = "3"
-rcgen = "0.13"
+rcgen = "0.14"
 rustls = { version = "0.23", features = ["aws-lc-rs"] }
 
 [[bench]]

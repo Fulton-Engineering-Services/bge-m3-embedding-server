@@ -250,6 +250,13 @@ pub async fn run() -> anyhow::Result<()> {
             engine_propagation_tx,
             prewarm_strict: cfg.prewarm_strict,
             circuit_breaker_threshold: cfg.circuit_breaker_threshold,
+            trt_inband_jit_guard_enabled: cfg.trt_inband_jit_guard_enabled,
+            trt_inband_jit_guard_seq: cfg.trt_inband_jit_guard_seq,
+            // Shared across all workers: the max sequence tier any worker has
+            // successfully warmed. Starts at 0 (nothing warmed) and is raised
+            // via fetch_max as workers complete prewarm / propagation /
+            // adaptive compiles. Read by the per-request in-band JIT guard.
+            warmed_seq_ceiling: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             #[cfg(feature = "cache-gc")]
             trt_cache_gc_enabled: cfg.trt_cache_gc_enabled,
         },
@@ -638,10 +645,10 @@ mod tests {
             .install_default()
             .ok();
 
-        let CertifiedKey { cert, key_pair } =
+        let CertifiedKey { cert, signing_key } =
             generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
         let cert_pem = cert.pem();
-        let key_pem = key_pair.serialize_pem();
+        let key_pem = signing_key.serialize_pem();
 
         let cert_file = tempfile::NamedTempFile::new().unwrap();
         let key_file = tempfile::NamedTempFile::new().unwrap();

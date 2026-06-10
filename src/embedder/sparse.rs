@@ -18,6 +18,7 @@ use anyhow::Result;
 use ort::value::TensorRef;
 
 use super::error::ort_err;
+use super::jit_guard::{self, TrtJitGuard};
 use super::math::{seq_len_distribution, sparse_maxpool, sparse_project};
 use super::tokenize::{build_chunk_arrays, tokenize_no_pad};
 use super::types::{EmbedStats, SparseEmbedding};
@@ -28,6 +29,11 @@ use crate::config::ModelVariant;
 ///
 /// Tokenizes once, then uses the cost model to bin-pack into chunks. Results
 /// are scattered back to the original input order.
+///
+/// `guard` is the in-band TRT JIT admission guard; see [`embed_dense`] for the
+/// refusal semantics.
+///
+/// [`embed_dense`]: super::dense::embed_dense
 #[allow(clippy::cast_possible_truncation)]
 pub(super) fn embed_sparse(
     session: &mut ort::session::Session,
@@ -35,6 +41,7 @@ pub(super) fn embed_sparse(
     texts: &[String],
     cost_model: &CostModel,
     model_variant: ModelVariant,
+    guard: Option<&TrtJitGuard>,
 ) -> Result<(Vec<SparseEmbedding>, EmbedStats)> {
     let (weight, bias) = crate::weights::sparse_linear();
     let weight_view = weight.view();
@@ -47,6 +54,7 @@ pub(super) fn embed_sparse(
     let seq_dist = seq_len_distribution(&seq_lens);
     let total_token_positions: usize = seq_lens.iter().sum();
     let chunks = bin_pack(&seq_lens, cost_model);
+    jit_guard::guard_chunks(guard, &chunks, &seq_lens).map_err(anyhow::Error::new)?;
 
     let mut all_sparse: Vec<Option<SparseEmbedding>> = (0..texts.len()).map(|_| None).collect();
 

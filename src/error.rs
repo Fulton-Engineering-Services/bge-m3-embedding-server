@@ -73,6 +73,18 @@ impl IntoResponse for AppError {
 
 impl From<anyhow::Error> for AppError {
     fn from(err: anyhow::Error) -> Self {
+        // The in-band TRT JIT guard refuses dangerous, uncovered chunk shapes
+        // to avoid a process-killing pathological autotuner allocation. That
+        // refusal is a *retriable* condition (coverage may extend via adaptive
+        // warmup, or a peer task may already cover the shape), so it maps to
+        // 503 rather than a generic 500. Detection walks the error source
+        // chain because the worker wraps embed errors with `.context(...)`.
+        if crate::embedder::jit_guard::is_trt_shape_rejected(&err) {
+            error!(error = %err, "in-band TRT JIT guard refused request");
+            return AppError::ServiceUnavailable(
+                "embedding temporarily unavailable for this input size; please retry".to_string(),
+            );
+        }
         error!(error = %err, "Internal error");
         AppError::Internal("internal server error".to_string())
     }
@@ -135,5 +147,25 @@ mod tests {
             body["error"]["message"], "internal server error",
             "internal details must not leak to client"
         );
+    }
+
+    #[tokio::test]
+    async fn trt_jit_rejection_maps_to_503() {
+        // The in-band JIT guard refusal is a retriable condition and must map
+        // to 503, not the generic 500, even when wrapped in a context chain
+        // (as the worker does via `.context(...)`).
+        let base: anyhow::Error = crate::embedder::jit_guard::TrtJitRejection {
+            batch: 8,
+            seq: 8192,
+            guard_seq: 4096,
+            warmed_seq_ceiling: 2048,
+        }
+        .into();
+        let wrapped = base.context("Dual embed error");
+        let app_err: AppError = wrapped.into();
+        let (status, body) = response_parts(app_err).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["error"]["code"], 503);
+        assert_eq!(body["error"]["type"], "service_unavailable");
     }
 }

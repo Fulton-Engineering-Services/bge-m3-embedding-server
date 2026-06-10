@@ -222,3 +222,60 @@ fn config_from_lookup_resolves_warmup_shapes_for_trt_ep() {
     // Confirm the partial grid was parsed (not fallen back to default).
     assert_eq!(cfg.trt_warmup_shapes, vec![(4, 128), (4, 512)]);
 }
+
+// --- BGE_M3_TRT_INBAND_JIT_GUARD / BGE_M3_TRT_INBAND_JIT_GUARD_SEQ ---
+
+#[test]
+fn inband_jit_guard_defaults_on_with_4096_seq() {
+    let map = HashMap::new();
+    let cfg = Config::from_lookup(lookup_from(&map));
+    assert!(
+        cfg.trt_inband_jit_guard_enabled,
+        "in-band JIT guard must default ON"
+    );
+    assert_eq!(cfg.trt_inband_jit_guard_seq, 4096);
+}
+
+#[test]
+fn inband_jit_guard_disabled_by_explicit_zero() {
+    for token in ["0", "false", "no"] {
+        let map = HashMap::from([("BGE_M3_TRT_INBAND_JIT_GUARD", token)]);
+        let cfg = Config::from_lookup(lookup_from(&map));
+        assert!(
+            !cfg.trt_inband_jit_guard_enabled,
+            "token {token:?} must disable the guard"
+        );
+    }
+}
+
+#[test]
+fn inband_jit_guard_fat_fingered_value_stays_enabled() {
+    // Any non-disable token keeps the protective default — only 0/false/no
+    // turn it off, so a typo does not silently remove the safety net.
+    let map = HashMap::from([("BGE_M3_TRT_INBAND_JIT_GUARD", "yes_please")]);
+    let cfg = Config::from_lookup(lookup_from(&map));
+    assert!(cfg.trt_inband_jit_guard_enabled);
+}
+
+#[test]
+fn inband_jit_guard_seq_parsed_from_env() {
+    let map = HashMap::from([("BGE_M3_TRT_INBAND_JIT_GUARD_SEQ", "2049")]);
+    let cfg = Config::from_lookup(lookup_from(&map));
+    assert_eq!(cfg.trt_inband_jit_guard_seq, 2049);
+}
+
+#[test]
+fn inband_jit_guard_seq_invalid_falls_back_to_default() {
+    let map = HashMap::from([("BGE_M3_TRT_INBAND_JIT_GUARD_SEQ", "not_a_number")]);
+    let cfg = Config::from_lookup(lookup_from(&map));
+    assert_eq!(cfg.trt_inband_jit_guard_seq, 4096);
+}
+
+#[test]
+fn inband_jit_guard_seq_zero_clamps_to_one() {
+    // 0 would make every shape "dangerous"; clamp to a minimum of 1 so the
+    // value stays a valid threshold.
+    let map = HashMap::from([("BGE_M3_TRT_INBAND_JIT_GUARD_SEQ", "0")]);
+    let cfg = Config::from_lookup(lookup_from(&map));
+    assert_eq!(cfg.trt_inband_jit_guard_seq, 1);
+}

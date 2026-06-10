@@ -134,6 +134,13 @@ pub(super) struct PrewarmStats {
     /// finished its shard (post final fsync). SM-filtered with the same
     /// semantics as `engine_count_before`.
     pub engine_count_after: usize,
+    /// Largest sequence length among the shapes this worker successfully
+    /// warmed (fresh compile **or** warm-cache hit). Zero when no shape
+    /// succeeded (e.g. every compile failed, the worker-3 `seq=8192` failure
+    /// mode). Folded into the pool-wide `warmed_seq_ceiling` atomic by the
+    /// worker so [`super::jit_guard::TrtJitGuard`] knows the highest sequence
+    /// tier with a persisted engine plan. See `worker.rs`.
+    pub max_warmed_seq: usize,
 }
 
 /// Selects the minimal set of shapes needed to verify that an ORT TRT EP
@@ -280,6 +287,7 @@ pub(super) fn trt_prewarm(
     let mut fresh_compiles = 0usize;
     let mut total_compile_ms: u64 = 0;
     let mut total_fsync_ms: u64 = 0;
+    let mut max_warmed_seq = 0usize;
     let shape_total = warmup_shapes.len();
     let engine_count_before = trt_cache::count_engine_files_for_sm(&engine_cache_dir, sm);
 
@@ -294,6 +302,7 @@ pub(super) fn trt_prewarm(
             engine_count_delta: 0,
             engine_count_before,
             engine_count_after: engine_count_before,
+            max_warmed_seq: 0,
         };
     }
 
@@ -323,6 +332,7 @@ pub(super) fn trt_prewarm(
         );
         if r.succeeded {
             warmed += 1;
+            max_warmed_seq = max_warmed_seq.max(seq);
             total_compile_ms = total_compile_ms.saturating_add(r.compile_ms);
             total_fsync_ms = total_fsync_ms.saturating_add(r.fsync_ms);
             if !r.cache_hit {
@@ -363,6 +373,9 @@ pub(super) fn trt_prewarm(
                 - i64::try_from(engine_count_before).unwrap_or(i64::MAX),
             engine_count_before,
             engine_count_after,
+            // The dimensional-extreme checks include the shard's max-seq shape;
+            // a fully-cached shard therefore has coverage up to its max seq.
+            max_warmed_seq,
         };
     }
 
@@ -387,6 +400,7 @@ pub(super) fn trt_prewarm(
         );
         if r.succeeded {
             warmed += 1;
+            max_warmed_seq = max_warmed_seq.max(seq);
             total_compile_ms = total_compile_ms.saturating_add(r.compile_ms);
             total_fsync_ms = total_fsync_ms.saturating_add(r.fsync_ms);
             if !r.cache_hit {
@@ -411,5 +425,6 @@ pub(super) fn trt_prewarm(
             - i64::try_from(engine_count_before).unwrap_or(i64::MAX),
         engine_count_before,
         engine_count_after,
+        max_warmed_seq,
     }
 }
