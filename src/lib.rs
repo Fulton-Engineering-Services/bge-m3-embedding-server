@@ -645,10 +645,10 @@ mod tests {
             .install_default()
             .ok();
 
-        let CertifiedKey { cert, key_pair } =
+        let CertifiedKey { cert, signing_key } =
             generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
         let cert_pem = cert.pem();
-        let key_pem = key_pair.serialize_pem();
+        let key_pem = signing_key.serialize_pem();
 
         let cert_file = tempfile::NamedTempFile::new().unwrap();
         let key_file = tempfile::NamedTempFile::new().unwrap();

@@ -85,7 +85,7 @@ pub(crate) fn count_engine_files_for_sm(dir: &Path, sm: Option<&str>) -> usize {
 ///
 /// Backwards-compatible wrapper around [`count_engine_files_for_sm`] with
 /// `sm = None`. Retained because the operator-visible startup cache log
-/// (`trt cache: found cached engines` in [`log_cache_state`]) reports the
+/// (`trt cache: found cached engines` in [`crate::embedder::trt_cache::log_cache_state`]) reports the
 /// total disk footprint, not the SM-filtered subset. Callers that drive
 /// the prewarm postcondition use the SM-aware variant directly.
 pub(crate) fn count_engine_files(dir: &Path) -> usize {
@@ -129,7 +129,7 @@ pub(crate) fn engine_basenames_for_sm(
 ///
 /// Backwards-compatible wrapper around [`engine_basenames_for_sm`] with
 /// `sm = None`. Retained for the unit tests below; production prewarm log
-/// emission goes through [`log_engine_basenames_before_prewarm_for_sm`].
+/// emission goes through [`crate::embedder::trt_cache::log_engine_basenames_before_prewarm_for_sm`].
 pub(crate) fn engine_basenames_in_dir_sorted(engine_dir: &Path) -> std::io::Result<Vec<String>> {
     engine_basenames_for_sm(engine_dir, None)
 }

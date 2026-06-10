@@ -50,7 +50,7 @@ pub struct WorkerConfig {
     pub intra_threads: usize,
     /// ONNX Runtime execution provider selection.
     ///
-    /// Forwarded to [`load_models`] at model load time so each ORT session
+    /// Forwarded to [`crate::embedder::session::load_models`] at model load time so each ORT session
     /// registers the correct EP. On macOS, `CoreML` is always used regardless
     /// of this value. See [`crate::config::EpSelection`] for details.
     pub ep: EpSelection,
@@ -68,7 +68,7 @@ pub struct WorkerConfig {
     /// CUDA/TRT device ID for this specific worker.
     ///
     /// Set by `EmbedPool::spawn` as `worker_index % gpu_count`. Forwarded to
-    /// [`super::session::execution_providers`] so the ORT session binds to the
+    /// [`crate::embedder::session::execution_providers`] so the ORT session binds to the
     /// correct GPU. Ignored on CPU EP and macOS (`CoreML` is single-device).
     pub device_id: u32,
 
@@ -132,7 +132,7 @@ pub struct WorkerConfig {
     /// Sourced from `BGE_M3_CIRCUIT_BREAKER_THRESHOLD`; defaults to `5`.
     pub circuit_breaker_threshold: usize,
 
-    /// Enables the in-band TRT JIT admission guard (see [`super::jit_guard`]).
+    /// Enables the in-band TRT JIT admission guard (see [`crate::embedder::jit_guard`]).
     ///
     /// When `true` (and `ep == TensorRt`), before any chunk's `session.run()`
     /// the worker refuses chunks whose sequence length is in the dangerous
@@ -154,7 +154,7 @@ pub struct WorkerConfig {
     /// successfully warmed (fresh compile or warm-cache hit), shared across
     /// all workers via the `Arc<AtomicUsize>`.
     ///
-    /// Read by the per-request [`super::jit_guard::TrtJitGuard`]; raised via
+    /// Read by the per-request [`crate::embedder::jit_guard::TrtJitGuard`]; raised via
     /// [`fetch_max`](std::sync::atomic::AtomicUsize::fetch_max) after startup
     /// prewarm, engine-propagation prewarm, and adaptive-warmup compiles. A
     /// successful warmup of a sequence tier by *any* worker means the engine
