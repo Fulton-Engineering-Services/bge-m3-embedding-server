@@ -15,7 +15,7 @@
 //! Tests for `is_trt_jit_oom` error-pattern matching and
 //! `embed_with_trt_retry` retry semantics and workspace-halving logic.
 
-use super::super::{embed_with_trt_retry, is_trt_jit_oom};
+use super::super::trt_retry::{embed_with_trt_retry, is_trt_jit_oom};
 use crate::binpack::CostModel;
 
 // --- is_trt_jit_oom ---

@@ -36,6 +36,8 @@
 //!   maintenance / dev binaries.
 //! - `trt_warmup`: `TensorRT` engine pre-warming during worker startup.
 //! - `worker`: blocking worker thread, request dispatch, probe wiring.
+//!   Submodules: `config`, `guard`, `trt_retry`, `propagation`, `probe`,
+//!   `prewarm_strict`, `startup`, `run`, `logging`.
 //! - `pool`: `EmbedPool` async wrapper and test helpers.
 //! - `adaptive_warmup`: adaptive in-process background warmup loop for TRT
 //!   engine cache miss recovery.

@@ -16,7 +16,7 @@
 //! lagged-channel recovery, already-warmed shape filtering, and empty-channel
 //! early-exit.
 
-use super::super::drain_engine_propagation;
+use super::super::propagation::drain_engine_propagation;
 
 // --- drain_engine_propagation ---
 

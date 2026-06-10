@@ -28,7 +28,7 @@
 //! module). Routing around the shared type keeps this test compile-stable
 //! even if a sibling change adds or renames `PrewarmStats` fields.
 
-use super::super::should_fail_readiness;
+use super::super::prewarm_strict::should_fail_readiness;
 
 #[test]
 fn strict_disabled_never_fails_readiness() {
