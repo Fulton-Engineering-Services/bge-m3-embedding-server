@@ -20,7 +20,18 @@
 //!   handling, and idempotency for already-warmed shapes.
 //! - `prewarm_strict`: pure-function tests for the `BGE_M3_PREWARM_STRICT`
 //!   decision predicate (`should_fail_readiness`).
+//! - `guard`: shape-guard wiring, outcome classification, finalize path.
+//! - `logging`: abandoned-request observability.
+//! - `inference_complete`: post-inference cache-miss signaling.
+//! - `dispatch`: reload-error reply routing and abandonment logging.
+//! - `startup`: SM detection helper for TRT workers.
 
+mod dispatch;
+mod guard;
+mod helpers;
+mod inference_complete;
+mod logging;
 mod prewarm_strict;
 mod propagation;
+mod startup;
 mod trt_retry;

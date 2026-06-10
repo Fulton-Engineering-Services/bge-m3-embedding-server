@@ -110,6 +110,7 @@ pub(crate) enum EmbedRequest {
 pub(crate) type JitSuspectSender = tokio::sync::mpsc::Sender<(usize, usize)>;
 
 /// Result of a single probe `session.run()` call.
+#[derive(Debug)]
 pub(crate) struct ProbeResult {
     /// Process RSS (bytes) measured immediately before `session.run()`.
     pub rss_before: usize,

@@ -24,8 +24,11 @@ use tokio::sync::{Mutex, mpsc};
 use tracing::info;
 
 use super::config::WorkerConfig;
-use super::dispatch::{DispatchOutcome, dispatch_request};
-use super::guard::{InferenceOutcome, WorkerGuard, build_shape_guard};
+use super::dispatch::{DispatchOutcome, dispatch_request, reply_request_load_error};
+use super::guard::{
+    InferenceOutcome, WorkerGuard, build_shape_guard, next_consecutive_failures,
+    should_unload_on_outcome,
+};
 use super::probe::probe_run_dense;
 use super::propagation::drain_engine_propagation;
 use super::startup::{StartupOutcome, startup_worker};
@@ -172,23 +175,7 @@ pub(in crate::embedder) fn run_worker(
                         Err(e) => {
                             tracing::error!(error = %e, "Worker {id} failed to reload models");
                             let err = anyhow::anyhow!("Model reload failed: {e}");
-                            match request {
-                                EmbedRequest::Dense { reply, .. } => {
-                                    let _ = reply.send(Err(err));
-                                }
-                                EmbedRequest::Sparse { reply, .. } => {
-                                    let _ = reply.send(Err(err));
-                                }
-                                EmbedRequest::Both { reply, .. } => {
-                                    let _ = reply.send(Err(err));
-                                }
-                                EmbedRequest::Probe { reply, .. } => {
-                                    let _ = reply.send(Err(err));
-                                }
-                                EmbedRequest::AdaptiveWarmup { ack, .. } => {
-                                    let _ = ack.send(Err(err));
-                                }
-                            }
+                            reply_request_load_error(request, err);
                             continue;
                         }
                     }
@@ -236,28 +223,15 @@ pub(in crate::embedder) fn run_worker(
                 if skip_to_next {
                     continue;
                 }
-                match outcome {
-                    InferenceOutcome::Ok => {
-                        consecutive_failures = 0;
-                    }
-                    InferenceOutcome::Failure => {
-                        consecutive_failures += 1;
-                    }
-                    InferenceOutcome::TrtFatal => {
-                        return Err(anyhow::anyhow!(
-                            "Worker {id} hit fatal TRT engine build error; exiting"
-                        ));
-                    }
-                    InferenceOutcome::CircuitBreak => {
-                        consecutive_failures = 0;
-                        models = None;
-                        loaded_workers.fetch_sub(1, Ordering::AcqRel);
-                    }
-                    InferenceOutcome::Rejected => {
-                        // Healthy preventive refusal: leave the consecutive
-                        // failure counter untouched so guard rejections never
-                        // trip the circuit breaker.
-                    }
+                consecutive_failures = next_consecutive_failures(outcome, consecutive_failures);
+                if matches!(outcome, InferenceOutcome::TrtFatal) {
+                    return Err(anyhow::anyhow!(
+                        "Worker {id} hit fatal TRT engine build error; exiting"
+                    ));
+                }
+                if should_unload_on_outcome(outcome) {
+                    models = None;
+                    loaded_workers.fetch_sub(1, Ordering::AcqRel);
                 }
             }
         }

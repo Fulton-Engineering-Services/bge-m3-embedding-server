@@ -143,3 +143,18 @@ fn is_trt_shape_rejected_false_for_other_errors() {
     let err = anyhow::anyhow!("Could not find any implementation for Unsqueeze node");
     assert!(!is_trt_shape_rejected(&err));
 }
+
+#[test]
+fn trt_jit_rejection_display_includes_shape_and_thresholds() {
+    let msg = TrtJitRejection {
+        batch: 8,
+        seq: 8192,
+        guard_seq: GUARD_SEQ,
+        warmed_seq_ceiling: 2048,
+    }
+    .to_string();
+    assert!(msg.contains("batch=8"));
+    assert!(msg.contains("seq=8192"));
+    assert!(msg.contains("4096"));
+    assert!(msg.contains("2048"));
+}

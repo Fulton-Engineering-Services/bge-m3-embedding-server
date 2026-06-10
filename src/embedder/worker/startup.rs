@@ -43,6 +43,15 @@ pub(super) struct StartupOutcome {
     pub detected_sm: Option<String>,
 }
 
+/// Returns the GPU compute capability for TRT EP workers, or `None` on CPU/CUDA.
+pub(super) fn detected_sm_for_ep(ep: EpSelection, device_id: u32) -> Option<String> {
+    if ep == EpSelection::TensorRt {
+        detect_sm_for_device(device_id)
+    } else {
+        None
+    }
+}
+
 /// Loads models, runs optional TRT prewarm, and signals readiness.
 #[allow(clippy::too_many_lines)]
 pub(super) fn startup_worker(
@@ -186,7 +195,7 @@ pub(super) fn startup_worker(
     // unfiltered semantics so an operator missing `nvidia-smi` mid-deploy
     // does not see a hard regression.
     let detected_sm: Option<String> = if config.ep == EpSelection::TensorRt {
-        let sm = detect_sm_for_device(config.device_id);
+        let sm = detected_sm_for_ep(config.ep, config.device_id);
         if sm.is_none() {
             tracing::warn!(
                 worker_id = id,

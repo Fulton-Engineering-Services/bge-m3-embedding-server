@@ -17,7 +17,11 @@
 //! - `paths`: path construction, startup inspection, write-probe.
 //! - `fsync`: post-compile durability sweep.
 //! - `sm`: SM suffix matching and engine enumeration.
+//! - `prewarm_log`: operator-visible prewarm basename logging.
+//! - `inspect`: startup cache state logging.
 
 mod fsync;
+mod inspect;
 mod paths;
+mod prewarm_log;
 mod sm;
