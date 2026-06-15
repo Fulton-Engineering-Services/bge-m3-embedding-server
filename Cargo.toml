@@ -42,7 +42,7 @@ arc-swap = "1"
 ort = { version = "=2.0.0-rc.12", features = ["coreml", "ndarray", "std", "api-24", "tracing"], default-features = false }
 hf-hub = "0.5"
 tokenizers = { version = "0.23", default-features = false, features = ["onig"] }
-safetensors = "0.7"
+safetensors = "0.8"
 ndarray = "0.17"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
