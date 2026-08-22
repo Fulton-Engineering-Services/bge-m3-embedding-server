@@ -1,4 +1,4 @@
-Copyright (c) {{props["inceptionYear"]}} J. Patrick Fulton
+Copyright (c) {{ props.inception_year }} J. Patrick Fulton
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
