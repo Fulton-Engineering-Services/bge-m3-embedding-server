@@ -25,13 +25,5 @@ RUN curl -L --proto '=https' --tlsv1.2 -sSf \
 # cargo-nextest (test runner) and cargo-deny (supply-chain audit) — match CI
 RUN cargo binstall -y cargo-nextest cargo-deny
 
-# hawkeye 6.5.1: license-header checker — pinned to match the version in CI
-ARG HAWKEYE_VERSION=6.5.1
-RUN curl --proto '=https' --tlsv1.2 -sSfL \
-    "https://github.com/korandoru/hawkeye/releases/download/v${HAWKEYE_VERSION}/hawkeye-x86_64-unknown-linux-musl.tar.xz" \
-    -o /tmp/hawkeye.tar.xz \
-    && echo "9a6454f7f4f587764b4cbcbb865026526bbadeda477f1ef0b65924af777fb172  /tmp/hawkeye.tar.xz" | sha256sum -c \
-    && tar -xJf /tmp/hawkeye.tar.xz -C /tmp \
-    && mv "/tmp/hawkeye-x86_64-unknown-linux-musl/hawkeye" /usr/local/bin/hawkeye \
-    && rm -rf /tmp/hawkeye.tar.xz "/tmp/hawkeye-x86_64-unknown-linux-musl" \
-    && hawkeye --version
+# hawkeye: license-header checker — install the latest release, matching CI
+RUN cargo binstall -y hawkeye && hawkeye --version
