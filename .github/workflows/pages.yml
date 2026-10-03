@@ -15,8 +15,7 @@ concurrency:
 jobs:
   build-docs:
     name: Build Rustdoc
-    runs-on: arc-fes
-    timeout-minutes: 30
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
       - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9  # stable
@@ -36,8 +35,7 @@ jobs:
 
   build-notebooks:
     name: Build JupyterLite
-    runs-on: arc-fes
-    timeout-minutes: 30
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
       - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
@@ -66,8 +64,7 @@ jobs:
   deploy:
     name: Deploy to GitHub Pages
     needs: [build-docs, build-notebooks]
-    timeout-minutes: 15
-    runs-on: arc-fes
+    runs-on: ubuntu-latest
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
