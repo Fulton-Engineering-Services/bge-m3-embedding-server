@@ -21,7 +21,8 @@ jobs:
   # ── Quality gate ──────────────────────────────────────────────────────
   check:
     name: Check & Lint
-    runs-on: ubuntu-latest
+    runs-on: arc-fes
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
       - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9  # stable
@@ -39,7 +40,8 @@ jobs:
 
   test:
     name: Test
-    runs-on: ubuntu-latest
+    runs-on: arc-fes
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
       - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9  # stable
@@ -54,14 +56,16 @@ jobs:
 
   deny:
     name: Supply Chain Security
-    runs-on: ubuntu-latest
+    runs-on: arc-fes
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
       - uses: EmbarkStudios/cargo-deny-action@a531616d8ce3b9177443e48a1159bc945a099823  # v2
 
   docs:
     name: Rustdoc
-    runs-on: ubuntu-latest
+    runs-on: arc-fes
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
       - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9  # stable
@@ -73,7 +77,8 @@ jobs:
 
   license-headers:
     name: License Headers
-    runs-on: ubuntu-latest
+    runs-on: arc-fes
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
       - name: Install hawkeye
@@ -93,7 +98,8 @@ jobs:
   version:
     name: Check version
     needs: [check, test, deny, license-headers, docs]
-    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    runs-on: arc-fes
     outputs:
       version: ${{ steps.version.outputs.version }}
       tag: ${{ steps.version.outputs.tag }}
@@ -134,11 +140,12 @@ jobs:
   build-cuda-images:
     name: Build CUDA images (amd64)
     needs: [version]
+    timeout-minutes: 60
     if: needs.version.outputs.exists == 'false'
     permissions:
       contents: read
       packages: write
-    runs-on: ubuntu-latest
+    runs-on: arc-fes
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
 
@@ -262,6 +269,7 @@ jobs:
   build:
     name: Build (${{ matrix.platform }})
     needs: [version]
+    timeout-minutes: 60
     if: needs.version.outputs.exists == 'false'
     permissions:
       contents: read
@@ -270,7 +278,7 @@ jobs:
       fail-fast: true
       matrix:
         include:
-          - runner: ubuntu-latest
+          - runner: arc-fes
             platform: linux/amd64
           - runner: ubuntu-24.04-arm
             platform: linux/arm64
@@ -319,6 +327,7 @@ jobs:
   build-tls:
     name: Build TLS (${{ matrix.platform }})
     needs: [version]
+    timeout-minutes: 60
     if: needs.version.outputs.exists == 'false'
     permissions:
       contents: read
@@ -327,7 +336,7 @@ jobs:
       fail-fast: true
       matrix:
         include:
-          - runner: ubuntu-latest
+          - runner: arc-fes
             platform: linux/amd64
           - runner: ubuntu-24.04-arm
             platform: linux/arm64
@@ -381,7 +390,8 @@ jobs:
   release:
     name: Release
     needs: [version, build, build-tls, build-cuda-images]
-    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    runs-on: arc-fes
     permissions:
       contents: write
       packages: write
