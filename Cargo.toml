@@ -47,7 +47,7 @@ ndarray = "0.17"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 anyhow = "1"
-tower-http = { version = "0.6", features = ["trace", "request-id"] }
+tower-http = { version = "0.7", features = ["trace", "request-id"] }
 uuid = { version = "1", features = ["v4"] }
 nvml-wrapper = { version = "0.12.1", optional = true }
 
