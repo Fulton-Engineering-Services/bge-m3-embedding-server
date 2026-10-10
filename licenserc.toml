@@ -1,5 +1,7 @@
-headerPath = "config/hawkeye/license-header.txt"
+[header]
+path = "config/hawkeye/license-header.txt"
 
+[files]
 includes = [
     "src/**/*.rs",
     "tests/**/*.rs",
@@ -9,5 +11,5 @@ includes = [
     "tools/**/*.py",
 ]
 
-[properties]
-inceptionYear = 2026
+[props]
+inception_year = 2026
